@@ -252,10 +252,60 @@ def version(json_output: bool = typer.Option(False, "--json")) -> None:
                       f"registry v{info['schema']['registry']} · profiles v{info['schema']['profiles']}[/]")
 
 
+# --------------------------------------------------------------------------- gpu
+@app.command()
+def gpu(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    refresh: bool = typer.Option(False, "--refresh", help="Re-run the dtype ISA probe (ignore cache)."),
+) -> None:
+    """Detect GPUs: vendor, count, per-GPU VRAM, arch, and natively-accelerated dtypes."""
+    from dataclasses import asdict
+
+    from .hardware import detect as hwdetect
+
+    hw = hwdetect.detect(refresh=refresh)
+    if json_output:
+        console.print(_json.dumps(asdict(hw), indent=2))
+        return
+
+    if not hw.gpus:
+        console.print(
+            f"[yellow]no GPUs detected[/] (vendor={hw.vendor or 'none'}); "
+            f"host RAM {hw.host_ram_gb:.0f} GB — CPU / LM Studio / Ollama only."
+        )
+        return
+
+    het = "" if hw.homogeneous else "  [yellow](heterogeneous)[/]"
+    console.print(
+        f"[bold]{hw.vendor}[/] · {len(hw.gpus)} GPU(s) · {hw.total_vram_gb:.0f} GB VRAM · "
+        f"host RAM {hw.host_ram_gb:.0f} GB · fingerprint [cyan]{hw.fingerprint}[/]{het}"
+    )
+    for g in hw.groups:
+        dl = ", ".join(g.native_dtypes) or "—"
+        console.print(
+            f"  [bold]{g.arch}[/] ×{g.count} @ {g.vram_gb:.0f}GB — native dtypes: "
+            f"[green]{dl}[/] [dim](source: {hw.dtype_source})[/]"
+        )
+
+    table = Table(title="GPUs", title_style="bold")
+    table.add_column("IDX")
+    table.add_column("NAME")
+    table.add_column("ARCH", style="cyan")
+    table.add_column("VRAM (GB)", justify="right")
+    for g in hw.gpus:
+        table.add_row(str(g.index), g.name, g.arch, f"{g.vram_gb:.0f}")
+    console.print(table)
+
+    nd = set(hw.native_dtypes)
+    fp8 = "[green]✓[/]" if "fp8" in nd else "[red]✗[/]"
+    fp4 = "[green]✓[/]" if "fp4" in nd else "[red]✗[/]"
+    console.print(f"  fp8 native: {fp8}    fp4 native: {fp4}")
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "up": "P3", "down": "P3", "swap": "P3", "reap": "P3", "resolve": "P3",
-    "pin": "P3", "unpin": "P3", "logs": "P3", "metrics": "P3", "gpu": "P1",
+    "pin": "P3", "unpin": "P3", "logs": "P3", "metrics": "P3",
     "registry": "P2", "induct": "P4", "tune": "P4", "bench": "P4",
     "search": "P5", "download": "P5", "login": "P5", "alive": "P6",
     "provider": "P6", "cleanup": "P8", "nodes": "P11",
