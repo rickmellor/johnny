@@ -895,8 +895,8 @@ daemon_app = typer.Typer(add_completion=False, help="johnnyd: request-plane API 
 app.add_typer(daemon_app, name="daemon")
 
 
-def _daemon_pidfile():
-    return C.get_paths().state_dir / "johnnyd.json"
+def _daemon_pidfile(agent: bool = False):
+    return C.get_paths().state_dir / ("johnnyd-agent.json" if agent else "johnnyd.json")
 
 
 @daemon_app.command("up")
@@ -905,17 +905,39 @@ def daemon_up(
     port: int = typer.Option(8080, "--port"),
     no_jit: bool = typer.Option(False, "--no-jit", help="Disable load-on-first-request."),
     max_concurrent: int = typer.Option(0, "--max-concurrent", help="Per-seat admission cap (0=unlimited)."),
+    agent: bool = typer.Option(False, "--agent", help="Run as a node agent (dial out to a controller)."),
+    controller: str = typer.Option(None, "--controller", help="Controller URL (agent mode)."),
+    token: str = typer.Option("", "--token", help="Cluster join token (agent mode)."),
     foreground: bool = typer.Option(False, "--foreground", help="Run in this process (don't detach)."),
 ) -> None:
-    """Start johnnyd (request-plane API + OpenAI-compatible JIT gateway)."""
+    """Start johnnyd: controller (request-plane API + JIT gateway) or --agent (node)."""
+    import subprocess
+    import sys
+
+    if agent:
+        if not controller:
+            err.print("[red]--agent requires --controller <url>[/]")
+            raise typer.Exit(code=1)
+        if foreground:
+            from .cluster.agent import run_agent
+
+            run_agent(controller, token=token)
+            return
+        args = [sys.executable, "-m", "johnny", "daemon", "up", "--agent", "--foreground", "--controller", controller]
+        if token:
+            args += ["--token", token]
+        p = subprocess.Popen(args, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pf = _daemon_pidfile(agent=True)
+        pf.parent.mkdir(parents=True, exist_ok=True)
+        pf.write_text(_json.dumps({"pid": p.pid, "controller": controller}))
+        console.print(f"[green]●[/] johnnyd agent started · pid {p.pid} · → {controller}")
+        return
+
     if foreground:
         from .daemon.server import serve
 
         serve(host=host, port=port, jit=not no_jit, max_concurrent=max_concurrent)
         return
-    import subprocess
-    import sys
-
     args = [sys.executable, "-m", "johnny", "daemon", "up", "--foreground", "--host", host, "--port", str(port)]
     if no_jit:
         args.append("--no-jit")
@@ -955,21 +977,57 @@ def daemon_status(json_output: bool = typer.Option(False, "--json")) -> None:
 
 @daemon_app.command("down")
 def daemon_down() -> None:
-    """Stop johnnyd."""
+    """Stop johnnyd (controller and/or agent)."""
     import os
     import signal
 
-    pf = _daemon_pidfile()
-    if not pf.exists():
+    stopped = False
+    for agent in (False, True):
+        pf = _daemon_pidfile(agent=agent)
+        if not pf.exists():
+            continue
+        info = _json.loads(pf.read_text())
+        try:
+            os.kill(info["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        pf.unlink(missing_ok=True)
+        console.print(f"[green]✓[/] johnnyd {'agent' if agent else 'controller'} stopped (pid {info['pid']})")
+        stopped = True
+    if not stopped:
         console.print("[dim]johnnyd not running.[/]")
-        return
-    info = _json.loads(pf.read_text())
+
+
+@app.command()
+def nodes(
+    controller: str = typer.Option("http://127.0.0.1:8080", "--controller"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List nodes registered with the controller (multi-machine fleet)."""
+    import urllib.request
+
     try:
-        os.kill(info["pid"], signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    pf.unlink(missing_ok=True)
-    console.print(f"[green]✓[/] johnnyd stopped (pid {info['pid']})")
+        with urllib.request.urlopen(controller.rstrip("/") + "/cluster/nodes", timeout=5) as r:
+            data = _json.loads(r.read())
+    except Exception as e:
+        err.print(f"[red]controller unreachable[/] at {controller}: {e}")
+        raise typer.Exit(code=1)
+    nodes_list = data.get("nodes", [])
+    if json_output:
+        console.print(_json.dumps(nodes_list, indent=2))
+        return
+    if not nodes_list:
+        console.print("[dim]no nodes registered.[/] Start an agent: `johnny daemon up --agent --controller <url>`")
+        return
+    t = Table(title="cluster nodes", title_style="bold")
+    for col in ("NODE", "FINGERPRINT", "GPUS", "SEATS", "STATUS"):
+        t.add_column(col)
+    for n in nodes_list:
+        hw = n.get("hardware", {})
+        st = n.get("status", "?")
+        t.add_row(n.get("node_id", "?"), hw.get("fingerprint", "—"), str(hw.get("gpus", "—")),
+                  str(len(n.get("seats", []))), f"[{'green' if st == 'ready' else 'red'}]{st}[/]")
+    console.print(t)
 
 
 # --------------------------------------------------------------------------- TUI (P9)
@@ -984,7 +1042,6 @@ def tui() -> None:
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
-    "nodes": "P11",
 }
 
 

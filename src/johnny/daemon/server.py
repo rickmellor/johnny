@@ -38,6 +38,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"johnnyd/{__version__}"
     jit = True
     max_concurrent = 0  # 0 = unlimited
+    cluster_token = ""  # if set, agents must present a matching token
 
     def log_message(self, *a):  # quiet
         pass
@@ -74,6 +75,10 @@ class Handler(BaseHTTPRequestHandler):
             if not target:
                 return self._json(400, {"error": "missing ?target="})
             return self._json(200, service.resolve(target))
+        if u.path == "/cluster/nodes":
+            from ..cluster.state import REGISTRY
+
+            return self._json(200, {"nodes": REGISTRY.nodes()})
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -84,7 +89,35 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_pin(u.path == "/pin")
         if u.path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
             return self._gateway(u.path)
+        if u.path.startswith("/cluster/"):
+            return self._cluster(u.path)
         self._json(404, {"error": "not found"})
+
+    def _cluster(self, path: str) -> None:
+        from ..cluster.state import REGISTRY
+
+        try:
+            req = json.loads(self._body() or b"{}")
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "bad json"})
+        if self.cluster_token and req.get("token") != self.cluster_token:
+            return self._json(401, {"error": "bad cluster token"})
+        if path == "/cluster/register":
+            REGISTRY.register(req)
+            return self._json(200, {"ok": True, "node_id": req.get("node_id")})
+        if path == "/cluster/heartbeat":
+            payload = {k: v for k, v in req.items() if k != "token"}
+            cmds = REGISTRY.heartbeat(req.get("node_id"), payload)
+            return self._json(200, {"commands": cmds})
+        if path == "/cluster/place":
+            cid = REGISTRY.enqueue(req["node_id"], {"action": req.get("action", "up"),
+                                                    "model": req.get("model"),
+                                                    "placement": req.get("placement"),
+                                                    "seat": req.get("seat")})
+            return self._json(200, {"queued": cid})
+        if path == "/cluster/result":
+            return self._json(200, {"ok": True})
+        return self._json(404, {"error": "not found"})
 
     @staticmethod
     def _seat(s) -> dict:
@@ -174,7 +207,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8080, jit: bool = True, max_concurrent: int = 0) -> None:
+    import os
+
     Handler.jit = jit
     Handler.max_concurrent = max_concurrent
+    Handler.cluster_token = os.environ.get("JOHNNY_CLUSTER_TOKEN", "")
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.serve_forever()
