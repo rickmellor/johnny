@@ -67,6 +67,8 @@ def parse_launcher(path: Path) -> dict:
         "gpus": gpus,
         "port": _int(port),
         "runner_pooling": bool(re.search(r"--runner\s+pooling", text)),
+        "trust_remote_code": bool(re.search(r"--trust-remote-code", text)),
+        "cpuset": _search(r"--cpuset-cpus[= ]([^\s\\]+)", text),
         "env": dict(re.findall(r"-e\s+([A-Z_]+)=([^\s\\]+)", text)),
     }
 
@@ -120,11 +122,12 @@ def _model_skeleton(local_path: str | None, vendor: str | None, probe: dict, qua
     }
 
 
-def _build_placement(L: dict, fingerprint: str, quant: str | None, runtime_version: str) -> dict:
+def _build_placement(L: dict, fingerprint: str, quant: str | None, runtime_version: str, image: str | None) -> dict:
     pooling = L.get("runner_pooling")
     return {
         "id": Path(L["file"]).stem,
         "backend": "vllm",
+        "image": image,
         "use_case": _guess_use_case(L["file"]),
         "knobs": {
             "gpu_count": 0 if pooling else (len(L["gpus"]) or L.get("tp")),
@@ -142,6 +145,8 @@ def _build_placement(L: dict, fingerprint: str, quant: str | None, runtime_versi
             "reasoning_parser": L.get("reasoning_parser"),
             "runner": "pooling" if pooling else None,
             "device": "cpu" if pooling else None,
+            "trust_remote_code": L.get("trust_remote_code"),
+            "cpuset": L.get("cpuset"),
             "container_name": L.get("container"),
             "nickname": L.get("nickname"),
             "gpus": L.get("gpus"),
@@ -193,7 +198,7 @@ def import_launchers(launchers_dir: str, models_dir: str | None, fingerprint: st
         cap["tool_call_parser"] = cap["tool_call_parser"] or L.get("tool_parser")
         cap["reasoning_parser"] = cap["reasoning_parser"] or L.get("reasoning_parser")
         cap["native_context"] = cap["native_context"] or L.get("mml")
-        m["placements"].append(_build_placement(L, fingerprint, quant, runtime_version))
+        m["placements"].append(_build_placement(L, fingerprint, quant, runtime_version, image or None))
 
     reg["fingerprints"] = [fingerprint] if fingerprint else []
     return reg

@@ -144,3 +144,109 @@ class VllmDriver(Driver):
         q = cfg.get("quantization_config") or {}
         info["quant"] = q.get("quant_method")
         return info
+
+    # --- mutating ops (P3) ---
+    def compose(self, spec: dict) -> list[str]:
+        """Pure: a launch spec -> the `docker run` argv (the proven launcher shape).
+
+        Reproduces device/mount/env/flag conventions; binds to bind_address (localhost
+        by default); stamps johnny.* labels for label-derived occupancy.
+        """
+        extra = spec.get("extra") or {}
+        knobs = spec.get("knobs") or {}
+        gpus = spec.get("gpus") or []
+        pooling = extra.get("runner") == "pooling"
+        is_cpu = extra.get("device") == "cpu" or (pooling and not gpus)
+
+        args = ["docker", "run", "-d", "--name", spec["container_name"]]
+        for k, v in (spec.get("labels") or {}).items():
+            args += ["--label", f"{k}={v}"]
+        if is_cpu:
+            if extra.get("cpuset"):
+                args += ["--cpuset-cpus", str(extra["cpuset"])]
+        else:
+            args += ["--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render"]
+        args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
+        if spec.get("models_dir"):
+            args += ["-v", f"{spec['models_dir']}:/models"]
+        if spec.get("vllm_cache"):
+            args += ["-v", f"{spec['vllm_cache']}:/root/.cache/vllm"]
+        args += ["-p", f"{spec.get('bind_address', '127.0.0.1')}:{spec['port']}:8000"]
+        if gpus:
+            args += ["-e", f"{spec.get('visible_env', 'CUDA_VISIBLE_DEVICES')}={','.join(str(g) for g in gpus)}"]
+        # The engine owns GPU pinning; drop any *_VISIBLE_DEVICES carried over in env
+        # (the importer captures them from the launcher) so we don't emit duplicates.
+        for k, v in (spec.get("env") or {}).items():
+            if k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+                continue
+            args += ["-e", f"{k}={v}"]
+        args += [spec["image"], spec["model_path"], "--served-model-name", spec["served_model_name"]]
+        if knobs.get("tensor_parallel_size"):
+            args += ["--tensor-parallel-size", str(knobs["tensor_parallel_size"])]
+        if knobs.get("max_model_len"):
+            args += ["--max-model-len", str(knobs["max_model_len"])]
+        if knobs.get("gpu_memory_util"):
+            args += ["--gpu-memory-utilization", str(knobs["gpu_memory_util"])]
+        if not pooling:
+            args += ["--enable-prefix-caching"]
+        if knobs.get("max_num_seqs"):
+            args += ["--max-num-seqs", str(knobs["max_num_seqs"])]
+        if knobs.get("max_num_batched_tokens"):
+            args += ["--max-num-batched-tokens", str(knobs["max_num_batched_tokens"])]
+        kv = knobs.get("kv_cache_dtype")
+        if kv and kv != "auto":
+            args += ["--kv-cache-dtype", kv]
+        mtp = knobs.get("mtp") or {}
+        if mtp.get("enabled"):
+            n = mtp.get("num_speculative_tokens") or 2
+            args += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": n})]
+        if extra.get("tool_call_parser"):
+            args += ["--enable-auto-tool-choice", "--tool-call-parser", extra["tool_call_parser"]]
+        if extra.get("reasoning_parser"):
+            args += ["--reasoning-parser", extra["reasoning_parser"]]
+        if pooling:
+            args += ["--runner", "pooling"]
+        if extra.get("trust_remote_code"):
+            args += ["--trust-remote-code"]
+        return args
+
+    def launch(self, spec: dict) -> SeatInfo:
+        run(["docker", "rm", "-f", spec["container_name"]], timeout=20)  # idempotent
+        argv = self.compose(spec)
+        rc, _out, errout = run(argv, timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"docker run failed: {errout.strip() or 'unknown error'}")
+        return SeatInfo(
+            "vllm",
+            spec["container_name"],
+            spec["served_model_name"],
+            spec.get("port"),
+            spec.get("gpus") or [],
+            "loading",
+            {"image": spec.get("image"), "labels": spec.get("labels", {})},
+        )
+
+    def stop(self, seat: str) -> None:
+        run(["docker", "rm", "-f", seat], timeout=30)
+
+    def metrics(self, seat: str) -> dict:
+        from ..telemetry import sources
+
+        for s in self.runtime_state():
+            if s.name == seat and s.port:
+                m = sources.metrics_for_port(s.port)
+                m["seat"] = seat
+                return m
+        return {"seat": seat, "source": "unavailable"}
+
+    def logs(self, seat: str, follow: bool = False, tail: int = 200):
+        cmd = ["docker", "logs"]
+        if follow:
+            cmd.append("-f")
+        cmd += ["--tail", str(tail), seat]
+        if follow:
+            import subprocess
+
+            return subprocess.call(cmd)  # streams to terminal
+        rc, out, errout = run(cmd, timeout=15)
+        return out + errout

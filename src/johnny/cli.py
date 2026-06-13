@@ -40,38 +40,35 @@ _CHECK_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
 
 
 # --------------------------------------------------------------------------- status
+def _seats_as_dicts(seats) -> list[dict]:
+    return [
+        {"seat": s.name, "backend": s.backend, "port": s.port, "model": s.model,
+         "state": s.state, "gpus": s.gpus}
+        for s in seats
+    ]
+
+
 def _render_status(json_output: bool = False) -> None:
-    if not probe.docker_available():
-        if json_output:
-            console.print(_json.dumps({"docker": False, "seats": []}, indent=2))
-        else:
-            err.print("[red]docker is not reachable[/] — is the daemon running? (`johnny doctor`)")
-        return
+    from . import engine
 
-    seats = probe.list_seats()
+    seats = engine.all_seats()
     if json_output:
-        console.print(_json.dumps({"docker": True, "seats": seats}, indent=2))
+        console.print(_json.dumps({"seats": _seats_as_dicts(seats)}, indent=2))
         return
-
     if not seats:
-        console.print("[dim]no inference seats running.[/] Bring one up once the engine lands (P3); for now use your existing tooling.")
+        if not probe.docker_available():
+            err.print("[red]docker is not reachable[/] — is the daemon running? (`johnny doctor`)")
+        else:
+            console.print("[dim]no inference seats running.[/] Start one with [bold]johnny up <model>[/].")
         return
-
-    table = Table(title="johnny — seats (P0: derived from docker + /v1/models)", title_style="bold")
-    table.add_column("SEAT", style="bold")
-    table.add_column("PORT")
-    table.add_column("SERVED MODEL", style="cyan")
-    table.add_column("STATE")
-    table.add_column("IMAGE", style="dim")
+    table = Table(title="johnny — seats", title_style="bold")
+    for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
+                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None)):
+        table.add_column(col, style=style)
     for s in seats:
-        st = s["state"]
-        table.add_row(
-            s["seat"],
-            str(s["port"] or "—"),
-            s["model"] or "—",
-            f"[{_STATE_STYLE.get(st, 'white')}]{st}[/]",
-            s["image"],
-        )
+        gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
+        table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
+                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus)
     console.print(table)
 
 
@@ -98,16 +95,16 @@ def status(
 
 def _build_status_renderable():
     """A Rich renderable of current seats (used by --watch)."""
+    from . import engine
+
     table = Table(title="johnny — seats (live)", title_style="bold")
-    for col, style in (("SEAT", "bold"), ("PORT", None), ("SERVED MODEL", "cyan"), ("STATE", None), ("IMAGE", "dim")):
+    for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
+                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None)):
         table.add_column(col, style=style)
-    if not probe.docker_available():
-        table.add_row("[red]docker unreachable[/]", "—", "—", "—", "—")
-        return table
-    for s in probe.list_seats():
-        st = s["state"]
-        table.add_row(s["seat"], str(s["port"] or "—"), s["model"] or "—",
-                      f"[{_STATE_STYLE.get(st, 'white')}]{st}[/]", s["image"])
+    for s in engine.all_seats():
+        gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
+        table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
+                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus)
     return table
 
 
@@ -417,10 +414,197 @@ def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None
     raise typer.Exit(code=1)
 
 
+# --------------------------------------------------------------------------- seat lifecycle (P3)
+def _emit_err(e: Exception, json_output: bool):
+    if json_output:
+        console.print(_json.dumps({"error": str(e)}, indent=2))
+    else:
+        err.print(f"[red]{e}[/]")
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def up(
+    model: str = typer.Argument(..., help="Registry model id."),
+    placement: str = typer.Option(None, "--placement", help="Specific placement id (else best fit)."),
+    port: int = typer.Option(None, "--port"),
+    swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
+    force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
+    wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Bring up a model seat (spawn on free GPUs, or swap a named seat)."""
+    from .engine import launch
+
+    try:
+        res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait)
+    except Exception as e:
+        _emit_err(e, json_output)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    st = res.get("state")
+    console.print(
+        f"[green]●[/] {res['action']} [bold]{res['seat']}[/] · model={res['model']} · "
+        f"port={res.get('port')} · gpus={res.get('gpus') or '—'} · state=[{_STATE_STYLE.get(st, 'white')}]{st}[/]"
+    )
+    if res.get("endpoint"):
+        console.print(f"  endpoint: {res['endpoint']}")
+    if st == "loading":
+        console.print(f"  [dim]loading — poll `johnny resolve {res['model']}` or tail `johnny logs {res['seat']}`[/]")
+
+
+@app.command()
+def down(
+    seat: str = typer.Argument(..., help="Seat/container name (or model id)."),
+    drain: bool = typer.Option(False, "--drain", help="Graceful drain (no-op without a router)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Tear down a single named seat (never siblings)."""
+    from .engine import launch
+
+    try:
+        res = launch.down(seat, drain=drain)
+    except Exception as e:
+        _emit_err(e, json_output)
+    console.print(_json.dumps(res, indent=2) if json_output else f"[green]✓[/] down {res['seat']}")
+
+
+@app.command()
+def swap(
+    seat: str = typer.Argument(..., help="Running seat to replace."),
+    model: str = typer.Argument(..., help="Model to launch in its place."),
+    wait: bool = typer.Option(False, "--wait"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Replace one seat in place (same cards/port)."""
+    from .engine import launch
+
+    try:
+        res = launch.swap(seat, model, wait=wait)
+    except Exception as e:
+        _emit_err(e, json_output)
+    console.print(_json.dumps(res, indent=2) if json_output else
+                  f"[green]●[/] swapped {seat} → [bold]{res['seat']}[/] (state {res.get('state')})")
+
+
+@app.command()
+def reap(
+    idle_ttl: int = typer.Option(None, "--idle-ttl", help="Idle seconds before reaping (default 1800)."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Evict idle, unpinned seats so the GPUs reach deep idle. Stateless / cron-able."""
+    from .engine import service
+
+    actions = service.reap(idle_ttl=idle_ttl, dry_run=dry_run)
+    if json_output:
+        console.print(_json.dumps(actions, indent=2))
+        return
+    if not actions:
+        console.print("[dim]no seats to consider.[/]")
+        return
+    t = Table(title="johnny reap" + (" (dry-run)" if dry_run else ""), title_style="bold")
+    for col in ("SEAT", "ACTION", "IDLE (s)", "REASON"):
+        t.add_column(col)
+    style = {"reap": "red", "would-reap": "yellow", "keep": "green", "skip": "dim"}
+    for a in actions:
+        t.add_row(a["seat"], f"[{style.get(a['action'], 'white')}]{a['action']}[/]",
+                  str(a.get("idle_s", "—")), a.get("reason", ""))
+    console.print(t)
+
+
+@app.command()
+def pin(
+    seat: str = typer.Argument(...),
+    ttl: int = typer.Option(None, "--ttl", help="Seconds; omit for indefinite."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Exempt a seat from the reaper (ephemeral pin in the telemetry SQLite)."""
+    from .telemetry import collect
+
+    collect.add_pin(seat, ttl_s=ttl)
+    msg = {"pinned": seat, "ttl_s": ttl}
+    console.print(_json.dumps(msg, indent=2) if json_output else
+                  f"[green]✓[/] pinned {seat}" + (f" for {ttl}s" if ttl else " (indefinite)"))
+
+
+@app.command()
+def unpin(seat: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """Remove a seat's reaper exemption."""
+    from .telemetry import collect
+
+    collect.remove_pin(seat)
+    console.print(_json.dumps({"unpinned": seat}, indent=2) if json_output else f"[green]✓[/] unpinned {seat}")
+
+
+@app.command()
+def resolve(
+    target: str = typer.Argument(..., help="Role, seat, or model id."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Resolve a role/seat/model to its live endpoint + readiness (the SAINT hot path)."""
+    from .engine import service
+
+    res = service.resolve(target)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    st = res["state"]
+    console.print(
+        f"[{_STATE_STYLE.get(st, 'white')}]{st}[/] · seat={res.get('seat') or '—'} · "
+        f"model={res.get('model')} · endpoint={res.get('endpoint') or '—'} · "
+        f"eta_s={res.get('eta_s')} · queue={res.get('queue_depth')}"
+    )
+
+
+@app.command()
+def logs(
+    seat: str = typer.Argument(...),
+    follow: bool = typer.Option(False, "-f", "--follow"),
+    tail: int = typer.Option(200, "--tail"),
+) -> None:
+    """Tail a seat's logs (docker logs), with launch-failure context."""
+    from .engine import all_seats, driver_for
+
+    target = None
+    for s in all_seats():
+        labels = (s.extra or {}).get("labels", {})
+        if seat in (s.name, s.model, labels.get("johnny.model")):
+            target = s
+            break
+    if not target:
+        err.print(f"[red]no running seat[/] '{seat}'")
+        raise typer.Exit(code=1)
+    drv = driver_for(target)
+    out = drv.logs(target.name, follow=follow, tail=tail)
+    if not follow and out is not None:
+        console.print(out)
+
+
+@app.command()
+def metrics(seat: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """Show normalized telemetry for a seat (vLLM /metrics)."""
+    from .engine import all_seats, driver_for
+
+    target = None
+    for s in all_seats():
+        if seat in (s.name, s.model):
+            target = s
+            break
+    if not target:
+        err.print(f"[red]no running seat[/] '{seat}'")
+        raise typer.Exit(code=1)
+    m = driver_for(target).metrics(target.name)
+    if json_output:
+        console.print(_json.dumps(m, indent=2))
+        return
+    for k, v in m.items():
+        console.print(f"  {k}: {v}")
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
-    "up": "P3", "down": "P3", "swap": "P3", "reap": "P3", "resolve": "P3",
-    "pin": "P3", "unpin": "P3", "logs": "P3", "metrics": "P3",
     "induct": "P4", "tune": "P4", "bench": "P4",
     "search": "P5", "download": "P5", "login": "P5", "alive": "P6",
     "provider": "P6", "cleanup": "P8", "nodes": "P11",
