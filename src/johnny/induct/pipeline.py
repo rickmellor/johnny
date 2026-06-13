@@ -9,6 +9,7 @@ use-case, and writes the placement + report.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .. import config as C
@@ -40,15 +41,41 @@ def _save_state(model_id: str, st: dict) -> None:
     (d / "state.json").write_text(json.dumps(st, indent=2))
 
 
-def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None) -> dict:
+def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points) -> dict:
+    """Choose GPU vs CPU placements + candidate points. device: gpu|cpu|auto.
+    auto = GPU if any GPU placement fits, else fall back to CPU."""
+    free = free_gpus(hw, all_seats(cfg))
+    emb = embeddings if embeddings is not None else stages.is_embeddings(a)
+    priors = grid.seed_priors(store.load(), model_id)
+    native_ctx = a.get("native_context") or (a.get("dims") or {}).get("ctx")
+    gpu_viable, gpu_pruned = stages.hardware_fit(a, hw, len(free))
+    use_cpu = (device == "cpu") or (device == "auto" and not gpu_viable)
+
+    if use_cpu:
+        cv = grid.cpu_viable(a.get("size_bytes", 0), hw.host_ram_gb)
+        if not cv["fits"]:
+            return {"free": free, "device": "cpu", "embeddings": emb, "viable": [],
+                    "pruned": [{"tp": "cpu", "reason": cv["reason"]}], "priors": len(priors), "points": []}
+        ncpu = os.cpu_count() or 4
+        pts = grid.cpu_candidate_points(emb, ncpu, native_ctx, priors, max_points=max_points)
+        return {"free": free, "device": "cpu", "embeddings": emb,
+                "viable": [{"device": "cpu", "per_host_gb": cv["per_host_gb"]}],
+                "pruned": [], "priors": len(priors), "points": pts}
+
+    pts = grid.candidate_points(gpu_viable, priors, max_points=max_points)
+    for p in pts:
+        p["embeddings"] = emb
+    return {"free": free, "device": "gpu", "embeddings": emb, "viable": gpu_viable,
+            "pruned": gpu_pruned, "priors": len(priors), "points": pts}
+
+
+def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
+         device: str = "auto", embeddings: bool | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
     a = stages.audit(path)
-    free = free_gpus(hw, all_seats(cfg))
-    viable, pruned = stages.hardware_fit(a, hw, len(free))
-    priors = grid.seed_priors(store.load(), model_id)
-    points = grid.candidate_points(viable, priors, max_points=max_points)
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points)
     return {
         "model_id": model_id,
         "path": path,
@@ -57,11 +84,13 @@ def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None)
             "size_gb": round(a.get("size_bytes", 0) / 1e9, 1),
             "native_ctx": (a.get("dims") or {}).get("ctx"),
         },
-        "free_gpus": free,
-        "viable": viable,
-        "pruned": pruned,
-        "priors": len(priors),
-        "points": points,
+        "free_gpus": rp["free"],
+        "device": rp["device"],
+        "embeddings": rp["embeddings"],
+        "viable": rp["viable"],
+        "pruned": rp["pruned"],
+        "priors": rp["priors"],
+        "points": rp["points"],
     }
 
 
@@ -73,6 +102,8 @@ def run(
     max_points: int | None = None,
     cfg: dict | None = None,
     progress=None,
+    device: str = "auto",
+    embeddings: bool | None = None,
 ) -> dict:
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
@@ -88,12 +119,12 @@ def run(
     _save_state(model_id, st)
     _p(f"audit: {a.get('arch')} · {round(a.get('size_bytes', 0) / 1e9, 1)}GB · quant={a.get('quant')}")
 
-    viable, pruned = stages.hardware_fit(a, hw, len(free_gpus(hw, all_seats(cfg))))
-    _p(f"hardware-fit: {len(viable)} viable, {len(pruned)} pruned")
-    if not viable:
-        return {"model_id": model_id, "error": "no viable placement on this hardware", "pruned": pruned}
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points)
+    _p(f"device={rp['device']} · embeddings={rp['embeddings']} · {len(rp['viable'])} viable, {len(rp['pruned'])} pruned")
+    points = rp["points"]
+    if not points:
+        return {"model_id": model_id, "error": "no viable placement", "pruned": rp["pruned"], "device": rp["device"]}
 
-    points = grid.candidate_points(viable, grid.seed_priors(store.load(), model_id), max_points=max_points)
     done = sum(1 for p in points if report._point_sig(p) in st["results"])
     _p(f"sweep: {len(points)} point(s)" + (f" ({done} already done, resuming)" if done else ""))
 
@@ -102,21 +133,31 @@ def run(
         if sig in st["results"]:  # resumable: skip already-benched points
             _p(f"[{i}/{len(points)}] {sig}: cached, skipping")
             continue
-        gpus = assign_gpus(point["tp"], hw, free_gpus(hw, all_seats(cfg)))
-        if len(gpus) < point["tp"]:
-            r = {"point": point, "ok": False, "error": f"insufficient free GPUs for tp={point['tp']}"}
-            _p(f"[{i}/{len(points)}] {sig}: skipped (insufficient free GPUs)")
+        if point.get("device") == "cpu":
+            _p(f"[{i}/{len(points)}] {sig}: launching on CPU (cpuset {point.get('cpuset')}) + benching…")
+            collect.add_pin(stages.TUNING_CONTAINER)
+            try:
+                r = stages.tune_point(model_id, path, point, [], cfg, hw)
+            finally:
+                collect.remove_pin(stages.TUNING_CONTAINER)
         else:
+            gpus = assign_gpus(point["tp"], hw, free_gpus(hw, all_seats(cfg)))
+            if len(gpus) < point["tp"]:
+                r = {"point": point, "ok": False, "error": f"insufficient free GPUs for tp={point['tp']}"}
+                _p(f"[{i}/{len(points)}] {sig}: skipped (insufficient free GPUs)")
+                st["results"][sig] = r
+                _save_state(model_id, st)
+                continue
             _p(f"[{i}/{len(points)}] {sig}: launching on GPU {gpus} + benching…")
             collect.add_pin(stages.TUNING_CONTAINER)  # reaper-safe for the run
             try:
                 r = stages.tune_point(model_id, path, point, gpus, cfg, hw)
             finally:
                 collect.remove_pin(stages.TUNING_CONTAINER)
-            if r.get("ok"):
-                _p(f"[{i}/{len(points)}] {sig}: peak {r.get('peak_tok_s')} tok/s, single {r.get('single_tok_s')} tok/s")
-            else:
-                _p(f"[{i}/{len(points)}] {sig}: FAILED — {(r.get('error') or '')[:80]}")
+        if r.get("ok"):
+            _p(f"[{i}/{len(points)}] {sig}: peak {r.get('peak_tok_s')} tok/s, single {r.get('single_tok_s')} tok/s")
+        else:
+            _p(f"[{i}/{len(points)}] {sig}: FAILED — {(r.get('error') or '')[:80]}")
         st["results"][sig] = r
         _save_state(model_id, st)
 

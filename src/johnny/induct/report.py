@@ -9,6 +9,9 @@ from ..registry import store
 
 
 def _point_sig(point: dict) -> str:
+    if point.get("device") == "cpu":
+        return (f"cpu-{point.get('cpuset')}-mml{point.get('max_model_len')}"
+                f"-bt{point.get('max_num_batched_tokens')}-seqs{point.get('max_num_seqs')}")
     return (
         f"tp{point.get('tp')}-gmu{point.get('gpu_memory_util')}-seqs{point.get('max_num_seqs')}"
         f"-bt{point.get('max_num_batched_tokens')}-mml{point.get('max_model_len')}"
@@ -17,6 +20,33 @@ def _point_sig(point: dict) -> str:
 
 def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_version: str, use_case: str | None) -> dict:
     point = winner["point"]
+    vkey = {"hardware_fingerprint": hardware.fingerprint, "backend": "vllm", "runtime_version": runtime_version}
+    perf = {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")}
+    if point.get("device") == "cpu":
+        extra = {"device": "cpu", "cpuset": point.get("cpuset")}
+        if point.get("embeddings"):
+            extra["runner"] = "pooling"
+            extra["trust_remote_code"] = True
+        return {
+            "id": f"induct-cpu-{point.get('cpuset')}",
+            "backend": "vllm",
+            "image": None,
+            "use_case": use_case,
+            "knobs": {
+                "gpu_count": 0, "tensor_parallel_size": None,
+                "max_model_len": point.get("max_model_len"),
+                "gpu_memory_util": None,
+                "max_num_seqs": point.get("max_num_seqs"),
+                "max_num_batched_tokens": point.get("max_num_batched_tokens"),
+                "kv_cache_dtype": "auto", "mtp": {"enabled": False},
+            },
+            "extra": extra,
+            "env": {"VLLM_CPU_KVCACHE_SPACE": "4"},
+            "perf": perf,
+            "validation_key": vkey,
+            "validated_at": None,
+            "source": "induction",
+        }
     return {
         "id": f"induct-{_point_sig(point)}",
         "backend": "vllm",

@@ -638,18 +638,25 @@ def metrics(
 def _render_plan(pl: dict) -> None:
     a = pl["audit"]
     console.print(f"[bold]{pl['model_id']}[/]  [dim]{pl['path']}[/]")
-    console.print(f"  arch={a['arch']} quant={a['quant']} size={a['size_gb']}GB native_ctx={a['native_ctx']} "
-                  f"· free GPUs={pl['free_gpus']} · priors={pl['priors']}")
-    vt = Table(title="viable placements", title_style="bold")
-    for col in ("TP", "QUANT", "GB/GPU", "KV-CEILING CTX"):
-        vt.add_column(col)
-    for v in pl["viable"]:
-        vt.add_row(str(v["tp"]), str(v.get("quant")), str(v.get("per_gpu_gb")), str(v.get("kv_ceiling_ctx")))
-    console.print(vt)
-    if pl["pruned"]:
-        console.print("[dim]pruned:[/]")
-        for p in pl["pruned"]:
-            console.print(f"  [yellow]✗ tp={p['tp']}[/] — {p['reason']}")
+    console.print(f"  arch={a['arch']} quant={a['quant']} size={a['size_gb']}GB native_ctx={a['native_ctx']} · "
+                  f"[bold]device={pl.get('device')}[/] · embeddings={pl.get('embeddings')} · "
+                  f"free GPUs={pl['free_gpus']} · priors={pl['priors']}")
+    if pl.get("device") == "cpu":
+        for v in pl["viable"]:
+            console.print(f"  [cyan]CPU placement[/] — fits host RAM ({v.get('per_host_gb')}GB weights)")
+        for p in pl.get("pruned", []):
+            console.print(f"  [yellow]✗ {p.get('tp')}[/] — {p.get('reason')}")
+    else:
+        vt = Table(title="viable placements", title_style="bold")
+        for col in ("TP", "QUANT", "GB/GPU", "KV-CEILING CTX"):
+            vt.add_column(col)
+        for v in pl["viable"]:
+            vt.add_row(str(v["tp"]), str(v.get("quant")), str(v.get("per_gpu_gb")), str(v.get("kv_ceiling_ctx")))
+        console.print(vt)
+        if pl["pruned"]:
+            console.print("[dim]pruned:[/]")
+            for p in pl["pruned"]:
+                console.print(f"  [yellow]✗ tp={p.get('tp')}[/] — {p.get('reason')}")
     console.print(f"[bold]{len(pl['points'])}[/] candidate config point(s) to sweep "
                   f"[dim](seeded search, not a brute grid)[/]")
 
@@ -658,6 +665,8 @@ def _render_plan(pl: dict) -> None:
 def induct(
     model: str = typer.Argument(..., help="HF id, registry id, or local path."),
     use_case: str = typer.Option(None, "--use-case", help="throughput | latency | context"),
+    device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU if no GPU fits)."),
+    embeddings: bool = typer.Option(None, "--embeddings/--no-embeddings", help="Force embeddings vs generative bench (default: auto-detect)."),
     bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
     plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
@@ -665,12 +674,12 @@ def induct(
     yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Auto-tune a model into an optimal placement (tuning by default)."""
+    """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
     from .induct import pipeline
 
     if plan:
         try:
-            pl = pipeline.plan(model, max_points=max_points)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings)
         except Exception as e:
             _emit_err(e, json_output)
         if json_output:
@@ -681,16 +690,20 @@ def induct(
 
     if not yes and not json_output:
         try:
-            pl = pipeline.plan(model, max_points=max_points)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings)
         except Exception as e:
             _emit_err(e, json_output)
         _render_plan(pl)
-        if not typer.confirm(f"Launch {len(pl['points'])} tuning seat(s)? (each is a real load + bench)"):
+        if not pl["points"]:
+            raise typer.Exit(code=1)
+        where = "CPU" if pl.get("device") == "cpu" else "GPU"
+        if not typer.confirm(f"Launch {len(pl['points'])} {where} tuning seat(s)? (each is a real load + bench)"):
             raise typer.Exit(code=1)
 
     prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
-        res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points, progress=prog)
+        res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points,
+                           progress=prog, device=device, embeddings=embeddings)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:

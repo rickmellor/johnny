@@ -102,6 +102,46 @@ def seed_priors(registry: dict, model_id: str) -> list[dict]:
     return [p.get("knobs", {}) for p in m.get("placements", []) if p.get("knobs")]
 
 
+def cpu_viable(size_bytes: int, host_ram_gb: float, headroom: float = 0.7) -> dict:
+    """Can this model run on CPU given host RAM? (weights vs ~70% of RAM)."""
+    budget = host_ram_gb * 1e9 * headroom
+    fits = bool(size_bytes) and size_bytes < budget
+    return {
+        "device": "cpu",
+        "fits": fits,
+        "per_host_gb": round(size_bytes / 1e9, 1),
+        "reason": None if fits else f"{size_bytes / 1e9:.0f} GB exceeds ~{budget / 1e9:.0f} GB CPU budget ({host_ram_gb:.0f} GB RAM)",
+    }
+
+
+def cpu_candidate_points(embeddings: bool, ncpu: int, native_ctx: int | None,
+                         priors: list, max_points: int | None = None) -> list[dict]:
+    """CPU sweep: a small grid over cpuset (threads) × context/batch.
+
+    Embeddings get a batch×threads grid at native (small) context; generative CPU
+    LLMs sweep threads × a couple of seq settings.
+    """
+    half = max(1, ncpu // 2)
+    cpusets = list(dict.fromkeys([f"0-{ncpu - 1}", f"0-{half - 1}"]))
+    prior = priors[0] if priors else {}
+    pts: list[dict] = []
+    if embeddings:
+        mml = prior.get("max_model_len") or native_ctx or 2048
+        for cs in cpusets:
+            for batched in dict.fromkeys([prior.get("max_num_batched_tokens") or 8192, 16384]):
+                pts.append({"device": "cpu", "embeddings": True, "cpuset": cs, "max_model_len": mml,
+                            "max_num_batched_tokens": batched, "max_num_seqs": prior.get("max_num_seqs") or 256})
+    else:
+        mml = prior.get("max_model_len") or (min(native_ctx, 16384) if native_ctx else 8192)
+        for cs in cpusets:
+            for seqs in dict.fromkeys([prior.get("max_num_seqs") or 8, 16]):
+                pts.append({"device": "cpu", "embeddings": False, "cpuset": cs, "max_model_len": mml,
+                            "max_num_seqs": seqs, "max_num_batched_tokens": prior.get("max_num_batched_tokens") or 4096})
+    if max_points:
+        pts = pts[:max_points]
+    return pts
+
+
 def candidate_points(viable: list, priors: list, max_points: int | None = None) -> list[dict]:
     prior = priors[0] if priors else {}
     base_batched = prior.get("max_num_batched_tokens") or 16384
