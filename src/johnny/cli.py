@@ -40,10 +40,14 @@ _CHECK_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
 
 
 # --------------------------------------------------------------------------- status
+def _seat_image(s) -> str:
+    return (s.extra or {}).get("image") or "—"
+
+
 def _seats_as_dicts(seats) -> list[dict]:
     return [
         {"seat": s.name, "backend": s.backend, "port": s.port, "model": s.model,
-         "state": s.state, "gpus": s.gpus}
+         "state": s.state, "gpus": s.gpus, "image": _seat_image(s)}
         for s in seats
     ]
 
@@ -63,12 +67,12 @@ def _render_status(json_output: bool = False) -> None:
         return
     table = Table(title="johnny — seats", title_style="bold")
     for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
-                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None)):
+                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
         table.add_column(col, style=style)
     for s in seats:
         gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
-                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus)
+                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
     console.print(table)
 
 
@@ -99,12 +103,12 @@ def _build_status_renderable():
 
     table = Table(title="johnny — seats (live)", title_style="bold")
     for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
-                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None)):
+                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
         table.add_column(col, style=style)
     for s in engine.all_seats():
         gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
-                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus)
+                      f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
     return table
 
 
