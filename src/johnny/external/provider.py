@@ -59,9 +59,12 @@ def _patch(data, name: str, block: dict) -> bool:
     return False
 
 
-def sync(provider_name: str = "specul8-o-matic", write: bool = False, cfg: dict | None = None) -> dict:
+def sync(provider_name: str | None = None, write: bool = False, cfg: dict | None = None) -> dict:
+    cfg = cfg if cfg is not None else load_config()
+    ext = cfg.get("external") or {}
+    provider_name = provider_name or ext.get("provider") or "johnny"
     block = compute_block(provider_name, cfg)
-    path = hermes_config_path()
+    path = Path(ext["config_path"]).expanduser() if ext.get("config_path") else hermes_config_path()
     if not write:
         return {"path": str(path), "block": block, "written": False}
     if not path.exists():

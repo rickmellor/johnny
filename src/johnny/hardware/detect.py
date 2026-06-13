@@ -170,7 +170,9 @@ def detect(refresh: bool = False) -> Hardware:
     else:
         gpus = []
 
-    probe_script = (cfg.get("scripts") or {}).get("probe_dtypes")
+    from ..bundled import resolve_script
+
+    probe_script = resolve_script("probe_dtypes", cfg)  # bundled by default
     image = (cfg.get("docker") or {}).get("vllm_image")
 
     # Cluster into homogeneous groups (vendor, arch, rounded VRAM).

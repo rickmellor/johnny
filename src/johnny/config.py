@@ -115,25 +115,9 @@ def autodiscover() -> dict:
     if ld:
         roots["launchers_dir"] = ld  # consumed by the P2 registry importer
 
-    # Reuse-don't-reimplement: point at the user's existing mlops scripts when present.
-    # (Used by induction/benchmark phases; recorded now so later phases find them.)
-    script_candidates = {
-        "bench": home / "vllm-tuning" / "bench.sh",
-        "wait_ready": home / "vllm-tuning" / "wait-ready.sh",
-        "push_ctx": home / "vllm-tuning" / "push-coder-ctx.sh",
-        "audit_models": home / ".hermes/skills/mlops/vllm-tuner/scripts/audit-models.py",
-        "probe_dtypes": home / ".hermes/skills/mlops/vllm-tuner/scripts/probe-wmma-opcodes.sh",
-        "probe_mtp": home / ".hermes/skills/mlops/vllm-tuner/scripts/probe-mtp-availability.sh",
-        "arc_eval": home / ".hermes/skills/mlops/vllm-bench/scripts/arc_eval.py",
-        "humaneval_score": home / ".hermes/skills/mlops/vllm-bench/scripts/humaneval_chat_score.py",
-    }
-    scripts = {k: str(v) for k, v in script_candidates.items() if v.exists()}
-
-    legacy: dict = {}
-    lj = home / ".local/bin/johnny"
-    if lj.exists():
-        legacy["johnny_bash"] = str(lj)  # the v1 bash tool, for launcher import / reference
-
+    # The mlops scripts ship bundled in the package (johnny/bundled.py); we no longer
+    # hunt for machine-specific copies. `config.scripts.<key>` remains an optional
+    # override for users who want to point at their own copy.
     backends = {
         "vllm": bool(which("docker")) and os.name == "posix",
         "lmstudio": bool(which("lms")),
@@ -143,8 +127,6 @@ def autodiscover() -> dict:
     return {
         "vendor": vendor,
         "roots": roots,
-        "scripts": scripts,
-        "legacy": legacy,
         "backends": backends,
     }
 
@@ -173,10 +155,11 @@ def build_default_config(disc: dict | None = None) -> dict:
             "ports": {"base": 8000, "reserved": {"embeddings": 8001}, "range": [8000, 8019]},
         },
         "backends": {"enabled": [k for k, v in disc["backends"].items() if v]},
-        "scripts": disc["scripts"],
+        # Optional per-script overrides (key -> path); empty = use the bundled copies.
+        "scripts": {},
+        # Chat-tool handoff for `alive` / `provider sync` (generic by default).
+        "external": {"provider": "johnny", "adapter": "hermes", "tmux_session": "johnny"},
     }
-    if disc["legacy"]:
-        cfg["legacy"] = disc["legacy"]
     return cfg
 
 

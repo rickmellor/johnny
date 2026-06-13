@@ -818,8 +818,8 @@ def alive(
     no_wait: bool = typer.Option(False, "--no-wait", help="Don't wait for a loading seat."),
     timeout: int = typer.Option(900, "--timeout"),
     no_attach: bool = typer.Option(False, "--no-attach", help="Start detached (don't attach the tmux session)."),
-    session: str = typer.Option("hermes", "--session"),
-    provider: str = typer.Option("specul8-o-matic", "--provider"),
+    session: str = typer.Option(None, "--session"),
+    provider: str = typer.Option(None, "--provider", help="Chat provider name (default: config [external].provider)."),
 ) -> None:
     """Launch (or re-attach) the chat TUI against a seat (role/model/seat)."""
     import os
@@ -846,7 +846,7 @@ app.add_typer(provider_app, name="provider")
 @provider_app.command("sync")
 def provider_sync(
     write: bool = typer.Option(False, "--write", help="Patch the config in place (timestamped backup)."),
-    provider: str = typer.Option("specul8-o-matic", "--provider"),
+    provider: str = typer.Option(None, "--provider", help="Chat provider name (default: config [external].provider)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Compute the provider's base_url + models catalog from the registry (preview, or --write)."""

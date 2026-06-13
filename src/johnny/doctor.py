@@ -89,4 +89,19 @@ def run_checks() -> list[dict]:
         avail.append("ollama")
     checks.append(_c("backends", "ok" if avail else "warn", ", ".join(avail) if avail else "no backend CLIs found"))
 
+    # --- induction readiness: bundled scripts resolve + bench prerequisites ---
+    from .bundled import all_status
+
+    cfg_data = C.load_yaml(cf) or {}
+    sstat = all_status(cfg_data)
+    missing = [k for k, v in sstat.items() if v["source"] == "missing"]
+    bench_tools = [t for t in ("bash", "curl", "bc") if not which(t)]
+    if missing:
+        checks.append(_c("induction", "warn", f"bundled scripts not resolving: {', '.join(sorted(missing))}"))
+    elif bench_tools:
+        checks.append(_c("induction", "warn", f"tuning bench needs: {', '.join(bench_tools)} (install them)"))
+    else:
+        nb = sum(1 for v in sstat.values() if v["source"] == "bundled")
+        checks.append(_c("induction", "ok", f"{nb} bundled scripts + bench prereqs present"))
+
     return checks

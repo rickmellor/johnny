@@ -216,9 +216,11 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
         if point.get("embeddings"):
             parsed = _bench_embeddings(TUNING_PORT, model_id)
         else:
-            bench_script = (cfg.get("scripts") or {}).get("bench")
-            if not bench_script or not Path(bench_script).exists():
-                result["error"] = "no bench script configured (scripts.bench)"
+            from ..bundled import resolve_script
+
+            bench_script = resolve_script("bench", cfg)  # bundled by default; config-overridable
+            if not bench_script:
+                result["error"] = "bench script unavailable (not bundled and no scripts.bench override)"
                 return result
             from ..util import run
 

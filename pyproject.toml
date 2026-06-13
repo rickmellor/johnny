@@ -26,4 +26,7 @@ johnny = "johnny.cli:main"
 path = "src/johnny/__init__.py"
 
 [tool.hatch.build.targets.wheel]
+# Includes everything under src/johnny — incl. the bundled mlops scripts in
+# src/johnny/scripts/ (bench/probes/eval harnesses) — so a clean install is
+# self-contained; johnny/bundled.py resolves them at runtime.
 packages = ["src/johnny"]

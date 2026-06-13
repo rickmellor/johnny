@@ -37,7 +37,7 @@ def _say(msg: str) -> None:
 class HermesAdapter:
     name = "hermes"
 
-    def command(self, served_model: str, provider: str = "specul8-o-matic", extra=None) -> list[str]:
+    def command(self, served_model: str, provider: str = "johnny", extra=None) -> list[str]:
         cmd = ["env", "-u", "SSH_CLIENT", "-u", "SSH_TTY", "-u", "SSH_CONNECTION",
                "hermes", "chat", "--tui", "-m", served_model, "--provider", provider]
         if extra:
@@ -68,9 +68,13 @@ def _tmux_has(session: str) -> bool:
 
 
 def alive(target: str | None = None, role: str = "orchestrator", wait: bool = True, timeout: float = 900,
-          attach: bool = True, session: str = "hermes", provider: str = "specul8-o-matic",
+          attach: bool = True, session: str | None = None, provider: str | None = None,
           extra_args=None, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
+    ext = cfg.get("external") or {}
+    provider = provider or ext.get("provider") or "johnny"
+    session = session or ext.get("tmux_session") or "johnny"
+    adapter_name = ext.get("adapter", "hermes")
     tgt = target or role
     res = service.resolve(tgt, cfg)
 
@@ -93,7 +97,10 @@ def alive(target: str | None = None, role: str = "orchestrator", wait: bool = Tr
     if not which("tmux"):
         return {"error": "tmux not installed (needed to host the TUI session)"}
 
-    inner = HermesAdapter().command(served, provider=provider, extra=extra_args)
+    if adapter_name == "generic" and ext.get("command_template"):
+        inner = GenericAdapter(ext["command_template"]).command(served, base_url=res.get("endpoint"), extra=extra_args)
+    else:
+        inner = HermesAdapter().command(served, provider=provider, extra=extra_args)
     fresh = False
     if not _tmux_has(session):
         subprocess.run(["tmux", "new-session", "-d", "-s", session,
