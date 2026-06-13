@@ -607,9 +607,98 @@ def metrics(seat: str = typer.Argument(...), json_output: bool = typer.Option(Fa
         console.print(f"  {k}: {v}")
 
 
+# --------------------------------------------------------------------------- induction (P4)
+def _render_plan(pl: dict) -> None:
+    a = pl["audit"]
+    console.print(f"[bold]{pl['model_id']}[/]  [dim]{pl['path']}[/]")
+    console.print(f"  arch={a['arch']} quant={a['quant']} size={a['size_gb']}GB native_ctx={a['native_ctx']} "
+                  f"· free GPUs={pl['free_gpus']} · priors={pl['priors']}")
+    vt = Table(title="viable placements", title_style="bold")
+    for col in ("TP", "QUANT", "GB/GPU", "KV-CEILING CTX"):
+        vt.add_column(col)
+    for v in pl["viable"]:
+        vt.add_row(str(v["tp"]), str(v.get("quant")), str(v.get("per_gpu_gb")), str(v.get("kv_ceiling_ctx")))
+    console.print(vt)
+    if pl["pruned"]:
+        console.print("[dim]pruned:[/]")
+        for p in pl["pruned"]:
+            console.print(f"  [yellow]✗ tp={p['tp']}[/] — {p['reason']}")
+    console.print(f"[bold]{len(pl['points'])}[/] candidate config point(s) to sweep "
+                  f"[dim](seeded search, not a brute grid)[/]")
+
+
+@app.command()
+def induct(
+    model: str = typer.Argument(..., help="HF id, registry id, or local path."),
+    use_case: str = typer.Option(None, "--use-case", help="throughput | latency | context"),
+    bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
+    plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
+    resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
+    max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Auto-tune a model into an optimal placement (tuning by default)."""
+    from .induct import pipeline
+
+    if plan:
+        try:
+            pl = pipeline.plan(model, max_points=max_points)
+        except Exception as e:
+            _emit_err(e, json_output)
+        if json_output:
+            console.print(_json.dumps(pl, indent=2))
+        else:
+            _render_plan(pl)
+        return
+
+    if not yes and not json_output:
+        try:
+            pl = pipeline.plan(model, max_points=max_points)
+        except Exception as e:
+            _emit_err(e, json_output)
+        _render_plan(pl)
+        if not typer.confirm(f"Launch {len(pl['points'])} tuning seat(s)? (each is a real load + bench)"):
+            raise typer.Exit(code=1)
+
+    try:
+        res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points)
+    except Exception as e:
+        _emit_err(e, json_output)
+    if json_output:
+        console.print(_json.dumps(res, indent=2, default=str))
+        return
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    w = res.get("winner")
+    if w:
+        wp = w["point"]
+        console.print(f"[green]✓ winner[/] TP={wp.get('tp')} gmu={wp.get('gpu_memory_util')} "
+                      f"mml={wp.get('max_model_len')} → peak {w.get('peak_tok_s')} tok/s, single {w.get('single_tok_s')} tok/s")
+        console.print(f"  wrote placement [bold]{res['placement_id']}[/] to the registry")
+    else:
+        console.print("[yellow]no winning config[/] (all points failed — see the report)")
+    console.print(f"  report: {res['report']}  ·  bench: {res['bench']}")
+
+
+@app.command()
+def tune(
+    model: str = typer.Argument(..., help="Registry id or local path."),
+    use_case: str = typer.Option(None, "--use-case"),
+    resume: bool = typer.Option(False, "--resume"),
+    max_points: int = typer.Option(None, "--max-points"),
+    yes: bool = typer.Option(False, "--yes"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Re-tune an existing model (induction, tuning-only)."""
+    induct(model=model, use_case=use_case, bench=False, plan=False, resume=resume,
+           max_points=max_points, yes=yes, json_output=json_output)
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
-    "induct": "P4", "tune": "P4", "bench": "P4",
+    "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
     "search": "P5", "download": "P5", "login": "P5", "alive": "P6",
     "provider": "P6", "cleanup": "P8", "nodes": "P11",
 }
