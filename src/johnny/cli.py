@@ -890,6 +890,88 @@ def cleanup(
         console.print("[dim]dry-run — pass --apply to delete untracked dirs (with confirmation).[/]")
 
 
+# --------------------------------------------------------------------------- daemon / request plane (P10)
+daemon_app = typer.Typer(add_completion=False, help="johnnyd: request-plane API + JIT gateway.")
+app.add_typer(daemon_app, name="daemon")
+
+
+def _daemon_pidfile():
+    return C.get_paths().state_dir / "johnnyd.json"
+
+
+@daemon_app.command("up")
+def daemon_up(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8080, "--port"),
+    no_jit: bool = typer.Option(False, "--no-jit", help="Disable load-on-first-request."),
+    max_concurrent: int = typer.Option(0, "--max-concurrent", help="Per-seat admission cap (0=unlimited)."),
+    foreground: bool = typer.Option(False, "--foreground", help="Run in this process (don't detach)."),
+) -> None:
+    """Start johnnyd (request-plane API + OpenAI-compatible JIT gateway)."""
+    if foreground:
+        from .daemon.server import serve
+
+        serve(host=host, port=port, jit=not no_jit, max_concurrent=max_concurrent)
+        return
+    import subprocess
+    import sys
+
+    args = [sys.executable, "-m", "johnny", "daemon", "up", "--foreground", "--host", host, "--port", str(port)]
+    if no_jit:
+        args.append("--no-jit")
+    if max_concurrent:
+        args += ["--max-concurrent", str(max_concurrent)]
+    p = subprocess.Popen(args, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pf = _daemon_pidfile()
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(_json.dumps({"pid": p.pid, "host": host, "port": port}))
+    console.print(f"[green]●[/] johnnyd started · pid {p.pid} · http://{host}:{port}  "
+                  f"[dim](jit={'off' if no_jit else 'on'})[/]")
+    console.print(f"  try: curl http://{host}:{port}/v1/fleet  ·  stop: johnny daemon down")
+
+
+@daemon_app.command("status")
+def daemon_status(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Is johnnyd running + healthy?"""
+    import urllib.request
+
+    pf = _daemon_pidfile()
+    if not pf.exists():
+        console.print("[dim]johnnyd not running (no pidfile).[/]")
+        raise typer.Exit(code=1)
+    info = _json.loads(pf.read_text())
+    healthy = False
+    try:
+        with urllib.request.urlopen(f"http://{info['host']}:{info['port']}/healthz", timeout=2) as r:
+            healthy = _json.loads(r.read()).get("ok", False)
+    except Exception:
+        healthy = False
+    if json_output:
+        console.print(_json.dumps({**info, "healthy": healthy}, indent=2))
+        return
+    console.print(f"{'[green]● healthy[/]' if healthy else '[red]○ unreachable[/]'} "
+                  f"johnnyd pid {info['pid']} · http://{info['host']}:{info['port']}")
+
+
+@daemon_app.command("down")
+def daemon_down() -> None:
+    """Stop johnnyd."""
+    import os
+    import signal
+
+    pf = _daemon_pidfile()
+    if not pf.exists():
+        console.print("[dim]johnnyd not running.[/]")
+        return
+    info = _json.loads(pf.read_text())
+    try:
+        os.kill(info["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    pf.unlink(missing_ok=True)
+    console.print(f"[green]✓[/] johnnyd stopped (pid {info['pid']})")
+
+
 # --------------------------------------------------------------------------- TUI (P9)
 @app.command()
 def tui() -> None:
