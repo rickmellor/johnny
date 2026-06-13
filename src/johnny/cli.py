@@ -688,8 +688,9 @@ def induct(
         if not typer.confirm(f"Launch {len(pl['points'])} tuning seat(s)? (each is a real load + bench)"):
             raise typer.Exit(code=1)
 
+    prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
-        res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points)
+        res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points, progress=prog)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:

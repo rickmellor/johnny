@@ -72,7 +72,9 @@ def run(
     resume: bool = False,
     max_points: int | None = None,
     cfg: dict | None = None,
+    progress=None,
 ) -> dict:
+    _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
@@ -84,26 +86,37 @@ def run(
     a = stages.audit(path)
     st["audit_summary"] = {"arch": a.get("arch"), "quant": a.get("quant"), "size_gb": round(a.get("size_bytes", 0) / 1e9, 1)}
     _save_state(model_id, st)
+    _p(f"audit: {a.get('arch')} · {round(a.get('size_bytes', 0) / 1e9, 1)}GB · quant={a.get('quant')}")
 
     viable, pruned = stages.hardware_fit(a, hw, len(free_gpus(hw, all_seats(cfg))))
+    _p(f"hardware-fit: {len(viable)} viable, {len(pruned)} pruned")
     if not viable:
         return {"model_id": model_id, "error": "no viable placement on this hardware", "pruned": pruned}
 
     points = grid.candidate_points(viable, grid.seed_priors(store.load(), model_id), max_points=max_points)
+    done = sum(1 for p in points if report._point_sig(p) in st["results"])
+    _p(f"sweep: {len(points)} point(s)" + (f" ({done} already done, resuming)" if done else ""))
 
-    for point in points:
+    for i, point in enumerate(points, 1):
         sig = report._point_sig(point)
         if sig in st["results"]:  # resumable: skip already-benched points
+            _p(f"[{i}/{len(points)}] {sig}: cached, skipping")
             continue
         gpus = assign_gpus(point["tp"], hw, free_gpus(hw, all_seats(cfg)))
         if len(gpus) < point["tp"]:
             r = {"point": point, "ok": False, "error": f"insufficient free GPUs for tp={point['tp']}"}
+            _p(f"[{i}/{len(points)}] {sig}: skipped (insufficient free GPUs)")
         else:
+            _p(f"[{i}/{len(points)}] {sig}: launching on GPU {gpus} + benching…")
             collect.add_pin(stages.TUNING_CONTAINER)  # reaper-safe for the run
             try:
                 r = stages.tune_point(model_id, path, point, gpus, cfg, hw)
             finally:
                 collect.remove_pin(stages.TUNING_CONTAINER)
+            if r.get("ok"):
+                _p(f"[{i}/{len(points)}] {sig}: peak {r.get('peak_tok_s')} tok/s, single {r.get('single_tok_s')} tok/s")
+            else:
+                _p(f"[{i}/{len(points)}] {sig}: FAILED — {(r.get('error') or '')[:80]}")
         st["results"][sig] = r
         _save_state(model_id, st)
 
