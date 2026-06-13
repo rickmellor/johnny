@@ -768,10 +768,70 @@ def login(
         console.print("[yellow]no HF token[/] — set one with `johnny login --token <hf_...>` (needed for gated models).")
 
 
+# --------------------------------------------------------------------------- chat TUI + provider (P6)
+@app.command()
+def alive(
+    model: str = typer.Option(None, "--model", help="Target a specific model."),
+    seat: str = typer.Option(None, "--seat", help="Target a specific seat."),
+    role: str = typer.Option("orchestrator", "--role", help="Target seat by role (default)."),
+    no_wait: bool = typer.Option(False, "--no-wait", help="Don't wait for a loading seat."),
+    timeout: int = typer.Option(900, "--timeout"),
+    no_attach: bool = typer.Option(False, "--no-attach", help="Start detached (don't attach the tmux session)."),
+    session: str = typer.Option("hermes", "--session"),
+    provider: str = typer.Option("specul8-o-matic", "--provider"),
+) -> None:
+    """Launch (or re-attach) the chat TUI against a seat (role/model/seat)."""
+    import os
+
+    from .external import tui
+
+    target = seat or model
+    res = tui.alive(target=target, role=role, wait=not no_wait, timeout=timeout,
+                    attach=not no_attach, session=session, provider=provider)
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]●[/] {res['action']} session [bold]{res['session']}[/] · seat={res['seat']} · model={res['model']}")
+    if res["action"] == "attach":
+        os.execvp("tmux", ["tmux", "attach", "-t", res["session"]])
+    else:
+        console.print(f"  [dim]attach with: tmux attach -t {res['session']}[/]")
+
+
+provider_app = typer.Typer(add_completion=False, help="Sync an external chat tool's provider config.")
+app.add_typer(provider_app, name="provider")
+
+
+@provider_app.command("sync")
+def provider_sync(
+    write: bool = typer.Option(False, "--write", help="Patch the config in place (timestamped backup)."),
+    provider: str = typer.Option("specul8-o-matic", "--provider"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Compute the provider's base_url + models catalog from the registry (preview, or --write)."""
+    from .external import provider as prov
+
+    res = prov.sync(provider_name=provider, write=write)
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    b = res["block"]
+    console.print(f"[bold]{b['name']}[/]  base_url={b['base_url']}  ({len(b['models'])} models)")
+    for mid, meta in sorted(b["models"].items()):
+        console.print(f"  {mid}: context_length={meta['context_length']}")
+    if res["written"]:
+        console.print(f"[green]✓ patched[/] {res['path']}  [dim](backup {res['backup']})[/]")
+    else:
+        console.print(f"[dim]preview only — pass --write to patch {res['path']} (creates a backup).[/]")
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
-    "alive": "P6", "provider": "P6", "cleanup": "P8", "nodes": "P11",
+    "cleanup": "P8", "nodes": "P11",
 }
 
 
