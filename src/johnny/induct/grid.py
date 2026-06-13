@@ -29,20 +29,44 @@ def read_config(path: str) -> dict:
         return {}
 
 
+# Defaults for model families whose config.json is stripped (values come from the
+# transformers config class at load time, so they're absent on disk). Keyed by
+# model_type. ctx = native context; head_dim where it's fixed across sizes.
+_MODEL_TYPE_DEFAULTS = {
+    "gemma3": {"ctx": 131072, "head_dim": 256},
+    "gemma3_text": {"ctx": 131072, "head_dim": 256},
+    "gemma2": {"ctx": 8192, "head_dim": 256},
+}
+
+_CTX_KEYS = ("max_position_embeddings", "max_sequence_length", "n_positions", "seq_length")
+
+
 def dims(config: dict) -> dict:
     tc = config.get("text_config") or {}
 
     def g(k):
         return config.get(k) if config.get(k) is not None else tc.get(k)
 
+    mt = str(g("model_type") or "").lower()
+    defaults = _MODEL_TYPE_DEFAULTS.get(mt, {})
+
     n_heads = g("num_attention_heads")
     hidden = g("hidden_size")
-    head_dim = g("head_dim") or ((hidden // n_heads) if (hidden and n_heads) else None)
+    head_dim = g("head_dim") or defaults.get("head_dim") or ((hidden // n_heads) if (hidden and n_heads) else None)
+
+    ctx = None
+    for k in _CTX_KEYS:
+        if g(k):
+            ctx = g(k)
+            break
+    if not ctx:
+        ctx = defaults.get("ctx")  # stripped config → family default
+
     return {
         "layers": g("num_hidden_layers"),
         "kv_heads": g("num_key_value_heads") or n_heads,
         "head_dim": head_dim,
-        "ctx": g("max_position_embeddings"),
+        "ctx": ctx,
     }
 
 
