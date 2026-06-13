@@ -890,6 +890,15 @@ def cleanup(
         console.print("[dim]dry-run — pass --apply to delete untracked dirs (with confirmation).[/]")
 
 
+# --------------------------------------------------------------------------- TUI (P9)
+@app.command()
+def tui() -> None:
+    """Launch the live Textual dashboard (seats, concurrency, KV — by backend/model)."""
+    from .tui.app import run as run_tui
+
+    run_tui()
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
