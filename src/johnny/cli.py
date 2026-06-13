@@ -696,11 +696,82 @@ def tune(
            max_points=max_points, yes=yes, json_output=json_output)
 
 
+# --------------------------------------------------------------------------- discovery (P5)
+_VERDICT_STYLE = {"fits": "green", "tight": "yellow", "wont-fit": "red", "unknown": "dim"}
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Hugging Face search query."),
+    limit: int = typer.Option(10, "--limit"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Search Hugging Face with a fit verdict for your hardware + capability badges."""
+    from .discover import search as dsearch
+    from .hardware import detect as hwdetect
+
+    res = dsearch.search(query, hwdetect.detect(), limit=limit)
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    t = Table(title=f"HF search: {query}", title_style="bold")
+    for col in ("MODEL", "DOWNLOADS", "GATED", "SIZE", "FIT", "BADGES"):
+        t.add_column(col)
+    for r in res["results"]:
+        v = r["fit"]
+        verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
+        t.add_row(r["id"], str(r.get("downloads") or "—"), "🔒" if r["gated"] else "",
+                  f"{r['size_gb']}GB" if r["size_gb"] else "—",
+                  f"{verdict} {v.get('detail', '')}", ", ".join(r["badges"]) or "—")
+    console.print(t)
+
+
+@app.command()
+def download(repo: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+    """Download a model into the models dir (gated models need `johnny login`)."""
+    from .discover import search as dsearch
+
+    cfg = C.load_yaml(C.get_paths().config_file) or {}
+    models_dir = (cfg.get("roots") or {}).get("models_dir")
+    if not models_dir:
+        err.print("[red]no models_dir in config[/] — run `johnny init`.")
+        raise typer.Exit(code=1)
+    console.print(f"[dim]downloading {repo} → {models_dir}/{repo} … (large; ^C to abort)[/]")
+    res = dsearch.acquire(repo, models_dir)
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    console.print(_json.dumps(res, indent=2) if json_output else f"[green]✓ downloaded[/] {repo} → {res['path']}")
+
+
+@app.command()
+def login(
+    token: str = typer.Option(None, "--token", help="HF token; omit to show status."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Store / check a Hugging Face token (for gated models)."""
+    from .discover import auth
+
+    if token:
+        p = auth.save_token(token)
+        console.print(_json.dumps({"saved": str(p)}, indent=2) if json_output else f"[green]✓[/] token saved to {p}")
+        return
+    present = auth.has_token()
+    if json_output:
+        console.print(_json.dumps({"token_present": present, "path": str(auth.token_path())}, indent=2))
+    elif present:
+        console.print(f"[green]✓[/] HF token present  [dim]({auth.token_path()})[/]")
+    else:
+        console.print("[yellow]no HF token[/] — set one with `johnny login --token <hf_...>` (needed for gated models).")
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
-    "search": "P5", "download": "P5", "login": "P5", "alive": "P6",
-    "provider": "P6", "cleanup": "P8", "nodes": "P11",
+    "alive": "P6", "provider": "P6", "cleanup": "P8", "nodes": "P11",
 }
 
 
