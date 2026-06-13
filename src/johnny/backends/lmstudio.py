@@ -83,5 +83,55 @@ class LmStudioDriver(Driver):
         return seats
 
     def probe_model(self, path: str) -> dict:
-        # LM Studio owns model metadata; richer probing arrives with the full P7 driver.
+        # LM Studio owns model metadata; config.json (if a raw HF dir) is still readable.
         return {}
+
+    DEFAULT_PORT = 1234
+
+    def compose(self, spec: dict) -> list[str]:
+        """A launch spec -> the `lms load` argv. Knobs map: context_length, gpu offload, ttl.
+
+        LM Studio owns GPU placement + serves all loaded models on one port, so there's
+        no per-GPU pinning or per-seat port here (unlike vLLM).
+        """
+        args = ["lms", "load", spec["model_key"], "--identifier", spec["identifier"], "--yes"]
+        if spec.get("context_length"):
+            args += ["--context-length", str(spec["context_length"])]
+        gpu = spec.get("gpu_offload")
+        if gpu is not None:
+            args += ["--gpu", str(gpu)]
+        if spec.get("ttl"):
+            args += ["--ttl", str(spec["ttl"])]
+        return args
+
+    def launch(self, spec: dict) -> SeatInfo:
+        if not self.available():
+            raise RuntimeError("LM Studio CLI (`lms`) not found on this box")
+        argv = self.compose(spec)
+        rc, _out, errout = run(argv, timeout=300)
+        if rc != 0:
+            raise RuntimeError(f"`lms load` failed: {errout.strip() or 'unknown error'}")
+        return SeatInfo(
+            "lmstudio", spec["identifier"], spec.get("model_key"),
+            spec.get("port", self.DEFAULT_PORT), [], "loading",
+            {"server": f"http://127.0.0.1:{spec.get('port', self.DEFAULT_PORT)}/v1"},
+        )
+
+    def stop(self, seat: str) -> None:
+        if self.available():
+            run(["lms", "unload", seat], timeout=60)
+
+    def metrics(self, seat: str) -> dict:
+        # LM Studio exposes nothing near vLLM's Prometheus; degrade visibly (§3.7).
+        return {"seat": seat, "source": "unavailable", "note": "LM Studio has no Prometheus endpoint"}
+
+    def logs(self, seat: str, follow: bool = False, tail: int = 200):
+        # `lms log stream` is server-global, not per-seat.
+        if not self.available():
+            return "(lms not available)"
+        if follow:
+            import subprocess
+
+            return subprocess.call(["lms", "log", "stream"])
+        rc, out, _ = run(["lms", "log", "stream", "--no-follow"], timeout=10)
+        return out if rc == 0 else "(no per-seat logs; `lms log stream` is server-global)"

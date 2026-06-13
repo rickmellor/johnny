@@ -57,6 +57,29 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     }
 
 
+def _up_lmstudio(model_id: str, model: dict, placement: dict, cfg: dict) -> dict:
+    """LM Studio launch: it owns GPU placement + a shared server port, so we skip
+    GPU assignment/port allocation and delegate to `lms load` via the driver."""
+    drv = get_driver("lmstudio")
+    if not drv.available():
+        raise PlacementError("LM Studio (`lms`) is not available on this box")
+    ident = model.get("identity") or {}
+    knobs = placement.get("knobs") or {}
+    extra = placement.get("extra") or {}
+    spec = {
+        "model_key": ident.get("local_path") or ident.get("repo_id") or model_id,
+        "identifier": model_id,
+        "context_length": knobs.get("max_model_len"),
+        "gpu_offload": knobs.get("gpu_offload") or extra.get("gpu_offload") or "max",
+        "ttl": extra.get("ttl"),
+        "port": (cfg.get("lmstudio") or {}).get("port", 1234),
+    }
+    seat = drv.launch(spec)
+    collect.record_activity(seat.name)
+    return {"action": "launched", "seat": seat.name, "port": seat.port, "gpus": [],
+            "model": model_id, "placement": placement.get("id"), "state": "loading", "backend": "lmstudio"}
+
+
 def _find_seat(seats, name_or_model: str):
     for s in seats:
         if s.name == name_or_model:
@@ -92,6 +115,9 @@ def up(
         existing = _find_seat(seats, model_id)
         if existing and not swap and not force:
             return {"action": "exists", "seat": existing.name, "port": existing.port, "state": existing.state, "model": model_id}
+
+        if (placement.get("backend") or "vllm") == "lmstudio":
+            return _up_lmstudio(model_id, model, placement, cfg)
 
         if swap:
             target = _find_seat(seats, swap)
