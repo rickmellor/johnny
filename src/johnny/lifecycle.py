@@ -64,18 +64,91 @@ def cleanup_candidates(cfg: dict | None = None, stale_days: int = 30) -> dict:
     return {"fingerprint": hw.fingerprint, "candidates": cands}
 
 
-def delete_untracked(candidate: dict) -> bool:
-    """Delete an 'untracked' on-disk model dir. Returns True on success."""
-    if candidate.get("kind") != "untracked" or not candidate.get("path"):
-        return False
+def _models_dir(cfg: dict | None = None) -> str | None:
+    cfg = cfg if cfg is not None else (C.load_yaml(C.get_paths().config_file) or {})
+    return (cfg.get("roots") or {}).get("models_dir")
+
+
+def delete_path(path: str, cfg: dict | None = None) -> bool:
+    """Delete a model dir — but only if it lives inside the configured models dir."""
     import shutil
 
-    p = Path(candidate["path"])
-    models_dir = Path((C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir", "")).expanduser()
-    # safety: only delete inside the configured models dir
+    md = _models_dir(cfg)
+    if not md:
+        return False
+    p = Path(path)
     try:
-        p.resolve().relative_to(models_dir.resolve())
+        p.resolve().relative_to(Path(md).expanduser().resolve())
     except (ValueError, OSError):
         return False
     shutil.rmtree(p, ignore_errors=True)
     return not p.exists()
+
+
+def delete_untracked(candidate: dict) -> bool:
+    """Delete an 'untracked' on-disk model dir. Returns True on success."""
+    if candidate.get("kind") != "untracked" or not candidate.get("path"):
+        return False
+    return delete_path(candidate["path"])
+
+
+def resolve_target(target: str, cfg: dict | None = None) -> dict | None:
+    """Resolve a removal target (registry id, local_path, or on-disk path) to
+    {model_id, local_path, path, size_gb}. None if it matches nothing."""
+    cfg = cfg if cfg is not None else (C.load_yaml(C.get_paths().config_file) or {})
+    md = _models_dir(cfg)
+    reg = store.load()
+    models = reg.get("models") or {}
+
+    def _entry(model_id, local_path):
+        path = None
+        if md and local_path:
+            cand = Path(md).expanduser() / local_path
+            if cand.exists():
+                path = str(cand)
+        return {"model_id": model_id, "local_path": local_path, "path": path,
+                "size_gb": round(grid.model_size_bytes(path) / 1e9, 1) if path else None}
+
+    if target in models:
+        return _entry(target, (models[target].get("identity") or {}).get("local_path"))
+    for mid, m in models.items():
+        if (m.get("identity") or {}).get("local_path") == target:
+            return _entry(mid, target)
+    p = Path(target).expanduser()
+    if not p.is_absolute() and md:
+        p = Path(md).expanduser() / target
+    if p.exists():
+        return {"model_id": None, "local_path": target, "path": str(p),
+                "size_gb": round(grid.model_size_bytes(str(p)) / 1e9, 1)}
+    return None
+
+
+def running_seat_for(info: dict, cfg: dict | None = None) -> str | None:
+    """If the target model is currently serving, return its seat name (so we refuse
+    to delete a live model)."""
+    from .engine import all_seats
+
+    mid = info.get("model_id")
+    if not mid:
+        return None
+    for s in all_seats(cfg):
+        labels = (s.extra or {}).get("labels", {})
+        if s.model == mid or labels.get("johnny.model") == mid:
+            return s.name
+    return None
+
+
+def remove(info: dict, registry_only: bool = False, cfg: dict | None = None) -> dict:
+    """Remove a single model: its on-disk weights (unless --registry-only) and/or its
+    registry entry."""
+    result = {"model_id": info.get("model_id"), "deleted_path": None, "deregistered": False}
+    if not registry_only and info.get("path"):
+        if delete_path(info["path"], cfg):
+            result["deleted_path"] = info["path"]
+    if info.get("model_id"):
+        reg = store.load()
+        if info["model_id"] in (reg.get("models") or {}):
+            del reg["models"][info["model_id"]]
+            store.save(reg)
+            result["deregistered"] = True
+    return result

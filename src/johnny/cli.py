@@ -882,12 +882,62 @@ def cleanup(
     console.print(t)
     if apply:
         untracked = [c for c in cands if c["kind"] == "untracked"]
-        if untracked and typer.confirm(f"Delete {len(untracked)} untracked on-disk model dir(s)?"):
-            for c in untracked:
-                ok = lifecycle.delete_untracked(c)
+        if not untracked:
+            console.print("[dim]nothing deletable here (only untracked on-disk dirs); use `johnny rm <model>` for a tracked one.[/]")
+            return
+        console.print("[dim]confirm each (Ctrl-C to stop):[/]")
+        for c in untracked:
+            if typer.confirm(f"Delete {c['target']} ({c.get('size_gb')}GB)?", default=False):
+                ok = lifecycle.delete_path(c["path"])
                 console.print(f"  {'[green]✓ deleted[/]' if ok else '[red]✗ failed[/]'} {c['target']}")
+            else:
+                console.print(f"  [dim]skipped {c['target']}[/]")
     else:
-        console.print("[dim]dry-run — pass --apply to delete untracked dirs (with confirmation).[/]")
+        console.print("[dim]dry-run — `cleanup --apply` confirms each, or `johnny rm <model>` removes a single one.[/]")
+
+
+@app.command(name="rm")
+def rm(
+    target: str = typer.Argument(..., help="Model id, local path (vendor/name), or directory."),
+    registry_only: bool = typer.Option(False, "--registry-only", help="Deregister but keep the weights on disk."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Remove a single model: its on-disk weights and/or its registry entry."""
+    from . import lifecycle
+
+    info = lifecycle.resolve_target(target)
+    if not info:
+        err.print(f"[red]no model[/] '{target}' on disk or in the registry")
+        raise typer.Exit(code=1)
+    seat = lifecycle.running_seat_for(info)
+    if seat:
+        err.print(f"[red]'{target}' is serving as seat[/] {seat} — stop it first: `johnny down {seat}`")
+        raise typer.Exit(code=1)
+
+    actions = []
+    if info.get("model_id"):
+        actions.append("deregister from registry")
+    if not registry_only and info.get("path"):
+        actions.append(f"delete {info['path']} ({info.get('size_gb')}GB)")
+    if not actions:
+        console.print(f"[yellow]nothing to do[/] for '{target}' (no registry entry and no on-disk path).")
+        return
+
+    if not yes and not json_output:
+        console.print("will: " + "; ".join(actions))
+        if not typer.confirm("Proceed?", default=False):
+            raise typer.Exit(code=1)
+    res = lifecycle.remove(info, registry_only=registry_only)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    if res["deleted_path"]:
+        console.print(f"[green]✓ deleted[/] {res['deleted_path']}")
+    if res["deregistered"]:
+        console.print(f"[green]✓ deregistered[/] {res['model_id']}")
+    if not res["deleted_path"] and not res["deregistered"]:
+        console.print("[yellow]nothing removed[/]")
 
 
 # --------------------------------------------------------------------------- daemon / request plane (P10)
