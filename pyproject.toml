@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "johnny-fleet"
+version = "0.1.0"
+description = "johnny — a shareable local inference environment manager (pluggable backends: vLLM, LM Studio, Ollama)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rick Mellor", email = "rickmellor@gmail.com" }]
+keywords = ["llm", "vllm", "inference", "fleet", "local", "gpu"]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "platformdirs>=4.0",
+]
+
+[project.scripts]
+johnny = "johnny.cli:main"
+
+[tool.hatch.version]
+path = "src/johnny/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/johnny"]
