@@ -587,8 +587,35 @@ def logs(
 
 
 @app.command()
-def metrics(seat: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
-    """Show normalized telemetry for a seat (vLLM /metrics)."""
+def metrics(
+    seat: str = typer.Argument(...),
+    history: bool = typer.Option(False, "--history", help="Aggregate trends from the telemetry SQLite."),
+    since: int = typer.Option(None, "--since", help="History window in seconds (default: all)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show telemetry for a seat: live vLLM /metrics, or --history rollup trends."""
+    if history:
+        from .telemetry import collect
+
+        rows = collect.rollup(seat=seat, since_s=since)
+        if json_output:
+            console.print(_json.dumps(rows, indent=2))
+            return
+        if not rows:
+            console.print(f"[dim]no telemetry history for '{seat}' yet.[/]")
+            return
+        t = Table(title=f"metrics history — {seat}", title_style="bold")
+        for col in ("SEAT", "SAMPLES", "AVG gen tok/s", "MAX gen tok/s", "AVG TTFT ms", "PEAK running"):
+            t.add_column(col)
+        for r in rows:
+            t.add_row(r["seat"], str(r["samples"]),
+                      f"{r['avg_gen_tok_s']:.1f}" if r["avg_gen_tok_s"] else "—",
+                      f"{r['max_gen_tok_s']:.1f}" if r["max_gen_tok_s"] else "—",
+                      f"{r['avg_ttft_ms']:.1f}" if r["avg_ttft_ms"] else "—",
+                      str(r["peak_running"] if r["peak_running"] is not None else "—"))
+        console.print(t)
+        return
+
     from .engine import all_seats, driver_for
 
     target = None
@@ -828,10 +855,45 @@ def provider_sync(
         console.print(f"[dim]preview only — pass --write to patch {res['path']} (creates a backup).[/]")
 
 
+# --------------------------------------------------------------------------- lifecycle / cleanup (P8)
+@app.command()
+def cleanup(
+    apply: bool = typer.Option(False, "--apply", help="Actually delete (default: dry-run preview)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Surface removal candidates (untracked on disk / unvalidated-here / stale)."""
+    from . import lifecycle
+
+    res = lifecycle.cleanup_candidates()
+    cands = res["candidates"]
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    if not cands:
+        console.print(f"[green]nothing to clean up[/]  [dim](fingerprint {res['fingerprint']})[/]")
+        return
+    t = Table(title="cleanup candidates", title_style="bold")
+    for col in ("KIND", "TARGET", "SIZE", "REASON"):
+        t.add_column(col)
+    style = {"untracked": "yellow", "unvalidated": "cyan", "stale": "dim"}
+    for c in cands:
+        t.add_row(f"[{style.get(c['kind'], 'white')}]{c['kind']}[/]", c["target"],
+                  f"{c['size_gb']}GB" if c.get("size_gb") else "—", c["reason"])
+    console.print(t)
+    if apply:
+        untracked = [c for c in cands if c["kind"] == "untracked"]
+        if untracked and typer.confirm(f"Delete {len(untracked)} untracked on-disk model dir(s)?"):
+            for c in untracked:
+                ok = lifecycle.delete_untracked(c)
+                console.print(f"  {'[green]✓ deleted[/]' if ok else '[red]✗ failed[/]'} {c['target']}")
+    else:
+        console.print("[dim]dry-run — pass --apply to delete untracked dirs (with confirmation).[/]")
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
-    "cleanup": "P8", "nodes": "P11",
+    "nodes": "P11",
 }
 
 

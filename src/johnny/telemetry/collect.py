@@ -105,6 +105,25 @@ def record_load_event(seat: str, model: str, placement: str, started_ts: int, re
         )
 
 
+def rollup(seat: str | None = None, since_s: int | None = None) -> list[dict]:
+    """Aggregate metric samples per seat (monitoring trends, §3.8)."""
+    since = (now() - since_s) if since_s else 0
+    q = ("SELECT seat, COUNT(*), AVG(gen_tok_s), MAX(gen_tok_s), AVG(ttft_ms), MAX(running) "
+         "FROM samples WHERE ts>=?")
+    args: list = [since]
+    if seat:
+        q += " AND seat=?"
+        args.append(seat)
+    q += " GROUP BY seat"
+    with connect() as conn:
+        rows = conn.execute(q, args).fetchall()
+    return [
+        {"seat": r[0], "samples": r[1], "avg_gen_tok_s": r[2], "max_gen_tok_s": r[3],
+         "avg_ttft_ms": r[4], "peak_running": r[5]}
+        for r in rows
+    ]
+
+
 def cold_start_estimate(model: str, placement: str | None = None) -> float | None:
     """Median historical cold-start seconds for a model/placement, or None."""
     with connect() as conn:

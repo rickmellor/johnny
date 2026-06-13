@@ -116,7 +116,12 @@ def run(
     if winner:
         rtv = ((cfg.get("docker") or {}).get("vllm_image", "") or "").split(":")[-1] or "unknown"
         placement = report.to_placement(model_id, winner, a, hw, rtv, use_case)
-        report.write_placement(model_id, a, placement, hw)
+        md = (cfg.get("roots") or {}).get("models_dir")
+        try:
+            lp = str(Path(path).relative_to(Path(md).expanduser())) if md else None
+        except (ValueError, TypeError):
+            lp = None
+        report.write_placement(model_id, a, placement, hw, local_path=lp)
 
     st["done"] = True
     _save_state(model_id, st)

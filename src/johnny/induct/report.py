@@ -42,7 +42,7 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
     }
 
 
-def write_placement(model_id: str, audit: dict, placement: dict, hardware) -> None:
+def write_placement(model_id: str, audit: dict, placement: dict, hardware, local_path: str | None = None) -> None:
     reg = store.load()
     models = reg.setdefault("models", {})
     m = models.setdefault(model_id, {
@@ -50,6 +50,8 @@ def write_placement(model_id: str, audit: dict, placement: dict, hardware) -> No
     })
     ident = m["identity"]
     ident.setdefault("repo_id", model_id)
+    if local_path:
+        ident.setdefault("local_path", local_path)
     ident.setdefault("arch", audit.get("arch"))
     ident.setdefault("quant", audit.get("quant"))
     cap = m["capabilities"]
