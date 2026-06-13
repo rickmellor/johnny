@@ -302,11 +302,126 @@ def gpu(
     console.print(f"  fp8 native: {fp8}    fp4 native: {fp4}")
 
 
+# --------------------------------------------------------------------------- registry
+registry_app = typer.Typer(add_completion=False, help="Inspect / seed / validate the model registry.")
+app.add_typer(registry_app, name="registry")
+
+
+@registry_app.command("show")
+def registry_show(
+    model: str = typer.Argument(None, help="Model id to detail; omit to list all."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List registry models (or detail one), with their placements."""
+    from .registry import store
+
+    reg = store.load()
+    models = store.models(reg)
+    if model:
+        m = models.get(model)
+        if not m:
+            err.print(f"[red]no model[/] '{model}' in the registry")
+            raise typer.Exit(code=1)
+        if json_output:
+            console.print(_json.dumps(m, indent=2))
+            return
+        ident = m.get("identity", {})
+        console.print(f"[bold]{model}[/]  [dim]{ident.get('local_path') or ident.get('repo_id')}[/]")
+        console.print(f"  arch={ident.get('arch')} quant={ident.get('quant')} ctx={m.get('capabilities',{}).get('native_context')}")
+        t = Table(title="placements")
+        for col in ("ID", "BACKEND", "USE", "TP", "MML", "GMU", "MTP", "KV", "SOURCE", "FINGERPRINT"):
+            t.add_column(col)
+        for p in m.get("placements", []):
+            k = p.get("knobs", {})
+            mtp = "on" if (k.get("mtp") or {}).get("enabled") else "—"
+            t.add_row(p.get("id", ""), p.get("backend", ""), str(p.get("use_case") or "—"),
+                      str(k.get("tensor_parallel_size") or "—"), str(k.get("max_model_len") or "—"),
+                      str(k.get("gpu_memory_util") or "—"), mtp, str(k.get("kv_cache_dtype") or "—"),
+                      p.get("source", ""), p.get("validation_key", {}).get("hardware_fingerprint", "—"))
+        console.print(t)
+        return
+
+    if json_output:
+        console.print(_json.dumps(reg, indent=2))
+        return
+    if not models:
+        console.print("[dim]registry is empty.[/] Seed it with [bold]johnny registry import[/].")
+        return
+    t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
+    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
+        t.add_column(col)
+    for mid, m in sorted(models.items()):
+        ident = m.get("identity", {})
+        pls = m.get("placements", [])
+        backends = sorted({p.get("backend", "?") for p in pls})
+        t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
+                  str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
+    console.print(t)
+
+
+@registry_app.command("import")
+def registry_import(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported; write nothing."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Seed the registry from the bash launchers (stamped source=imported)."""
+    from .hardware import detect as hwdetect
+    from .registry import importer, schema, store
+
+    cfg = C.load_yaml(C.get_paths().config_file) or {}
+    roots = cfg.get("roots") or {}
+    launchers_dir = roots.get("launchers_dir")
+    models_dir = roots.get("models_dir")
+    if not launchers_dir:
+        err.print("[red]no launchers_dir in config[/] — run `johnny init` on a box with ~/vllm/launchers, or set roots.launchers_dir.")
+        raise typer.Exit(code=1)
+    fingerprint = hwdetect.detect().fingerprint
+    imported = importer.import_launchers(launchers_dir, models_dir, fingerprint)
+    errors = schema.validate(imported)
+
+    n_models = len(imported.get("models", {}))
+    n_pl = sum(len(m.get("placements", [])) for m in imported.get("models", {}).values())
+    summary = {"models": n_models, "placements": n_pl, "fingerprint": fingerprint,
+               "valid": not errors, "errors": errors, "dry_run": dry_run}
+    if not dry_run and not errors:
+        merged = store.merge_imported(store.load(), imported)
+        store.save(merged)
+    if json_output:
+        console.print(_json.dumps(summary, indent=2))
+        return
+    console.print(f"[bold]{n_models}[/] models, [bold]{n_pl}[/] placements  [dim]fingerprint {fingerprint}[/]")
+    if errors:
+        for e in errors:
+            err.print(f"  [red]✗[/] {e}")
+        raise typer.Exit(code=1)
+    if dry_run:
+        console.print("[yellow]dry-run[/] — nothing written. Run without --dry-run to save.")
+    else:
+        console.print(f"[green]✓ wrote[/] {C.get_paths().registry_file}")
+
+
+@registry_app.command("validate")
+def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Validate the registry against the schema."""
+    from .registry import schema, store
+
+    errors = schema.validate(store.load())
+    if json_output:
+        console.print(_json.dumps({"valid": not errors, "errors": errors}, indent=2))
+        return
+    if not errors:
+        console.print("[green]✓ registry is valid[/]")
+        return
+    for e in errors:
+        err.print(f"[red]✗[/] {e}")
+    raise typer.Exit(code=1)
+
+
 # --------------------------------------------------------------------------- future stubs
 _FUTURE = {
     "up": "P3", "down": "P3", "swap": "P3", "reap": "P3", "resolve": "P3",
     "pin": "P3", "unpin": "P3", "logs": "P3", "metrics": "P3",
-    "registry": "P2", "induct": "P4", "tune": "P4", "bench": "P4",
+    "induct": "P4", "tune": "P4", "bench": "P4",
     "search": "P5", "download": "P5", "login": "P5", "alive": "P6",
     "provider": "P6", "cleanup": "P8", "nodes": "P11",
 }
