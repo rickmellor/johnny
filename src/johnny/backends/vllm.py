@@ -16,6 +16,9 @@ from ..util import run, which
 from .base import Capabilities, Driver, ModelInfo, SeatInfo
 
 
+_ARCH_CACHE: dict[str, set] = {}  # image -> registered archs (per-process)
+
+
 class VllmDriver(Driver):
     name = "vllm"
 
@@ -120,6 +123,38 @@ class VllmDriver(Driver):
                     v = line.split("=", 1)[1].strip()
                     return [int(x) for x in v.split(",") if x.strip().isdigit()]
         return []
+
+    def supported_archs(self, image: str | None = None) -> set[str] | None:
+        """Architectures this image's vLLM registers (cached per-process).
+
+        Returns None when it can't be determined (docker missing, query failed) so
+        callers can fail open rather than block. Used for induction's arch pre-flight
+        — catches 'unsupported model → doomed sweep → mystery timeout' for free.
+        """
+        img = image or self.image
+        if not img:
+            return None
+        if img in _ARCH_CACHE:
+            return _ARCH_CACHE[img] or None
+        if not self.available():
+            return None
+        code = (
+            "import json,sys;"
+            "from vllm.model_executor.models.registry import ModelRegistry;"
+            "sys.stdout.write('JOHNNY_ARCHS='+json.dumps(sorted(ModelRegistry.get_supported_archs())))"
+        )
+        rc, out, _ = run(["docker", "run", "--rm", "--entrypoint", "python3", img, "-c", code], timeout=180)
+        archs: set[str] = set()
+        if rc == 0:
+            for line in out.splitlines():
+                if line.startswith("JOHNNY_ARCHS="):
+                    try:
+                        archs = set(json.loads(line.split("=", 1)[1]))
+                    except json.JSONDecodeError:
+                        archs = set()
+                    break
+        _ARCH_CACHE[img] = archs
+        return archs or None
 
     def probe_model(self, path: str) -> dict:
         cfg_path = Path(path) / "config.json"

@@ -106,14 +106,17 @@ def write_report(run_dir: Path, model_id: str, audit: dict, results: list[dict],
         "",
         "## Sweep",
         "",
-        "| tp | gmu | seqs | batched | mml | peak tok/s | single tok/s | ok |",
-        "|----|-----|------|---------|-----|-----------|--------------|----|",
+        "| tp | gmu | seqs | batched | mml | KV tok | conc | peak tok/s | single tok/s | ok |",
+        "|----|-----|------|---------|-----|--------|------|-----------|--------------|----|",
     ]
     for r in results:
         p = r["point"]
+        kv = r.get("kv_cache_tokens")
+        kv_s = f"{kv/1e6:.2f}M" if kv else "—"
+        conc = f"{r.get('max_concurrency')}x" if r.get("max_concurrency") else "—"
         lines.append(
             f"| {p.get('tp')} | {p.get('gpu_memory_util')} | {p.get('max_num_seqs')} | "
-            f"{p.get('max_num_batched_tokens')} | {p.get('max_model_len')} | "
+            f"{p.get('max_num_batched_tokens')} | {p.get('max_model_len')} | {kv_s} | {conc} | "
             f"{r.get('peak_tok_s')} | {r.get('single_tok_s')} | {'✓' if r.get('ok') else '✗'} |"
         )
     if winner:

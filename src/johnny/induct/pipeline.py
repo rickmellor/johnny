@@ -41,15 +41,23 @@ def _save_state(model_id: str, st: dict) -> None:
     (d / "state.json").write_text(json.dumps(st, indent=2))
 
 
-def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points) -> dict:
+def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp=None) -> dict:
     """Choose GPU vs CPU placements + candidate points. device: gpu|cpu|auto.
-    auto = GPU if any GPU placement fits, else fall back to CPU."""
+    auto = GPU if any GPU placement fits, else fall back to CPU.
+    tp: force a tensor-parallel size — sweep only that TP (must be viable)."""
     free = free_gpus(hw, all_seats(cfg))
     emb = embeddings if embeddings is not None else stages.is_embeddings(a)
     priors = grid.seed_priors(store.load(), model_id)
     native_ctx = a.get("native_context") or (a.get("dims") or {}).get("ctx")
     gpu_viable, gpu_pruned = stages.hardware_fit(a, hw, len(free))
-    use_cpu = (device == "cpu") or (device == "auto" and not gpu_viable)
+    if tp is not None:  # --tp: keep only the requested TP, prune the rest with a reason
+        gpu_pruned = gpu_pruned + [{"tp": v["tp"], "reason": f"excluded by --tp {tp}"}
+                                   for v in gpu_viable if v["tp"] != tp]
+        gpu_viable = [v for v in gpu_viable if v["tp"] == tp]
+        if not gpu_viable:
+            gpu_pruned.append({"tp": tp, "reason": f"--tp {tp} is not a viable placement here"})
+    # --tp signals explicit GPU intent: don't silently fall back to CPU when it empties.
+    use_cpu = (device == "cpu") or (device == "auto" and not gpu_viable and tp is None)
 
     if use_cpu:
         cv = grid.cpu_viable(a.get("size_bytes", 0), hw.host_ram_gb)
@@ -70,12 +78,15 @@ def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points) ->
 
 
 def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
-         device: str = "auto", embeddings: bool | None = None) -> dict:
+         device: str = "auto", embeddings: bool | None = None, tp: int | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
     a = stages.audit(path)
-    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points)
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp)
+    img_key = "cpu_image" if rp["device"] == "cpu" else "vllm_image"
+    image = (cfg.get("docker") or {}).get(img_key)
+    arch_ok, arch_why = stages.arch_supported(a.get("arch"), image)
     return {
         "model_id": model_id,
         "path": path,
@@ -87,10 +98,13 @@ def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
         "free_gpus": rp["free"],
         "device": rp["device"],
         "embeddings": rp["embeddings"],
+        "arch_supported": arch_ok,
+        "arch_warning": arch_why,
         "viable": rp["viable"],
         "pruned": rp["pruned"],
         "priors": rp["priors"],
-        "points": rp["points"],
+        # An unsupported arch can't launch — present zero sweepable points.
+        "points": rp["points"] if arch_ok else [],
     }
 
 
@@ -104,6 +118,7 @@ def run(
     progress=None,
     device: str = "auto",
     embeddings: bool | None = None,
+    tp: int | None = None,
 ) -> dict:
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
@@ -119,8 +134,20 @@ def run(
     _save_state(model_id, st)
     _p(f"audit: {a.get('arch')} · {round(a.get('size_bytes', 0) / 1e9, 1)}GB · quant={a.get('quant')}")
 
-    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points)
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp)
     _p(f"device={rp['device']} · embeddings={rp['embeddings']} · {len(rp['viable'])} viable, {len(rp['pruned'])} pruned")
+
+    # Arch pre-flight: refuse to launch seats the image's vLLM can't even register.
+    img_key = "cpu_image" if rp["device"] == "cpu" else "vllm_image"
+    image = (cfg.get("docker") or {}).get(img_key)
+    ok, why = stages.arch_supported(a.get("arch"), image)
+    if not ok:
+        _p(f"abort: {why}")
+        st["arch_unsupported"] = why
+        _save_state(model_id, st)
+        return {"model_id": model_id, "error": why, "device": rp["device"],
+                "pruned": [{"tp": "*", "reason": why}]}
+
     points = rp["points"]
     if not points:
         return {"model_id": model_id, "error": "no viable placement", "pruned": rp["pruned"], "device": rp["device"]}
@@ -155,7 +182,10 @@ def run(
             finally:
                 collect.remove_pin(stages.TUNING_CONTAINER)
         if r.get("ok"):
-            _p(f"[{i}/{len(points)}] {sig}: peak {r.get('peak_tok_s')} tok/s, single {r.get('single_tok_s')} tok/s")
+            kv = r.get("kv_cache_tokens")
+            kvs = f", KV {kv/1e6:.2f}M tok ({r.get('max_concurrency')}x)" if kv else ""
+            _p(f"[{i}/{len(points)}] {sig}: peak {r.get('peak_tok_s')} tok/s, "
+               f"single {r.get('single_tok_s')} tok/s{kvs}")
         else:
             _p(f"[{i}/{len(points)}] {sig}: FAILED — {(r.get('error') or '')[:80]}")
         st["results"][sig] = r

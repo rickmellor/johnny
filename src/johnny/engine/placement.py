@@ -72,12 +72,23 @@ def allocate_port(cfg: dict, seats, role: str | None = None) -> int:
 
 
 def pick_placement(placements: list[dict], placement_id: str | None, hardware) -> dict | None:
+    """Resolve a placement. With placement_id: exact id, else a *unique* substring
+    (consistent with `registry delete`); raises ValueError on an ambiguous substring.
+    Without one: prefer a placement validated on this exact hardware fingerprint."""
     if not placements:
         return None
     if placement_id:
-        for p in placements:
-            if p.get("id") == placement_id:
-                return p
+        exact = [p for p in placements if p.get("id") == placement_id]
+        if exact:
+            return exact[0]
+        subs = [p for p in placements if placement_id in (p.get("id") or "")]
+        if len(subs) == 1:
+            return subs[0]
+        if len(subs) > 1:
+            raise ValueError(
+                f"placement '{placement_id}' is ambiguous — matches: "
+                + ", ".join(p.get("id", "") for p in subs)
+            )
         return None
     # Prefer a placement validated on this exact hardware fingerprint.
     fp = hardware.fingerprint

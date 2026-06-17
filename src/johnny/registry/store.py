@@ -32,6 +32,19 @@ def get(reg: dict, model_id: str) -> dict | None:
     return models(reg).get(model_id)
 
 
+def delete_placement(reg: dict, model_id: str, placement_id: str) -> dict | None:
+    """Remove one placement (by exact id) from a model, mutating reg. Returns the
+    removed placement, or None if the model/placement wasn't found."""
+    m = get(reg, model_id)
+    if not m:
+        return None
+    pls = m.get("placements") or []
+    for i, p in enumerate(pls):
+        if p.get("id") == placement_id:
+            return pls.pop(i)
+    return None
+
+
 def merge_imported(existing: dict, imported: dict) -> dict:
     """Overlay imported models onto an existing registry (imported entries win;
     other models are preserved). Fingerprints are unioned."""

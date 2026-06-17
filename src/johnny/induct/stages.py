@@ -27,12 +27,13 @@ def discover(model_ref: str, cfg: dict) -> tuple[str, str]:
     """
     p = Path(model_ref).expanduser()
     if p.exists() and (p / "config.json").exists():
+        p = p.resolve()  # absolute: the container path→/models mount translation needs it
         return p.name, str(p)
     models_dir = (cfg.get("roots") or {}).get("models_dir")
     if models_dir:
-        full = Path(models_dir).expanduser() / model_ref
+        full = (Path(models_dir).expanduser() / model_ref).resolve()
         if (full / "config.json").exists():
-            return Path(model_ref).name, str(full)
+            return full.name, str(full)
     raise FileNotFoundError(
         f"model '{model_ref}' not found on disk (download/acquire arrives at P5; "
         f"place it under {models_dir} or pass a local path)"
@@ -54,16 +55,54 @@ def audit(path: str) -> dict:
     return info
 
 
-_GENERATIVE_ARCH = ("ForCausalLM", "ForConditionalGeneration", "LMHeadModel", "ForSeq2SeqLM")
+# Heads that emit tokens (autoregressive *and* diffusion LMs) — never embeddings.
+_GENERATIVE_ARCH = (
+    "ForCausalLM", "ForConditionalGeneration", "LMHeadModel", "ForSeq2SeqLM",
+    "ForBlockDiffusion", "ForDiffusionLM", "ForDiffusion",  # diffusion LMs generate text
+)
+# Pooling/encoder arch names with no generative head (e.g. NomicBertModel).
+_EMBEDDING_ARCH = ("Model", "Encoder", "ForSequenceClassification", "ForMaskedLM")
 
 
 def is_embeddings(audit_info: dict) -> bool:
     """Heuristic: an encoder/bert-like arch with no generative head is a pooling/
-    embeddings model (e.g. NomicBertModel). Override with --embeddings/--no-embeddings."""
+    embeddings model (e.g. NomicBertModel). Generative heads — including diffusion
+    LMs and multimodal generators — are not. Override with --embeddings/--no-embeddings.
+
+    Fails *closed* to generative: an unrecognized arch is treated as generative (it
+    benches against /v1/completions) rather than embeddings (which would force the
+    /v1/embeddings path a generative model doesn't serve)."""
     arch = audit_info.get("arch") or ""
+    if not arch:
+        return False
     if any(g in arch for g in _GENERATIVE_ARCH):
         return False
-    return bool(arch)
+    # A vision tower over a generative stack ⇒ a multimodal generator, not a pooler.
+    if audit_info.get("multimodal"):
+        return False
+    # Positive signal only: bare encoder/pooling/classifier arch names.
+    return any(arch.endswith(e) for e in _EMBEDDING_ARCH)
+
+
+def arch_supported(arch: str | None, image: str | None) -> tuple[bool, str | None]:
+    """Pre-flight: does `image`'s vLLM register `arch`? (Fix for the 'unsupported
+    model → 8 doomed seats → mystery timeout' failure mode.)
+
+    Returns (ok, reason_if_not). Fails *open* — when support can't be determined
+    (docker missing, query failed), returns ok=True so a transient probe failure
+    never blocks a legitimate induct."""
+    if not arch or not image:
+        return True, None
+    archs = VllmDriver(image=image).supported_archs(image)
+    if archs is None:  # couldn't determine — don't block
+        return True, None
+    if arch in archs:
+        return True, None
+    return False, (
+        f"architecture {arch!r} is not registered by vLLM image {image!r} "
+        f"({len(archs)} archs available; none match) — this model needs a newer "
+        f"or forked vLLM build, so no tuning config could launch"
+    )
 
 
 def hardware_fit(audit_info: dict, hardware, free_count: int) -> tuple[list, list]:
@@ -181,6 +220,26 @@ def _bench_embeddings(port: int, model: str) -> dict:
         return {"peak_tok_s": None, "single_tok_s": None, "error": f"embed bench failed: {e}"}
 
 
+def _parse_kv_cache(log: str) -> dict:
+    """Actual KV capacity vLLM computed at load — the real context a gmu buys.
+
+    Parses the engine startup log: 'GPU KV cache size: N tokens' (total KV token
+    pool) + 'Maximum concurrency for M tokens per request: Xx' + 'Available KV cache
+    memory: G GiB'. The requested mml is only a ceiling; this is what actually fits.
+    """
+    out: dict = {"kv_cache_tokens": None, "max_concurrency": None, "kv_cache_gib": None}
+    m = re.search(r"GPU KV cache size:\s*([\d,]+)\s*tokens", log)
+    if m:
+        out["kv_cache_tokens"] = int(m.group(1).replace(",", ""))
+    m = re.search(r"Maximum concurrency for [\d,]+ tokens per request:\s*([\d.]+)x", log)
+    if m:
+        out["max_concurrency"] = float(m.group(1))
+    m = re.search(r"Available KV cache memory:\s*([\d.]+)\s*GiB", log)
+    if m:
+        out["kv_cache_gib"] = float(m.group(1))
+    return out
+
+
 def _parse_bench(out: str) -> dict:
     """peak tok/s = max over the sweep; single ≈ first tok/s in the latency section."""
     nums = [float(x) for x in re.findall(r"([\d.]+)\s*tok/s", out)]
@@ -210,9 +269,17 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
     try:
         drv.launch(spec)
         # CPU loads (and big models) can be slow; give CPU a longer ready window.
-        if not _wait_ready(TUNING_PORT, timeout=900 if is_cpu else 600):
-            result["error"] = "tuning seat did not become ready in time"
+        ready, why = _wait_ready(drv, TUNING_CONTAINER, TUNING_PORT, timeout=900 if is_cpu else 600)
+        if not ready:
+            # Surface the real reason (dead container / vLLM error), not a bare timeout.
+            logtail = _diagnose(drv, TUNING_CONTAINER)
+            result["error"] = (why or "tuning seat did not become ready in time") + (
+                f" — {logtail}" if logtail else ""
+            )
             return result
+        # Actual KV capacity vLLM sized for this gmu — the real context/concurrency the
+        # gmu buys (the requested mml is only a ceiling, identical across gmu points).
+        result.update(_parse_kv_cache(drv.logs(TUNING_CONTAINER, tail=500) or ""))
         if point.get("embeddings"):
             parsed = _bench_embeddings(TUNING_PORT, model_id)
         else:
@@ -235,15 +302,96 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
     return result
 
 
-def _wait_ready(port: int, timeout: float) -> bool:
+# Known vLLM startup-failure signatures → a short, human-readable cause.
+_FAILURE_SIGNATURES = (
+    ("are not supported for now", "unsupported architecture for this vLLM image"),
+    ("not supported", "unsupported model/feature for this vLLM image"),
+    ("trust_remote_code", "needs --trust-remote-code / custom modeling code"),
+    ("out of memory", "GPU OOM during load"),
+    ("CUDA out of memory", "GPU OOM during load"),
+    ("HIP out of memory", "GPU OOM during load"),
+    ("No such file or directory", "model path/file missing in container"),
+    ("Address already in use", "tuning port already in use"),
+    ("NCCL", "NCCL/multi-GPU init failure"),
+)
+
+
+def _container_exited(drv, container: str) -> tuple[bool, int | None]:
+    """(exited?, exit_code) from docker inspect; (False, None) if state unknown."""
+    from ..util import run
+
+    rc, out, _ = run(
+        ["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container], timeout=8
+    )
+    if rc != 0:
+        return False, None
+    parts = out.strip().split()
+    if len(parts) != 2:
+        return False, None
+    running = parts[0] == "true"
+    try:
+        code = int(parts[1])
+    except ValueError:
+        code = None
+    return (not running), code
+
+
+# vLLM logs the real exception, then a generic summary; don't report the summary.
+_GENERIC_ERR = (
+    "Engine core initialization failed",
+    "See root cause above",
+    "Failed core proc",
+    "EngineCore failed to start",
+    "Engine core proc",
+)
+
+
+def _root_cause(log: str) -> str | None:
+    """The most specific `*Error:/Exception:` line that isn't vLLM's generic
+    'Engine core initialization failed' summary — the actual root cause."""
+    cands = []
+    for ln in log.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if re.search(r"\w*(?:Error|Exception)\s*:", s) and not any(g in s for g in _GENERIC_ERR):
+            cands.append(s)
+    return cands[-1][:240] if cands else None
+
+
+def _diagnose(drv, container: str) -> str | None:
+    """Tail the container log and surface the real cause: specific exception line
+    first (above vLLM's generic summary), then known signatures, then last line."""
+    try:
+        log = drv.logs(container, tail=200) or ""
+    except Exception:
+        return None
+    rc = _root_cause(log)
+    if rc:
+        return rc
+    for needle, msg in _FAILURE_SIGNATURES:
+        if needle in log:
+            return msg
+    lines = [ln.strip() for ln in log.splitlines() if ln.strip()]
+    return lines[-1][:200] if lines else None
+
+
+def _wait_ready(drv, container: str, port: int, timeout: float) -> tuple[bool, str | None]:
+    """Poll the endpoint until ready, OR bail early if the container dies.
+
+    Returns (ready, reason_if_not). Watching container liveness is the fix for
+    polling a crashed seat for the full timeout window."""
     import time
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         if probe.probe_models(port):
-            return True
+            return True, None
+        exited, code = _container_exited(drv, container)
+        if exited:
+            return False, f"tuning container exited (code {code}) before serving"
         time.sleep(3)
-    return False
+    return False, "tuning seat did not become ready in time"
 
 
 def synthesize(results: list[dict], use_case: str | None) -> dict | None:

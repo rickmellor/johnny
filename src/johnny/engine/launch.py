@@ -106,9 +106,17 @@ def up(
     model = store.get(reg, model_id)
     if not model:
         raise PlacementError(f"no model '{model_id}' in the registry (try `johnny registry import`)")
-    placement = pick_placement(model.get("placements") or [], placement_id, hardware)
+    try:
+        placement = pick_placement(model.get("placements") or [], placement_id, hardware)
+    except ValueError as e:
+        raise PlacementError(str(e))
     if not placement:
-        raise PlacementError(f"no placement for '{model_id}'" + (f" with id {placement_id}" if placement_id else ""))
+        avail = ", ".join(p.get("id", "") for p in (model.get("placements") or [])) or "none"
+        raise PlacementError(
+            f"no placement for '{model_id}'"
+            + (f" matching '{placement_id}'" if placement_id else "")
+            + f" (available: {avail})"
+        )
 
     with mutation_lock():
         seats = all_seats(cfg)

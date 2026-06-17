@@ -7,10 +7,43 @@ factor. The precise KV/context math (induct/grid.py) runs post-download with con
 
 from __future__ import annotations
 
-_QUANT_DTYPE = {"fp8": "fp8", "awq": "int4", "gptq": "int4", "int4": "int4", "bf16": "bf16", "fp4": "fp4"}
+# quant label -> the compute dtype it needs natively accelerated.
+# Covers the modern llm-compressor / community labels (NVFP4, W4A16, FP8-Dynamic…).
+_QUANT_DTYPE = {
+    "fp8": "fp8", "w8a8": "fp8",
+    "nvfp4": "fp4", "mxfp4": "fp4", "fp4": "fp4",
+    "awq": "int4", "gptq": "int4", "w4a16": "int4", "int4": "int4", "4bit": "int4",
+    "int8": "int8", "8bit": "int8",
+    "bf16": "bf16", "fp16": "fp16",
+}
 _GMU_CAP = 0.92
 _OVERHEAD = 1.5e9
 _KV_MIN = 2.0e9
+
+
+def quant_native_dtype(quant: str | None) -> str | None:
+    """The compute dtype a quant needs accelerated, or None if unquantized/unknown."""
+    return _QUANT_DTYPE.get((quant or "").lower())
+
+
+def dtype_fit(quant: str | None, hardware) -> dict:
+    """Does this quant's compute dtype run natively on the detected hardware?
+
+    The 'fits my dtypes' check — distinct from the VRAM fit. Returns
+    {ok: True|False|None, need: dtype|None, detail}. ok=None = unquantized / can't tell.
+    """
+    q = (quant or "").lower()
+    if q == "gguf":
+        return {"ok": False, "need": None, "detail": "GGUF format → llama.cpp/Ollama, not vLLM"}
+    need = quant_native_dtype(quant)
+    nd = set(hardware.native_dtypes)
+    if not quant or need is None:
+        return {"ok": None, "need": None, "detail": "unquantized / unknown quant"}
+    if not nd:
+        return {"ok": None, "need": need, "detail": f"need {need}; native dtypes undetected"}
+    if need in nd:
+        return {"ok": True, "need": need, "detail": f"{need} natively accelerated"}
+    return {"ok": False, "need": need, "detail": f"{need} NOT native here (have {sorted(nd)})"}
 
 
 def fit_verdict(size_bytes: int, hardware, quant: str | None = None) -> dict:

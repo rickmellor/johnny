@@ -311,9 +311,14 @@ app.add_typer(registry_app, name="registry")
 @registry_app.command("show")
 def registry_show(
     model: str = typer.Argument(None, help="Model id to detail; omit to list all."),
+    compact: bool = typer.Option(False, "--compact", "-c", help="Terse one-row-per-model index (omit placements)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """List registry models (or detail one), with their placements."""
+    """List registry models with their placements (or detail one model).
+
+    Placements are what you load (`up --placement <id>`) and prune
+    (`registry delete <model> <id>`), so they're shown by default; -c for the index.
+    """
     from .registry import store
 
     reg = store.load()
@@ -348,16 +353,41 @@ def registry_show(
     if not models:
         console.print("[dim]registry is empty.[/] Seed it with [bold]johnny registry import[/].")
         return
-    t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
-    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
-        t.add_column(col)
+    if compact:
+        t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
+        for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
+            t.add_column(col)
+        for mid, m in sorted(models.items()):
+            ident = m.get("identity", {})
+            pls = m.get("placements", [])
+            backends = sorted({p.get("backend", "?") for p in pls})
+            t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
+                      str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
+        console.print(t)
+        return
+
+    # Default: full picture — every model with its placements inline.
+    console.print(f"[bold]registry — {len(models)} model(s)[/]  "
+                  f"[dim]load: `johnny up <model> --placement <id>`  ·  -c for the terse index[/]")
     for mid, m in sorted(models.items()):
         ident = m.get("identity", {})
         pls = m.get("placements", [])
-        backends = sorted({p.get("backend", "?") for p in pls})
-        t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
-                  str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
-    console.print(t)
+        cap = m.get("capabilities", {})
+        meta = " · ".join(x for x in [ident.get("arch"), ident.get("quant"),
+                          f"ctx {cap.get('native_context')}" if cap.get("native_context") else None] if x)
+        console.print(f"\n[bold]{mid}[/]  [dim]{meta}[/]")
+        if not pls:
+            console.print("  [dim](no placements — `johnny induct <model>` or `registry import`)[/]")
+            continue
+        for p in pls:
+            k = p.get("knobs", {})
+            perf = p.get("perf", {})
+            peak, single = perf.get("peak_tok_s"), perf.get("single_stream_tok_s")
+            perf_s = f" · {peak}/{single} tok/s" if peak else ""
+            console.print(
+                f"  • [cyan]{p.get('id')}[/]  [dim]tp{k.get('tensor_parallel_size') or '—'} · "
+                f"{p.get('use_case') or '—'} · mml{k.get('max_model_len') or '—'}{perf_s} · {p.get('source')}[/]"
+            )
 
 
 @registry_app.command("import")
@@ -418,6 +448,69 @@ def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None
     raise typer.Exit(code=1)
 
 
+@registry_app.command("delete")
+def registry_delete(
+    model: str = typer.Argument(..., help="Model id (see `johnny registry show`)."),
+    placement: str = typer.Argument(None, help="Placement id to delete — exact or a unique substring (e.g. 'tp2'). Omit with --all."),
+    all_placements: bool = typer.Option(False, "--all", help="Delete ALL placements for the model (keeps the model entry)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Delete a placement (or all) from a model — placement-level pruning.
+
+    Keeps the model and its other placements. To remove a whole model (and optionally
+    its weights), use `johnny rm <model>`.
+    """
+    from .registry import store
+
+    reg = store.load()
+    m = store.get(reg, model)
+    if not m:
+        err.print(f"[red]no model[/] '{model}' in the registry")
+        raise typer.Exit(code=1)
+    pls = m.get("placements") or []
+    if not pls:
+        console.print(f"[yellow]'{model}' has no placements.[/]")
+        return
+
+    if all_placements:
+        targets = list(pls)
+    elif placement:
+        exact = [p for p in pls if p.get("id") == placement]
+        subs = [p for p in pls if placement in (p.get("id") or "")]
+        targets = exact or subs
+        if not targets:
+            err.print(f"[red]no placement[/] matching '{placement}' in '{model}'.")
+            console.print("  known: " + ", ".join(p.get("id", "") for p in pls))
+            raise typer.Exit(code=1)
+        if len(targets) > 1:
+            err.print(f"[red]'{placement}' is ambiguous[/] — matches {len(targets)}:")
+            for p in targets:
+                console.print(f"  • {p.get('id')}")
+            raise typer.Exit(code=1)
+    else:
+        console.print(f"[yellow]specify a placement id to delete (or --all).[/] '{model}' has:")
+        for p in pls:
+            k = p.get("knobs", {})
+            console.print(f"  • [cyan]{p.get('id')}[/]  [dim](tp{k.get('tensor_parallel_size') or '—'} · "
+                          f"{p.get('use_case') or '—'} · {p.get('source')})[/]")
+        raise typer.Exit(code=1)
+
+    ids = [p.get("id", "") for p in targets]
+    if not yes and not json_output:
+        console.print(f"will delete from [bold]{model}[/]: " + ", ".join(ids))
+        if not typer.confirm("Proceed?", default=False):
+            raise typer.Exit(code=1)
+    for pid in ids:
+        store.delete_placement(reg, model, pid)
+    store.save(reg)
+    remaining = len(m.get("placements") or [])
+    if json_output:
+        console.print(_json.dumps({"model": model, "deleted": ids, "remaining": remaining}, indent=2))
+    else:
+        console.print(f"[green]✓ deleted[/] {len(ids)} placement(s) from {model}  [dim]({remaining} remaining)[/]")
+
+
 # --------------------------------------------------------------------------- seat lifecycle (P3)
 def _emit_err(e: Exception, json_output: bool):
     if json_output:
@@ -427,18 +520,62 @@ def _emit_err(e: Exception, json_output: bool):
     raise typer.Exit(code=1)
 
 
+def _render_pick(it: dict) -> str:
+    """One placement line for the picker: model + id + key knobs + perf."""
+    p = it["p"]
+    k = p.get("knobs", {})
+    peak = (p.get("perf") or {}).get("peak_tok_s")
+    perf_s = f" · {peak} tok/s" if peak else ""
+    return (f"[bold]{it['model']}[/]  [cyan]{p.get('id')}[/]  "
+            f"[dim]tp{k.get('tensor_parallel_size') or '—'} · {p.get('use_case') or '—'} · "
+            f"mml{k.get('max_model_len') or '—'}{perf_s}[/]")
+
+
+def _pick_placement_interactive(json_output: bool) -> tuple[str, str]:
+    """Open the placement picker over the whole registry; return (model, placement_id)
+    or exit (cancel / nothing to pick / --json with no model)."""
+    from .external import picker
+    from .registry import store
+
+    if json_output:
+        _emit_err(ValueError("`up` needs a model id with --json (the picker needs a TTY)"), True)
+    models = store.models(store.load())
+    items = [{"model": mid, "p": p}
+             for mid, m in sorted(models.items())
+             for p in (m.get("placements") or [])]
+    if not items:
+        err.print("[yellow]no placements in the registry[/] — run `johnny induct <model>` first.")
+        raise typer.Exit(code=1)
+    i = picker.select(items, render=_render_pick, title="load a placement",
+                      hint="↑/↓ move · enter load · q cancel")
+    if i is None:
+        console.print("[dim]cancelled.[/]")
+        raise typer.Exit(code=0)
+    chosen = items[i]
+    pid = chosen["p"].get("id")
+    console.print(f"[dim]→ johnny up {chosen['model']} --placement {pid}[/]")
+    return chosen["model"], pid
+
+
 @app.command()
 def up(
-    model: str = typer.Argument(..., help="Registry model id."),
-    placement: str = typer.Option(None, "--placement", help="Specific placement id (else best fit)."),
+    model: str = typer.Argument(None, help="Registry model id. Omit to pick a placement interactively."),
+    placement: str = typer.Option(None, "--placement", help="Placement id or unique substring (e.g. 'tp4'); else best fit for this hardware."),
     port: int = typer.Option(None, "--port"),
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
     force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
     wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Bring up a model seat (spawn on free GPUs, or swap a named seat)."""
+    """Bring up a model seat (spawn on free GPUs, or swap a named seat).
+
+    With no model id, opens an interactive picker over every registry placement —
+    ↑/↓ to choose, enter to load.
+    """
     from .engine import launch
+
+    if model is None:
+        model, placement = _pick_placement_interactive(json_output)
 
     try:
         res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait)
@@ -657,6 +794,10 @@ def _render_plan(pl: dict) -> None:
             console.print("[dim]pruned:[/]")
             for p in pl["pruned"]:
                 console.print(f"  [yellow]✗ tp={p.get('tp')}[/] — {p.get('reason')}")
+    if pl.get("arch_supported") is False:
+        console.print(f"[red]✗ unsupported architecture[/] — {pl.get('arch_warning')}")
+        console.print("[dim]nothing to sweep; induct would abort before launching any seat.[/]")
+        return
     console.print(f"[bold]{len(pl['points'])}[/] candidate config point(s) to sweep "
                   f"[dim](seeded search, not a brute grid)[/]")
 
@@ -664,8 +805,9 @@ def _render_plan(pl: dict) -> None:
 @app.command()
 def induct(
     model: str = typer.Argument(..., help="HF id, registry id, or local path."),
-    use_case: str = typer.Option(None, "--use-case", help="throughput | latency | context"),
+    use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
     device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU if no GPU fits)."),
+    tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be a viable placement). Overrides the auto winner's TP."),
     embeddings: bool = typer.Option(None, "--embeddings/--no-embeddings", help="Force embeddings vs generative bench (default: auto-detect)."),
     bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
     plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
@@ -679,7 +821,7 @@ def induct(
 
     if plan:
         try:
-            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp)
         except Exception as e:
             _emit_err(e, json_output)
         if json_output:
@@ -690,7 +832,7 @@ def induct(
 
     if not yes and not json_output:
         try:
-            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp)
         except Exception as e:
             _emit_err(e, json_output)
         _render_plan(pl)
@@ -703,7 +845,7 @@ def induct(
     prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
         res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points,
-                           progress=prog, device=device, embeddings=embeddings)
+                           progress=prog, device=device, embeddings=embeddings, tp=tp)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -726,7 +868,7 @@ def induct(
 @app.command()
 def tune(
     model: str = typer.Argument(..., help="Registry id or local path."),
-    use_case: str = typer.Option(None, "--use-case"),
+    use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
     resume: bool = typer.Option(False, "--resume"),
     max_points: int = typer.Option(None, "--max-points"),
     yes: bool = typer.Option(False, "--yes"),
@@ -741,17 +883,60 @@ def tune(
 _VERDICT_STYLE = {"fits": "green", "tight": "yellow", "wont-fit": "red", "unknown": "dim"}
 
 
+def _dtype_cell(d: dict) -> str:
+    """Render a dtype-fit verdict: native ✓ / not-native ✗ / unknown —."""
+    ok = (d or {}).get("ok")
+    need = (d or {}).get("need")
+    if ok is True:
+        return f"[green]✓ {need}[/]"
+    if ok is False:
+        return f"[red]✗ {need or (d or {}).get('detail', '')}[/]"
+    return "[dim]—[/]"
+
+
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Hugging Face search query."),
+    query: str = typer.Argument(..., help="HF search query, or a base model id with --quants."),
+    quants: bool = typer.Option(False, "--quants", "-q",
+                                help="List quantizations of QUERY (a base model id) with a dtype-fit verdict."),
     limit: int = typer.Option(10, "--limit"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Search Hugging Face with a fit verdict for your hardware + capability badges."""
+    """Search Hugging Face with a fit verdict for your hardware + capability badges.
+
+    With --quants, QUERY is treated as a base model id and johnny enumerates its
+    quantized variants, flagging which run natively on your GPUs (e.g. FP8 ✓ but
+    NVFP4 ✗ on RDNA4) so you don't download a quant your silicon can't accelerate.
+    """
     from .discover import search as dsearch
     from .hardware import detect as hwdetect
 
-    res = dsearch.search(query, hwdetect.detect(), limit=limit)
+    hw = hwdetect.detect()
+
+    if quants:
+        res = dsearch.list_quantizations(query, hw, limit=limit)
+        if res.get("error"):
+            err.print(f"[red]{res['error']}[/]")
+            raise typer.Exit(code=1)
+        if json_output:
+            console.print(_json.dumps(res, indent=2))
+            return
+        t = Table(title=f"quantizations of {query}  ·  native dtypes: {', '.join(hw.native_dtypes) or '—'}",
+                  title_style="bold")
+        for col in ("MODEL", "QUANT", "DTYPE", "SIZE", "FIT"):
+            t.add_column(col)
+        for r in res["results"]:
+            v = r["fit"]
+            verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
+            label = r["id"] + ("  [dim](base)[/]" if r.get("base") else "")
+            t.add_row(label, str(r.get("quant") or "—"), _dtype_cell(r["dtype"]),
+                      f"{r['size_gb']}GB" if r["size_gb"] else "—",
+                      f"{verdict} [dim]{v.get('detail', '')}[/]")
+        console.print(t)
+        console.print("[dim]✓ = compute dtype natively accelerated here · ✗ = runs un-accelerated or won't load[/]")
+        return
+
+    res = dsearch.search(query, hw, limit=limit)
     if res.get("error"):
         err.print(f"[red]{res['error']}[/]")
         raise typer.Exit(code=1)
@@ -759,13 +944,13 @@ def search(
         console.print(_json.dumps(res, indent=2))
         return
     t = Table(title=f"HF search: {query}", title_style="bold")
-    for col in ("MODEL", "DOWNLOADS", "GATED", "SIZE", "FIT", "BADGES"):
+    for col in ("MODEL", "DOWNLOADS", "GATED", "SIZE", "DTYPE", "FIT", "BADGES"):
         t.add_column(col)
     for r in res["results"]:
         v = r["fit"]
         verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
         t.add_row(r["id"], str(r.get("downloads") or "—"), "🔒" if r["gated"] else "",
-                  f"{r['size_gb']}GB" if r["size_gb"] else "—",
+                  f"{r['size_gb']}GB" if r["size_gb"] else "—", _dtype_cell(r.get("dtype")),
                   f"{verdict} {v.get('detail', '')}", ", ".join(r["badges"]) or "—")
     console.print(t)
 
