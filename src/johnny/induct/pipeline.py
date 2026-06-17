@@ -200,6 +200,12 @@ def run(
     if winner:
         rtv = ((cfg.get("docker") or {}).get("vllm_image", "") or "").split(":")[-1] or "unknown"
         placement = report.to_placement(model_id, winner, a, hw, rtv, use_case)
+        ex = placement.get("extra") or {}
+        if ex.get("tool_call_parser") or ex.get("reasoning_parser"):
+            _p(f"derived parsers (arch={a.get('arch')}): tool={ex.get('tool_call_parser')} "
+               f"reasoning={ex.get('reasoning_parser')}"
+               + (" +chat-template" if ex.get('chat_template') else "")
+               + " — override in the registry if a variant differs")
         md = (cfg.get("roots") or {}).get("models_dir")
         try:
             lp = str(Path(path).relative_to(Path(md).expanduser())) if md else None

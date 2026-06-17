@@ -239,10 +239,15 @@ class VllmDriver(Driver):
             args += ["--enable-auto-tool-choice", "--tool-call-parser", extra["tool_call_parser"]]
         if extra.get("reasoning_parser"):
             args += ["--reasoning-parser", extra["reasoning_parser"]]
+        if extra.get("chat_template"):
+            args += ["--chat-template", extra["chat_template"]]
         if pooling:
             args += ["--runner", "pooling"]
         if extra.get("trust_remote_code"):
             args += ["--trust-remote-code"]
+        # Raw passthrough for backend-native flags (§3.3) — power users / proven
+        # launchers (e.g. --limit-mm-per-prompt). Appended verbatim, last.
+        args += list(extra.get("extra_flags") or [])
         return args
 
     def launch(self, spec: dict) -> SeatInfo:

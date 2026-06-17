@@ -78,6 +78,17 @@ def alive(target: str | None = None, role: str = "orchestrator", wait: bool = Tr
     tgt = target or role
     res = service.resolve(tgt, cfg)
 
+    if res["state"] == "absent" and target is None:
+        # Role didn't resolve (no profile maps it) — fall back to the obvious running
+        # chat seat so `johnny alive` just works with one model up.
+        chat = service.ready_chat_seats(cfg)
+        if len(chat) == 1:
+            res = service.resolve(chat[0].name, cfg)
+        elif len(chat) > 1:
+            names = ", ".join(s.name for s in chat)
+            return {"error": f"role '{role}' isn't mapped and multiple chat seats are ready "
+                             f"({names}) — pick one: `johnny alive --seat <seat>` or `--model <model>`"}
+
     if res["state"] == "absent":
         return {"error": f"no seat for '{tgt}' (absent). Start one: `johnny up <model>`"}
     if res["state"] in ("loading",):

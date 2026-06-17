@@ -8,6 +8,27 @@ from .. import config as C
 from ..registry import store
 
 
+# arch-family → proven vLLM tool/reasoning parser + chat template, from this box's
+# known-good launchers (substring match on the architecture name). Best-effort: gets
+# an inducted seat past vLLM's "tool_choice=auto requires --tool-call-parser" 400 out
+# of the box. Override per-model in the registry when a variant differs (e.g. Qwen FP8
+# coder seats use qwen3_coder, AWQ ones qwen3_xml — not derivable from arch alone).
+_ARCH_PARSERS = (
+    ("Gemma4", {"tool_call_parser": "gemma4", "reasoning_parser": "gemma4",
+                "chat_template": "/app/vllm/examples/tool_chat_template_gemma4.jinja"}),
+    ("Qwen3", {"tool_call_parser": "qwen3_xml", "reasoning_parser": "qwen3"}),
+)
+
+
+def derive_parsers(arch: str | None) -> dict:
+    """Tool/reasoning parser + chat template inferred from the arch family, or {}."""
+    a = arch or ""
+    for key, parsers in _ARCH_PARSERS:
+        if key in a:
+            return dict(parsers)
+    return {}
+
+
 def _point_sig(point: dict) -> str:
     if point.get("device") == "cpu":
         return (f"cpu-{point.get('cpuset')}-mml{point.get('max_model_len')}"
@@ -27,6 +48,8 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
         if point.get("embeddings"):
             extra["runner"] = "pooling"
             extra["trust_remote_code"] = True
+        else:
+            extra.update(derive_parsers(audit.get("arch")))
         return {
             "id": f"induct-cpu-{point.get('cpuset')}",
             "backend": "vllm",
@@ -63,7 +86,7 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
             "kv_cache_dtype": point.get("kv_cache_dtype", "auto"),
             "mtp": point.get("mtp") or {"enabled": False},
         },
-        "extra": {},
+        "extra": derive_parsers(audit.get("arch")),
         "env": {},
         "perf": {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")},
         "validation_key": {"hardware_fingerprint": hardware.fingerprint, "backend": "vllm", "runtime_version": runtime_version},

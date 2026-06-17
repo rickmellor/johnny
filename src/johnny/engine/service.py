@@ -62,6 +62,27 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
     }
 
 
+def ready_chat_seats(cfg: dict | None = None) -> list:
+    """Ready, non-embeddings seats — what `alive` falls back to when a role doesn't
+    resolve (no profile). A seat is embeddings if its served model has a pooling
+    placement in the registry; an unknown model is treated as chat-capable."""
+    cfg = cfg if cfg is not None else load_config()
+    from ..registry import store
+
+    reg = store.load()
+    out = []
+    for s in all_seats(cfg):
+        if s.state != "ready" or not s.port:
+            continue
+        m = store.get(reg, s.model) if s.model else None
+        is_emb = bool(m) and any(
+            (p.get("extra") or {}).get("runner") == "pooling" for p in (m.get("placements") or [])
+        )
+        if not is_emb:
+            out.append(s)
+    return out
+
+
 def _container_started_epoch(name: str) -> int | None:
     rc, out, _ = run(["docker", "inspect", "-f", "{{.State.StartedAt}}", name], timeout=8)
     if rc != 0 or not out.strip():

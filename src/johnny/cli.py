@@ -557,6 +557,34 @@ def _pick_placement_interactive(json_output: bool) -> tuple[str, str]:
     return chosen["model"], pid
 
 
+def _render_seat(s) -> str:
+    """One running-seat line for the down picker."""
+    gpus = ",".join(str(g) for g in (s.gpus or [])) or "—"
+    state_style = _STATE_STYLE.get(s.state, "white")
+    return (f"[bold]{s.name}[/]  [dim]{s.model or '—'} · port {s.port or '—'} · "
+            f"gpus {gpus} ·[/] [{state_style}]{s.state}[/]")
+
+
+def _pick_seat_interactive(json_output: bool) -> str:
+    """Open a picker over the running seats; return the chosen seat name or exit."""
+    from .engine import all_seats, load_config
+    from .external import picker
+
+    if json_output:
+        _emit_err(ValueError("`down` needs a seat id with --json (the picker needs a TTY)"), True)
+    seats = all_seats(load_config())
+    if not seats:
+        err.print("[yellow]no running seats[/] — nothing to down.")
+        raise typer.Exit(code=1)
+    i = picker.select(seats, render=_render_seat, title="down a seat",
+                      hint="↑/↓ move · enter down · q cancel")
+    if i is None:
+        console.print("[dim]cancelled.[/]")
+        raise typer.Exit(code=0)
+    console.print(f"[dim]→ johnny down {seats[i].name}[/]")
+    return seats[i].name
+
+
 @app.command()
 def up(
     model: str = typer.Argument(None, help="Registry model id. Omit to pick a placement interactively."),
@@ -597,12 +625,19 @@ def up(
 
 @app.command()
 def down(
-    seat: str = typer.Argument(..., help="Seat/container name (or model id)."),
+    seat: str = typer.Argument(None, help="Seat/container name (or model id). Omit to pick interactively."),
     drain: bool = typer.Option(False, "--drain", help="Graceful drain (no-op without a router)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Tear down a single named seat (never siblings)."""
+    """Tear down a single named seat (never siblings).
+
+    With no seat id, opens an interactive picker over the running seats —
+    ↑/↓ to choose, enter to down.
+    """
     from .engine import launch
+
+    if seat is None:
+        seat = _pick_seat_interactive(json_output)
 
     try:
         res = launch.down(seat, drain=drain)
