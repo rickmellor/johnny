@@ -25,6 +25,8 @@ def drivers_from_config(cfg: dict | None = None) -> dict:
         try:
             if name == "vllm":
                 drivers[name] = get_driver("vllm", models_dir=roots.get("models_dir"), image=docker.get("vllm_image"))
+            elif name == "llamacpp":
+                drivers[name] = get_driver("llamacpp", models_dir=roots.get("models_dir"), image=docker.get("llamacpp_image"))
             else:
                 drivers[name] = get_driver(name)
         except Exception:

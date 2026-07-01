@@ -36,6 +36,10 @@ DEFAULT_VLLM_IMAGE_AMD = "vllm/vllm-openai-rocm:v0.20.2"
 DEFAULT_VLLM_IMAGE_NVIDIA = "vllm/vllm-openai:latest"
 DEFAULT_VLLM_CPU_IMAGE = "vllm/vllm-openai-cpu:v0.20.2"
 
+# llama.cpp server image (GGUF backend). Self-contained builds ship llama-server as
+# the ENTRYPOINT; no vendor split (the same image targets the box's GPU arch).
+DEFAULT_LLAMACPP_IMAGE = "johnny-llamacpp-dsv4:gfx1201"
+
 
 @dataclass
 class Paths:
@@ -120,6 +124,7 @@ def autodiscover() -> dict:
     # override for users who want to point at their own copy.
     backends = {
         "vllm": bool(which("docker")) and os.name == "posix",
+        "llamacpp": bool(which("docker")) and os.name == "posix",
         "lmstudio": bool(which("lms")),
         "ollama": bool(which("ollama")),
     }
@@ -145,6 +150,7 @@ def build_default_config(disc: dict | None = None) -> dict:
         "docker": {
             "vllm_image": _default_vllm_image(disc.get("vendor")),
             "cpu_image": DEFAULT_VLLM_CPU_IMAGE,
+            "llamacpp_image": DEFAULT_LLAMACPP_IMAGE,
             "shm_size": "16g",
         },
         "network": {

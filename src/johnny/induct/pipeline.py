@@ -19,6 +19,7 @@ from ..hardware import detect as hwd
 from ..registry import store
 from ..telemetry import collect
 from . import grid, report, stages
+from . import llamacpp as _llamacpp
 
 
 def _state_dir(model_id: str) -> Path:
@@ -80,6 +81,9 @@ def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp
 def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
          device: str = "auto", embeddings: bool | None = None, tp: int | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
+    _g = _llamacpp.gguf_ref(model_ref, cfg)
+    if _g:  # GGUF -> llama.cpp backend path
+        return _llamacpp.plan(_g[0], _g[1], max_points=max_points, cfg=cfg)
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
     a = stages.audit(path)
@@ -122,6 +126,9 @@ def run(
 ) -> dict:
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
+    _g = _llamacpp.gguf_ref(model_ref, cfg)
+    if _g:  # GGUF -> llama.cpp backend path (self-contained; not TP/vLLM-shaped)
+        return _llamacpp.run(_g[0], _g[1], use_case=use_case, max_points=max_points, cfg=cfg, progress=progress)
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
 

@@ -75,6 +75,9 @@ class VllmDriver(Driver):
             is_johnny = any(k.startswith("johnny.") for k in labels)
             if "vllm" not in image.lower() and not is_johnny:
                 continue
+            # don't claim seats another backend owns (e.g. llamacpp) — labels disambiguate
+            if labels.get("johnny.backend", "vllm") != "vllm":
+                continue
             name = c.get("Names", "")
             ports = probe.host_ports(c.get("Ports", ""))
             # GPU occupancy: johnny label first (P3 stamps it), else inspect env.

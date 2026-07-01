@@ -29,7 +29,9 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     docker = cfg.get("docker") or {}
     ident = model.get("identity") or {}
     local_path = ident.get("local_path")
-    image = placement.get("image") or docker.get("vllm_image")
+    backend = placement.get("backend") or "vllm"
+    _img_key = "llamacpp_image" if backend == "llamacpp" else "vllm_image"
+    image = placement.get("image") or docker.get(_img_key)
     visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
     return {
         "container_name": f"johnny-{model_id}-{port}",
@@ -48,6 +50,7 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
         "env": placement.get("env") or {},
         "labels": {
             "johnny.managed": "1",
+            "johnny.backend": backend,
             "johnny.model": model_id,
             "johnny.placement": placement.get("id", ""),
             "johnny.port": str(port),
@@ -151,7 +154,8 @@ def up(
             port = allocate_port(cfg, seats, role=role_for(placement))
 
         spec = build_spec(model_id, model, placement, gpus, port, cfg, hardware)
-        drv = get_driver("vllm", models_dir=(cfg.get("roots") or {}).get("models_dir"), image=spec["image"])
+        backend = placement.get("backend") or "vllm"
+        drv = get_driver(backend, models_dir=(cfg.get("roots") or {}).get("models_dir"), image=spec["image"])
         started = collect.now()
         seat = drv.launch(spec)
         collect.record_activity(seat.name, ts=started)

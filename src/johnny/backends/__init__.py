@@ -22,13 +22,17 @@ def get_driver(name: str, **kw) -> Driver:
         from .lmstudio import LmStudioDriver
 
         return LmStudioDriver(**kw)
+    if name == "llamacpp":
+        from .llamacpp import LlamaCppDriver
+
+        return LlamaCppDriver(**kw)
     raise ValueError(f"unknown backend: {name}")
 
 
 def available_drivers() -> list[str]:
     """Backends whose CLI/runtime is present on this box."""
     out = []
-    for name in ("vllm", "lmstudio"):
+    for name in ("vllm", "lmstudio", "llamacpp"):
         try:
             if get_driver(name).available():
                 out.append(name)
