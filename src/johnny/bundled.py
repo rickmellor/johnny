@@ -22,6 +22,8 @@ _BUNDLED = {
     "arc_eval": "arc_eval.py",
     "humaneval_score": "humaneval_chat_score.py",
     "code_needle": "code_needle.py",
+    "bench_llamacpp": "bench_llamacpp.sh",     # llama.cpp client throughput (concurrency 1..32)
+    "llama_bench": "bench_llama_speed.sh",     # llama.cpp single-stream prefill/decode (llama-bench)
 }
 
 

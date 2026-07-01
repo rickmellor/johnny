@@ -99,87 +99,133 @@ def _gpu_count_for(size_bytes: int, total_gpu_count: int, per_gpu_gb: float = 28
     return max(1, min(need, total_gpu_count or 1))
 
 
+# VRAM heuristics (per GPU): fit decision vs. weight-target when offloading. The gap
+# (~5 GB) is reserved for KV cache + compute buffers so an offload point doesn't OOM.
+# 27 GB weight-target is what the validated balanced -ot bf16 run actually used/GPU.
+_FIT_GB_PER_GPU = 30.0
+_WEIGHT_TARGET_GB_PER_GPU = 27.0
+
+
+def _offload_regex(n_layer: int, gpu_count: int, k_per_group: int) -> str:
+    """Balanced expert-offload: push the first k experts of each of the gpu_count
+    layer-groups to CPU. Spreading across groups keeps GPU load even (a contiguous
+    --n-cpu-moe empties GPU0 and OOMs the last GPU). per_group uses CEIL to match
+    llama.cpp's actual layer->GPU split (~ceil(n_layer/gpu_count) per device incl. the
+    output layer); floor skews offload toward the low GPUs and OOMs the high ones."""
+    import math
+    per_group = max(1, math.ceil(n_layer / gpu_count))
+    layers: list[int] = []
+    for g in range(gpu_count):
+        base = g * per_group
+        for i in range(k_per_group):
+            L = base + i
+            if L < n_layer:
+                layers.append(L)
+    alt = "|".join(str(L) for L in sorted(set(layers)))
+    return rf"blk\.({alt})\.ffn_(gate|up|down)_exps\.weight=CPU"
+
+
 def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None) -> list[dict]:
-    """Small, meaningful llama-server sweep. Model fits all-GPU here, so we sweep the
-    real throughput knob (`--parallel`, the concurrent-slot count) at a working ctx."""
+    """llama-server sweep. If the weights fit all-GPU, sweep the throughput knob
+    (`--parallel`). If not (e.g. bf16 > VRAM), sweep two balanced expert-offload
+    levels (`-ot` → experts on CPU RAM), since that's the only way it runs."""
     native = audit_info.get("native_context") or 32768
     ctx = min(32768, native)
-    pts = [
-        {"backend": "llamacpp", "gpu_count": gpu_count, "n_gpu_layers": 999,
-         "flash_attn": "off", "max_model_len": ctx, "parallel": 4},
-        {"backend": "llamacpp", "gpu_count": gpu_count, "n_gpu_layers": 999,
-         "flash_attn": "off", "max_model_len": ctx, "parallel": 16},
-    ]
+    size_gb = (audit_info.get("size_bytes") or 0) / 1e9
+    n_layer = audit_info.get("n_layer") or 0
+
+    def _mk(**kw):
+        return {"backend": "llamacpp", "gpu_count": gpu_count, "n_gpu_layers": 999,
+                "flash_attn": "off", "max_model_len": ctx, "parallel": 4, **kw}
+
+    if not n_layer or size_gb <= gpu_count * _FIT_GB_PER_GPU:
+        pts = [_mk(parallel=4), _mk(parallel=16)]  # fits: sweep concurrency
+    else:
+        import math
+        layer_gb = size_gb / n_layer
+        overflow = size_gb - gpu_count * _WEIGHT_TARGET_GB_PER_GPU
+        need = max(1, math.ceil(overflow / layer_gb))  # expert-layers to shed
+        k = max(1, math.ceil(need / gpu_count))  # per-group, balanced
+        pts = []
+        for kk in (k, k + 1):  # two offload levels: just-fits vs. more headroom
+            layers = min(kk * gpu_count, n_layer)
+            pts.append(_mk(override_tensor=_offload_regex(n_layer, gpu_count, kk),
+                           offload_layers=layers))
     if max_points:
         pts = pts[:max_points]
     return pts
 
 
 def _point_sig(p: dict) -> str:
-    return f"llama-ngl{p.get('n_gpu_layers')}-par{p.get('parallel')}-mml{p.get('max_model_len')}"
+    base = f"llama-ngl{p.get('n_gpu_layers')}-par{p.get('parallel')}-mml{p.get('max_model_len')}"
+    if p.get("override_tensor"):
+        base += f"-ot{p.get('offload_layers')}"
+    return base
 
 
-# --- tuning ------------------------------------------------------------------
-def _tuning_spec(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
-    roots = cfg.get("roots") or {}
+# --- tuning (via llama-bench: clean single-stream prefill/decode) -------------
+def _parse_llama_bench(out: str) -> tuple[float | None, float | None]:
+    """From llama-bench's markdown table, pull prefill (pp*) and decode (tg*) t/s.
+    Rows look like: | ... | pp512 | 311.28 ± 5.50 |  and  | ... | tg128 | 15.30 ± 0.77 |"""
+    pp = tg = None
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        test = next((c for c in cells if c.startswith(("pp", "tg"))), None)
+        if not test:
+            continue
+        # t/s is the rightmost numeric cell (may be "311.28 ± 5.50")
+        nums = [c for c in cells if re.match(r"^[\d.]+(\s*(±|\+/-).*)?$", c)]
+        if not nums:
+            continue
+        num = float(re.split(r"\s*(±|\+/-)\s*", nums[-1])[0])
+        if test.startswith("pp"):
+            pp = num
+        elif test.startswith("tg"):
+            tg = num
+    return pp, tg
+
+
+def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
+    """Speed-bench one config via llama-bench (loads the GGUF directly — no server).
+    Returns clean single-stream prefill/decode t/s; supports -ncmoe/-ot offload points."""
+    from ..util import run
+
     docker = cfg.get("docker") or {}
-    md = roots.get("models_dir")
-    model_path = (
+    image = docker.get("llamacpp_image")
+    md = (cfg.get("roots") or {}).get("models_dir")
+    cpath = (
         f"/models/{Path(gguf_path).relative_to(Path(md).expanduser())}"
         if md and str(gguf_path).startswith(str(Path(md).expanduser()))
         else gguf_path
     )
     visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
-    return {
-        "container_name": TUNING_CONTAINER,
-        "image": docker.get("llamacpp_image"),
-        "served_model_name": model_id,
-        "model_path": model_path,
-        "models_dir": md,
-        "port": TUNING_PORT,
-        "bind_address": "127.0.0.1",
-        "gpus": gpus,
-        "visible_env": visible_env,
-        "shm_size": docker.get("shm_size", "16g"),
-        "knobs": {
-            "n_gpu_layers": point.get("n_gpu_layers", 999),
-            "flash_attn": point.get("flash_attn", "off"),
-            "max_model_len": point.get("max_model_len"),
-            "n_cpu_moe": point.get("n_cpu_moe"),
-            "parallel": point.get("parallel"),
-        },
-        "extra": {"jinja": True, "override_tensor": point.get("override_tensor")},
-        "env": {},
-        "labels": {"johnny.tuning": "1", "johnny.backend": "llamacpp", "johnny.model": model_id},
-    }
+    argv = [
+        "docker", "run", "--rm", "--name", TUNING_CONTAINER,
+        "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render",
+        "--security-opt", "seccomp=unconfined", "--ipc=host",
+        "-v", f"{md}:/models:ro",
+        "-e", f"{visible_env}={','.join(str(g) for g in gpus)}",
+        "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
+        "-m", cpath, "-ngl", str(point.get("n_gpu_layers", 999)), "-fa", "0",
+        "-p", "512", "-n", "128", "-r", "2",
+    ]
+    if point.get("n_cpu_moe"):
+        argv += ["-ncmoe", str(point["n_cpu_moe"])]
+    if point.get("override_tensor"):
+        argv += ["-ot", point["override_tensor"]]
 
-
-def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
-    drv = get_driver("llamacpp", image=(cfg.get("docker") or {}).get("llamacpp_image"))
-    spec = _tuning_spec(model_id, gguf_path, point, gpus, cfg, hardware)
     result = {"point": point, "ok": False}
-    try:
-        drv.launch(spec)
-        ready, why = stages._wait_ready(drv, TUNING_CONTAINER, TUNING_PORT, timeout=600)
-        if not ready:
-            logtail = stages._diagnose(drv, TUNING_CONTAINER)
-            result["error"] = (why or "tuning seat not ready") + (f" — {logtail}" if logtail else "")
-            return result
-        from ..util import run
-
-        # llama.cpp-appropriate bench (concurrency 1..32), not the vLLM 16..1024 sweep.
-        scripts = cfg.get("scripts") or {}
-        bench_script = scripts.get("bench_llamacpp") or str(
-            Path(__file__).resolve().parent.parent / "scripts" / "bench_llamacpp.sh"
-        )
-        rc, out, errout = run(["bash", bench_script, str(TUNING_PORT), model_id], timeout=1800)
-        parsed = stages._parse_bench(out)
-        if parsed.get("peak_tok_s") is None:
-            parsed["error"] = (errout or out)[-300:]
-        result.update(parsed)
-        result["ok"] = parsed.get("peak_tok_s") is not None
-    finally:
-        drv.stop(TUNING_CONTAINER)
+    run(["docker", "rm", "-f", TUNING_CONTAINER], timeout=20)  # idempotent
+    rc, out, errout = run(argv, timeout=1800)
+    pp, tg = _parse_llama_bench(out)
+    if tg is not None:
+        # synthesize ranks by peak_tok_s/single_tok_s; use decode t/s for both.
+        result.update({"prefill_tok_s": pp, "decode_tok_s": tg,
+                       "peak_tok_s": tg, "single_tok_s": tg, "ok": True})
+    else:
+        result["error"] = (errout or out)[-300:]
     return result
 
 
@@ -199,9 +245,10 @@ def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtim
             "n_cpu_moe": p.get("n_cpu_moe"),
             "parallel": p.get("parallel"),
         },
-        "extra": {"jinja": True, "nickname": audit_info.get("name") or model_id},
+        "extra": {"jinja": True, "nickname": audit_info.get("name") or model_id,
+                  **({"override_tensor": p["override_tensor"]} if p.get("override_tensor") else {})},
         "env": {},
-        "perf": {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")},
+        "perf": {"prefill_tok_s": winner.get("prefill_tok_s"), "decode_tok_s": winner.get("decode_tok_s")},
         "validation_key": {
             "hardware_fingerprint": hardware.fingerprint,
             "backend": "llamacpp",
@@ -218,21 +265,23 @@ def _write_report(run_dir: Path, model_id: str, a: dict, results: list[dict], wi
         f"# TUNING_REPORT — {model_id} (llamacpp)", "",
         f"- arch: {a.get('arch')}  quant: {a.get('quant') or a.get('file_type_id')}  "
         f"size: {a.get('size_bytes', 0) / 1e9:.1f} GB  native_ctx: {a.get('native_context')}", "",
-        "## Sweep", "",
-        "| ngl | parallel | mml | peak tok/s | single tok/s | ok |",
-        "|-----|----------|-----|-----------|--------------|----|",
+        "## Sweep (llama-bench, single-stream)", "",
+        "| ngl | offload | mml | prefill tok/s | decode tok/s | ok |",
+        "|-----|---------|-----|--------------|--------------|----|",
     ]
     for r in results:
         p = r["point"]
+        off = p.get("offload_layers") or (p.get("n_cpu_moe") and f"ncmoe{p['n_cpu_moe']}") or "—"
         lines.append(
-            f"| {p.get('n_gpu_layers')} | {p.get('parallel')} | {p.get('max_model_len')} | "
-            f"{r.get('peak_tok_s')} | {r.get('single_tok_s')} | {'✓' if r.get('ok') else '✗'} |"
+            f"| {p.get('n_gpu_layers')} | {off} | {p.get('max_model_len')} | "
+            f"{r.get('prefill_tok_s')} | {r.get('decode_tok_s')} | {'✓' if r.get('ok') else '✗'} |"
         )
     if winner:
         wp = winner["point"]
-        lines += ["", f"## Winner\n\nngl={wp.get('n_gpu_layers')} parallel={wp.get('parallel')} "
-                  f"mml={wp.get('max_model_len')} → peak {winner.get('peak_tok_s')} tok/s, "
-                  f"single {winner.get('single_tok_s')} tok/s"]
+        lines += ["", f"## Winner\n\nngl={wp.get('n_gpu_layers')} "
+                  f"offload={wp.get('offload_layers') or wp.get('n_cpu_moe') or 0} "
+                  f"mml={wp.get('max_model_len')} → prefill {winner.get('prefill_tok_s')} tok/s, "
+                  f"decode {winner.get('decode_tok_s')} tok/s"]
     path = run_dir / "TUNING_REPORT.md"
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -290,8 +339,8 @@ def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: 
         finally:
             collect.remove_pin(TUNING_CONTAINER)
         if r.get("ok"):
-            _p(f"[{i}/{len(points)}] {_point_sig(point)}: peak {r.get('peak_tok_s')} tok/s, "
-               f"single {r.get('single_tok_s')} tok/s")
+            _p(f"[{i}/{len(points)}] {_point_sig(point)}: prefill {r.get('prefill_tok_s')} tok/s, "
+               f"decode {r.get('decode_tok_s')} tok/s")
         else:
             _p(f"[{i}/{len(points)}] {_point_sig(point)}: FAILED — {(r.get('error') or '')[:80]}")
         results.append(r)
