@@ -1214,21 +1214,10 @@ def _render_plan(pl: dict) -> None:
                   f"[dim](seeded search, not a brute grid)[/]")
 
 
-@app.command(rich_help_panel=_P_MODELS)
-def induct(
-    model: str = typer.Argument(..., help="HF id, registry id, or local path."),
-    use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
-    device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU if no GPU fits)."),
-    tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be a viable placement). Overrides the auto winner's TP."),
-    embeddings: bool = typer.Option(None, "--embeddings/--no-embeddings", help="Force embeddings vs generative bench (default: auto-detect)."),
-    bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
-    plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
-    resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
-    max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
-    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
-) -> None:
-    """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
+def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes, json_output) -> None:
+    """Shared induction implementation for `induct` and `tune`. A plain function so neither
+    command invokes the other: calling a Typer command directly passes its unfilled options
+    as raw OptionInfo sentinels (the `--tp <OptionInfo>` bug), never the real defaults."""
     from .induct import pipeline
 
     if plan:
@@ -1278,9 +1267,28 @@ def induct(
 
 
 @app.command(rich_help_panel=_P_MODELS)
+def induct(
+    model: str = typer.Argument(..., help="HF id, registry id, or local path."),
+    use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
+    device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU if no GPU fits)."),
+    tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be a viable placement). Overrides the auto winner's TP."),
+    embeddings: bool = typer.Option(None, "--embeddings/--no-embeddings", help="Force embeddings vs generative bench (default: auto-detect)."),
+    bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
+    plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
+    resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
+    max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
+    _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes, json_output)
+
+
+@app.command(rich_help_panel=_P_MODELS)
 def tune(
     model: str = typer.Argument(..., help="Registry id or local path."),
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
+    tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be viable on this hardware)."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
     yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
@@ -1288,8 +1296,7 @@ def tune(
 ) -> None:
     """Re-tune an existing model (induction, tuning-only). A focused alias for `induct`
     with tuning-only behavior; see `johnny induct --help` for the full option set."""
-    induct(model=model, use_case=use_case, bench=False, plan=False, resume=resume,
-           max_points=max_points, yes=yes, json_output=json_output)
+    _run_induct(model, use_case, "auto", tp, None, False, False, resume, max_points, yes, json_output)
 
 
 # --------------------------------------------------------------------------- discovery (P5)
