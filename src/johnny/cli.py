@@ -246,7 +246,7 @@ def migrate(
 
 # --------------------------------------------------------------------------- version
 @app.command(rich_help_panel=_P_SETUP)
-def version(json_output: bool = typer.Option(False, "--json")) -> None:
+def version(json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Print johnny + schema versions."""
     info = {
         "johnny": __version__,
@@ -475,8 +475,8 @@ def hinfo(
 
 @app.command(name="gpu", hidden=True)
 def _gpu_alias(
-    json_output: bool = typer.Option(False, "--json"),
-    refresh: bool = typer.Option(False, "--refresh"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    refresh: bool = typer.Option(False, "--refresh", help="Re-run the GPU dtype ISA probe (ignore cache)."),
 ) -> None:
     """Deprecated alias for `hinfo` (kept for muscle memory)."""
     hinfo(json_output=json_output, refresh=refresh, refresh_specs=False)
@@ -490,14 +490,16 @@ app.add_typer(registry_app, name="registry", rich_help_panel=_P_MODELS)
 def _registry_compact_table(models: dict) -> Table:
     """Terse one-row-per-model index (shared by `registry show -c` and `up`'s picker)."""
     t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
-    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
-        t.add_column(col)
+    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PL", "BACKENDS", "PATH"):
+        t.add_column(col, style="dim" if col == "PATH" else None)
     for mid, m in sorted(models.items()):
         ident = m.get("identity", {})
         pls = m.get("placements", [])
         backends = sorted({p.get("backend", "?") for p in pls})
+        path = ident.get("local_path") or ident.get("repo_id") or "—"
         t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
-                  str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
+                  str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)),
+                  ", ".join(backends), path)
     return t
 
 
@@ -620,7 +622,7 @@ def registry_show(
     model: str = typer.Argument(None, help="Model id to detail; omit to list all."),
     compact: bool = typer.Option(False, "--compact", "-c", help="Terse one-row-per-model index (omit placements)."),
     wide: bool = typer.Option(False, "--wide", "-w", help="Render the full table even if wider than the terminal (no column collapsing; pipe to `less -S` to scroll)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """List registry models with their placements (or detail one model).
 
@@ -644,7 +646,7 @@ def registry_show(
         ident = m.get("identity", {})
         pls = m.get("placements", [])
         backends = ", ".join(sorted({p.get("backend", "?") for p in pls})) or "—"
-        console.print(f"[bold]{model}[/]  [dim]{ident.get('local_path') or ident.get('repo_id')}[/]")
+        console.print(f"[bold]{model}[/]  [dim]path: {ident.get('local_path') or ident.get('repo_id') or '—'}[/]")
         console.print(f"  arch={ident.get('arch')} quant={ident.get('quant')} "
                       f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
         pins = _running_pins()
@@ -662,6 +664,11 @@ def registry_show(
         return
     if compact:
         _emit_table(_registry_compact_table(models), wide)
+        md = (C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir")
+        if md:
+            from pathlib import Path
+
+            console.print(f"[dim]models dir: {Path(md).expanduser()}  (PATH column is relative to this)[/]")
         return
 
     # Default: one scannable table across every model's placements (sparse MODEL column).
@@ -681,7 +688,7 @@ def registry_show(
 @registry_app.command("import")
 def registry_import(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported; write nothing."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Seed the registry from the bash launchers (stamped source=imported)."""
     from .hardware import detect as hwdetect
@@ -720,7 +727,7 @@ def registry_import(
 
 
 @registry_app.command("validate")
-def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None:
+def registry_validate(json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Validate the registry against the schema, and report the re-tune worklist.
 
     Two distinct things: schema *errors* (structural — fix with `registry normalize` or by
@@ -748,7 +755,7 @@ def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None
 @registry_app.command("normalize")
 def registry_normalize(
     apply: bool = typer.Option(False, "--apply", help="Write the normalized registry (timestamped backup)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Give every placement a consistent shape + honest status (preview by default).
 
@@ -816,7 +823,7 @@ def registry_delete(
     placement: str = typer.Argument(None, help="Placement id to delete — exact or a unique substring (e.g. 'tp2'). Omit with --all."),
     all_placements: bool = typer.Option(False, "--all", help="Delete ALL placements for the model (keeps the model entry)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Delete a placement (or all) from a model — placement-level pruning.
 
@@ -958,11 +965,11 @@ def _pick_seat_interactive(json_output: bool) -> str:
 def up(
     model: str = typer.Argument(None, help="Registry model id. Omit to list models + pick a placement (see `registry show`)."),
     placement: str = typer.Option(None, "--placement", help="Placement id or unique substring (e.g. 'tp4'); else best fit for this hardware."),
-    port: int = typer.Option(None, "--port"),
+    port: int = typer.Option(None, "--port", help="Serve on this port (else auto-assigned from the configured range)."),
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
     force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
     wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Bring up a model seat (spawn on free GPUs, or swap a named seat).
 
@@ -997,7 +1004,7 @@ def up(
 def down(
     seat: str = typer.Argument(None, help="Seat/container name (or model id). Omit to pick interactively."),
     drain: bool = typer.Option(False, "--drain", help="Graceful drain (no-op without a router)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Tear down a single named seat (never siblings).
 
@@ -1020,8 +1027,8 @@ def down(
 def swap(
     seat: str = typer.Argument(..., help="Running seat to replace."),
     model: str = typer.Argument(..., help="Model to launch in its place."),
-    wait: bool = typer.Option(False, "--wait"),
-    json_output: bool = typer.Option(False, "--json"),
+    wait: bool = typer.Option(False, "--wait", help="Block until the replacement seat is serving."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Replace one seat in place (same cards/port)."""
     from .engine import launch
@@ -1037,8 +1044,8 @@ def swap(
 @app.command(rich_help_panel=_P_SEATS)
 def reap(
     idle_ttl: int = typer.Option(None, "--idle-ttl", help="Idle seconds before reaping (default 1800)."),
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    json_output: bool = typer.Option(False, "--json"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List what would be reaped; evict nothing."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Evict idle, unpinned seats so the GPUs reach deep idle. Stateless / cron-able."""
     from .engine import service
@@ -1062,9 +1069,9 @@ def reap(
 
 @app.command(rich_help_panel=_P_SEATS)
 def pin(
-    seat: str = typer.Argument(...),
+    seat: str = typer.Argument(..., help="Seat to exempt from the reaper (see `johnny status`)."),
     ttl: int = typer.Option(None, "--ttl", help="Seconds; omit for indefinite."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Exempt a seat from the reaper (ephemeral pin in the telemetry SQLite)."""
     from .telemetry import collect
@@ -1076,7 +1083,7 @@ def pin(
 
 
 @app.command(rich_help_panel=_P_SEATS)
-def unpin(seat: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+def unpin(seat: str = typer.Argument(..., help="Seat to remove the reaper exemption from."), json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Remove a seat's reaper exemption."""
     from .telemetry import collect
 
@@ -1087,7 +1094,7 @@ def unpin(seat: str = typer.Argument(...), json_output: bool = typer.Option(Fals
 @app.command(rich_help_panel=_P_SEATS)
 def resolve(
     target: str = typer.Argument(..., help="Role, seat, or model id."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Resolve a role/seat/model to its live endpoint + readiness (the SAINT hot path)."""
     from .engine import service
@@ -1106,9 +1113,9 @@ def resolve(
 
 @app.command(rich_help_panel=_P_OBSERVE)
 def logs(
-    seat: str = typer.Argument(...),
-    follow: bool = typer.Option(False, "-f", "--follow"),
-    tail: int = typer.Option(200, "--tail"),
+    seat: str = typer.Argument(..., help="Seat whose container logs to tail."),
+    follow: bool = typer.Option(False, "-f", "--follow", help="Stream new log lines (docker logs -f)."),
+    tail: int = typer.Option(200, "--tail", help="Lines of history to show (default 200)."),
 ) -> None:
     """Tail a seat's logs (docker logs), with launch-failure context."""
     from .engine import all_seats, driver_for
@@ -1130,10 +1137,10 @@ def logs(
 
 @app.command(rich_help_panel=_P_OBSERVE)
 def metrics(
-    seat: str = typer.Argument(...),
+    seat: str = typer.Argument(..., help="Seat to report metrics for."),
     history: bool = typer.Option(False, "--history", help="Aggregate trends from the telemetry SQLite."),
     since: int = typer.Option(None, "--since", help="History window in seconds (default: all)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Show telemetry for a seat: live vLLM /metrics, or --history rollup trends."""
     if history:
@@ -1219,7 +1226,7 @@ def induct(
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
     yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
     from .induct import pipeline
@@ -1274,12 +1281,13 @@ def induct(
 def tune(
     model: str = typer.Argument(..., help="Registry id or local path."),
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
-    resume: bool = typer.Option(False, "--resume"),
-    max_points: int = typer.Option(None, "--max-points"),
-    yes: bool = typer.Option(False, "--yes"),
-    json_output: bool = typer.Option(False, "--json"),
+    resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
+    max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Re-tune an existing model (induction, tuning-only)."""
+    """Re-tune an existing model (induction, tuning-only). A focused alias for `induct`
+    with tuning-only behavior; see `johnny induct --help` for the full option set."""
     induct(model=model, use_case=use_case, bench=False, plan=False, resume=resume,
            max_points=max_points, yes=yes, json_output=json_output)
 
@@ -1304,8 +1312,8 @@ def search(
     query: str = typer.Argument(..., help="HF search query, or a base model id with --quants."),
     quants: bool = typer.Option(False, "--quants", "-q",
                                 help="List quantizations of QUERY (a base model id) with a dtype-fit verdict."),
-    limit: int = typer.Option(10, "--limit"),
-    json_output: bool = typer.Option(False, "--json"),
+    limit: int = typer.Option(10, "--limit", help="Max results to return (default 10)."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Search Hugging Face with a fit verdict for your hardware + capability badges.
 
@@ -1361,7 +1369,7 @@ def search(
 
 
 @app.command(rich_help_panel=_P_MODELS)
-def download(repo: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
+def download(repo: str = typer.Argument(..., help="Hugging Face repo id to download."), json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Download a model into the models dir (gated models need `johnny login`)."""
     from .discover import search as dsearch
 
@@ -1381,7 +1389,7 @@ def download(repo: str = typer.Argument(...), json_output: bool = typer.Option(F
 @app.command(rich_help_panel=_P_MODELS)
 def login(
     token: str = typer.Option(None, "--token", help="HF token; omit to show status."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Store / check a Hugging Face token (for gated models)."""
     from .discover import auth
@@ -1406,9 +1414,9 @@ def alive(
     seat: str = typer.Option(None, "--seat", help="Target a specific seat."),
     role: str = typer.Option("orchestrator", "--role", help="Target seat by role (default)."),
     no_wait: bool = typer.Option(False, "--no-wait", help="Don't wait for a loading seat."),
-    timeout: int = typer.Option(900, "--timeout"),
+    timeout: int = typer.Option(900, "--timeout", help="Seconds to wait for a loading seat (default 900)."),
     no_attach: bool = typer.Option(False, "--no-attach", help="Start detached (don't attach the tmux session)."),
-    session: str = typer.Option(None, "--session"),
+    session: str = typer.Option(None, "--session", help="tmux session name (default from config)."),
     provider: str = typer.Option(None, "--provider", help="Chat provider name (default: config [external].provider)."),
 ) -> None:
     """Launch (or re-attach) the chat TUI against a seat (role/model/seat)."""
@@ -1437,7 +1445,7 @@ app.add_typer(provider_app, name="provider", rich_help_panel=_P_FLEET)
 def provider_sync(
     write: bool = typer.Option(False, "--write", help="Patch the config in place (timestamped backup)."),
     provider: str = typer.Option(None, "--provider", help="Chat provider name (default: config [external].provider)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Compute the provider's base_url + models catalog from the registry (preview, or --write)."""
     from .external import provider as prov
@@ -1463,7 +1471,7 @@ def provider_sync(
 @app.command(rich_help_panel=_P_SETUP)
 def cleanup(
     apply: bool = typer.Option(False, "--apply", help="Actually delete (default: dry-run preview)."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Surface removal candidates (untracked on disk / unvalidated-here / stale)."""
     from . import lifecycle
@@ -1505,7 +1513,7 @@ def rm(
     target: str = typer.Argument(..., help="Model id, local path (vendor/name), or directory."),
     registry_only: bool = typer.Option(False, "--registry-only", help="Deregister but keep the weights on disk."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
-    json_output: bool = typer.Option(False, "--json"),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Remove a single model: its on-disk weights and/or its registry entry."""
     from . import lifecycle
@@ -1555,8 +1563,8 @@ def _daemon_pidfile(agent: bool = False):
 
 @daemon_app.command("up")
 def daemon_up(
-    host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8080, "--port"),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for johnnyd (default 127.0.0.1)."),
+    port: int = typer.Option(8080, "--port", help="Port for johnnyd to listen on (default 8080)."),
     no_jit: bool = typer.Option(False, "--no-jit", help="Disable load-on-first-request."),
     max_concurrent: int = typer.Option(0, "--max-concurrent", help="Per-seat admission cap (0=unlimited)."),
     agent: bool = typer.Option(False, "--agent", help="Run as a node agent (dial out to a controller)."),
@@ -1607,7 +1615,7 @@ def daemon_up(
 
 
 @daemon_app.command("status")
-def daemon_status(json_output: bool = typer.Option(False, "--json")) -> None:
+def daemon_status(json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Is johnnyd running + healthy?"""
     import urllib.request
 
@@ -1654,8 +1662,8 @@ def daemon_down() -> None:
 
 @app.command(rich_help_panel=_P_FLEET)
 def nodes(
-    controller: str = typer.Option("http://127.0.0.1:8080", "--controller"),
-    json_output: bool = typer.Option(False, "--json"),
+    controller: str = typer.Option("http://127.0.0.1:8080", "--controller", help="Controller base URL (default http://127.0.0.1:8080)."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """List nodes registered with the controller (multi-machine fleet)."""
     import urllib.request
