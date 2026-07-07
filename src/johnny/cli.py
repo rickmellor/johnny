@@ -37,6 +37,17 @@ err = Console(stderr=True)
 
 _STATE_STYLE = {"ready": "green", "running": "yellow", "loading": "yellow", "down": "red"}
 _CHECK_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
+_STATUS_STYLE = {"validated": "green", "unmeasured": "yellow", "incomplete": "red",
+                 "stale": "magenta", "unverified": "yellow"}
+
+# --help is grouped into task-family panels (rich_help_panel). Panels render in the
+# order their first command is defined below, so the section order here mirrors the
+# order commands appear in this file: Seats → Observe → Models → Fleet → Setup.
+_P_SEATS = "Seats — serve & lifecycle"
+_P_OBSERVE = "Observe — status, logs, metrics"
+_P_MODELS = "Models & tuning"
+_P_FLEET = "Fleet & integrations"
+_P_SETUP = "Setup & maintenance"
 
 
 # --------------------------------------------------------------------------- status
@@ -76,7 +87,7 @@ def _render_status(json_output: bool = False) -> None:
     console.print(table)
 
 
-@app.command()
+@app.command(rich_help_panel=_P_OBSERVE)
 def status(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
     watch: bool = typer.Option(False, "--watch", help="Refresh live (basic; full TUI is P9)."),
@@ -113,7 +124,7 @@ def _build_status_renderable():
 
 
 # --------------------------------------------------------------------------- doctor
-@app.command()
+@app.command(rich_help_panel=_P_SETUP)
 def doctor(json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
     """Preflight checks: docker, GPU runtime, arch, disk, backends, config."""
     checks = _doctor.run_checks()
@@ -134,7 +145,7 @@ def doctor(json_output: bool = typer.Option(False, "--json", help="Machine-reada
 
 
 # --------------------------------------------------------------------------- init
-@app.command()
+@app.command(rich_help_panel=_P_SETUP)
 def init(
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config."),
     pull: bool = typer.Option(False, "--pull", help="Also `docker pull` the vLLM image (large)."),
@@ -201,7 +212,7 @@ def init(
 
 
 # --------------------------------------------------------------------------- migrate
-@app.command()
+@app.command(rich_help_panel=_P_SETUP)
 def migrate(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report what would change; touch nothing."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
@@ -234,7 +245,7 @@ def migrate(
 
 
 # --------------------------------------------------------------------------- version
-@app.command()
+@app.command(rich_help_panel=_P_SETUP)
 def version(json_output: bool = typer.Option(False, "--json")) -> None:
     """Print johnny + schema versions."""
     info = {
@@ -254,70 +265,369 @@ def version(json_output: bool = typer.Option(False, "--json")) -> None:
 
 
 # --------------------------------------------------------------------------- gpu
-@app.command()
-def gpu(
-    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
-    refresh: bool = typer.Option(False, "--refresh", help="Re-run the dtype ISA probe (ignore cache)."),
-) -> None:
-    """Detect GPUs: vendor, count, per-GPU VRAM, arch, and natively-accelerated dtypes."""
+def _dimm_summary(dimms) -> str:
+    """Group identical DIMMs: '8× 32 GB DDR4-2667' (or 'a + b' when mixed)."""
+    from collections import Counter
+
+    groups = Counter((d.size_gb, d.type, d.configured_mts or d.speed_mts) for d in dimms)
+    out = []
+    for (size, typ, spd), n in sorted(groups.items(), key=lambda x: -x[1]):
+        label = f"{size:g} GB"
+        if typ and spd:
+            label += f" {typ}-{spd}"
+        elif typ:
+            label += f" {typ}"
+        out.append(f"{n}× {label}")
+    return " + ".join(out)
+
+
+def _fmt_link(mbps) -> str:
+    """NIC link speed as an Ethernet class (10 GbE / 2.5 GbE / 1 GbE), or raw Mb/s."""
+    if not mbps or mbps <= 0:
+        return "[dim]—[/]"
+    if mbps >= 1000 and mbps % 1000 == 0:
+        return f"{mbps // 1000} GbE"
+    if mbps >= 1000:
+        return f"{mbps / 1000:g} GbE"
+    return f"{mbps} Mb/s"
+
+
+def _hinfo_json(hw, host, specdb) -> dict:
     from dataclasses import asdict
 
     from .hardware import detect as hwdetect
+    from .hardware import specs as specmod
+
+    gpus = []
+    for g in hw.gpus:
+        gd = asdict(g)
+        gd["theoretical_tflops"] = hwdetect.theoretical_tflops(g)
+        gd["ai_spec"] = specmod.spec_for(specdb, g.arch, g.cu_count)
+        gpus.append(gd)
+    gpu_block = {k: v for k, v in asdict(hw).items() if k != "gpus"}
+    gpu_block["gpus"] = gpus
+    return {
+        "gpu": gpu_block,
+        "cpu": asdict(host.cpu),
+        "memory": asdict(host.mem),
+        "storage": [asdict(d) for d in host.disks],
+        "network": [asdict(n) for n in host.nics],
+    }
+
+
+def _ai_spec_line(spec: dict, count: int) -> str:
+    """One-line AI-matrix spec from the curated DB, with sparsity, box total, provenance."""
+    i8, f16 = spec.get("int8_matrix_tops"), spec.get("fp16_matrix_tflops")
+    i8s, f16s = spec.get("int8_matrix_tops_sparse"), spec.get("fp16_matrix_tflops_sparse")
+    approx = "~" if spec.get("approx") else ""
+    parts = []
+    if i8:
+        parts.append(f"{approx}{i8:g} TOPS INT8")
+    if f16:
+        parts.append(f"{approx}{f16:g} TFLOPS FP16")
+    body = " · ".join(parts) or "—"
+    spar = f" [dim](sparse {i8s:g}/{f16s:g})[/]" if (i8s or f16s) else ""
+    box = f"  [dim]· box ×{count} ≈ {i8 * count:g} TOPS INT8[/]" if (i8 and count > 1) else ""
+    src = spec.get("source", "")
+    host = src.split("/")[2] if "//" in src else src
+    prov = f"  [dim]\\[{host} · {spec.get('as_of', '?')}][/]" if host else ""
+    return f"  [bold]AI matrix (per card):[/] {body}{spar}{box}{prov}"
+
+
+def _render_hinfo(hw, host, specdb) -> None:
+    from .hardware import detect as hwdetect
+    from .hardware import specs as specmod
+
+    # ---- CPU ----
+    c = host.cpu
+    console.print("[bold underline]CPU[/]")
+    console.print(f"  {c.model}")
+    if c.max_mhz and c.base_mhz:
+        freq = f"{c.base_mhz / 1000:.2f}–{c.max_mhz / 1000:.2f} GHz"
+    elif c.max_mhz:
+        freq = f"up to {c.max_mhz / 1000:.2f} GHz"
+    elif c.base_mhz:
+        freq = f"{c.base_mhz / 1000:.2f} GHz"
+    else:
+        freq = "—"
+    sock = f"{c.sockets}× socket · " if c.sockets > 1 else ""
+    l3 = f" · L3 {c.l3_mb:.0f} MB" if c.l3_mb else ""
+    console.print(f"  {sock}{c.cores} cores / {c.threads} threads · {freq}{l3}")
+    bogo = f"{c.bogomips_total:,.0f}" if c.bogomips_total else "—"
+    console.print(f"  BogoMIPS {bogo} [dim](Linux MIPS proxy, not a benchmark)[/] · "
+                  f"AI ISA: [green]{', '.join(c.ai_flags) or '—'}[/]")
+
+    # ---- Memory ----
+    m = host.mem
+    console.print("\n[bold underline]Memory[/]")
+    if m.dimms:
+        slots = f"{m.populated}/{m.slots} slots" if m.slots else f"{m.populated} DIMM(s)"
+        maxc = f" · max {m.max_capacity_gb:.0f} GB" if m.max_capacity_gb else ""
+        ecc = " · ECC" if (m.ecc and m.ecc.lower() not in ("none", "")) else " · no ECC"
+        tag = f"  [dim](cached {m.captured_at})[/]" if m.cached else ""
+        console.print(f"  {m.total_gb:.0f} GB · {_dimm_summary(m.dimms)} · {slots}{maxc}{ecc}{tag}")
+        parts = sorted({d.part_number for d in m.dimms if d.part_number})
+        if parts:
+            console.print(f"  [dim]{', '.join(parts)}[/]")
+    else:
+        console.print(f"  {m.total_gb:.0f} GB [dim](DIMM detail needs root — "
+                      f"run `johnny hinfo --seed-memory` once to cache it)[/]")
+
+    # ---- GPU ----
+    console.print("\n[bold underline]GPU[/]")
+    if not hw.gpus:
+        console.print(f"  [yellow]none detected[/] (vendor={hw.vendor or 'none'}) — CPU / LM Studio / Ollama only.")
+    else:
+        het = "" if hw.homogeneous else "  [yellow](heterogeneous)[/]"
+        console.print(f"  [bold]{hw.vendor}[/] · {len(hw.gpus)} GPU(s) · {hw.total_vram_gb:.0f} GB VRAM · "
+                      f"fingerprint [cyan]{hw.fingerprint}[/]{het}")
+        cu_by_arch = {g.arch: g.cu_count for g in hw.gpus}
+        for grp in hw.groups:
+            dl = ", ".join(grp.native_dtypes) or "—"
+            console.print(f"  [bold]{grp.arch}[/] ×{grp.count} @ {grp.vram_gb:.0f}GB — native dtypes: "
+                          f"[green]{dl}[/] [dim](source: {hw.dtype_source})[/]")
+            spec = specmod.spec_for(specdb, grp.arch, cu_by_arch.get(grp.arch))
+            if spec:
+                console.print(_ai_spec_line(spec, grp.count))
+            else:
+                console.print(f"  [dim]AI matrix: — (no cached spec for {grp.arch}; add it to gpu_specs.json)[/]")
+        t = Table(pad_edge=False)
+        for col in ("IDX", "NAME", "ARCH", "VRAM", "CU", "CLK", "FP32*", "FP16*"):
+            t.add_column(col, style="cyan" if col == "ARCH" else None)
+        tot32 = tot16 = 0.0
+        for g in hw.gpus:
+            th = hwdetect.theoretical_tflops(g) or {}
+            f32, f16 = th.get("fp32_tflops"), th.get("fp16_tflops")
+            tot32 += f32 or 0
+            tot16 += f16 or 0
+            t.add_row(str(g.index), g.name, g.arch, f"{g.vram_gb:.0f} GB",
+                      str(g.cu_count or "—"), f"{g.clk_mhz:.0f} MHz" if g.clk_mhz else "—",
+                      f"{f32:.1f}" if f32 else "—", f"{f16:.1f}" if f16 else "—")
+        console.print(t)
+        if tot32:
+            console.print(f"  [dim]* theoretical vector TFLOPS (CU×clock×2, no dual-issue) · box ≈ "
+                          f"{tot32:.0f}/{tot16:.0f} FP32/FP16. Matrix/tensor AI-TOPS is a spec value — not shown.[/]")
+
+    # ---- Storage ----
+    console.print("\n[bold underline]Storage[/]")
+    if not host.disks:
+        console.print("  [dim]—[/]")
+    else:
+        t = Table(pad_edge=False)
+        for col in ("DEVICE", "SIZE", "KIND", "MODEL", "THROUGHPUT*"):
+            t.add_column(col)
+        for d in host.disks:
+            size = f"{d.size_gb / 1024:.1f} TB" if d.size_gb >= 1024 else f"{d.size_gb:.0f} GB"
+            t.add_row(d.name, size, d.kind, d.model or "—", d.throughput_est or "—")
+        console.print(t)
+        console.print("  [dim]* sequential throughput, bus-class estimate — not measured[/]")
+
+    # ---- Network ----
+    console.print("\n[bold underline]Network[/]")
+    if not host.nics:
+        console.print("  [dim]—[/]")
+    else:
+        for n in host.nics:
+            st = "green" if n.state == "up" else "red"
+            console.print(f"  [bold]{n.name}[/]  {_fmt_link(n.speed_mbps)}  "
+                          f"[{st}]{n.state}[/]  [dim]{n.mac or ''}[/]")
+
+
+@app.command(rich_help_panel=_P_SETUP)
+def hinfo(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+    refresh: bool = typer.Option(False, "--refresh", help="Re-run the GPU dtype ISA probe (ignore cache)."),
+    refresh_specs: bool = typer.Option(False, "--refresh-specs", help="Re-pull the curated GPU AI-TOPS spec DB into the cache."),
+    seed_memory: bool = typer.Option(False, "--seed-memory", help="Cache DIMM detail via `sudo dmidecode` (prompts for a password) so later unprivileged runs show it."),
+) -> None:
+    """Host hardware inventory: GPUs, CPU, memory, storage, network — with derived metrics
+    (theoretical GPU TFLOPS, matrix AI-TOPS, BogoMIPS, link throughput).
+
+    AI-TOPS are manufacturer spec-sheet figures from a curated DB — pulled into a per-user
+    cache on first run (`--refresh-specs` re-pulls), shown with source + date, and '—' for
+    archs with no cached spec. Theoretical vector TFLOPS are computed (CU×clock) and labelled
+    as such. DIMM detail needs root: run `--seed-memory` once to cache it for later runs.
+    Nothing here is fabricated — unknown specs stay '—'.
+    """
+    from .hardware import detect as hwdetect
+    from .hardware import hostinfo as hostmod
+    from .hardware import specs as specmod
+
+    state_dir = C.get_paths().state_dir
+    if seed_memory:
+        res = hostmod.seed_memory(state_dir)
+        if res and res.dimms:
+            console.print(f"[green]✓ cached memory info[/] — {res.populated} DIMM(s) "
+                          f"({_dimm_summary(res.dimms)}). Future `johnny hinfo` runs show it.\n")
+        else:
+            err.print("[yellow]couldn't read DIMM detail[/] — dmidecode/sudo failed or was declined.\n")
 
     hw = hwdetect.detect(refresh=refresh)
+    host = hostmod.host_info(state_dir)
+    specdb = specmod.load_specs(state_dir, refresh=refresh_specs)
     if json_output:
-        console.print(_json.dumps(asdict(hw), indent=2))
+        # Plain print, not console.print: Rich soft-wraps long lines (e.g. the spec source
+        # URL), inserting newlines that corrupt the JSON when piped.
+        print(_json.dumps(_hinfo_json(hw, host, specdb), indent=2))
         return
+    _render_hinfo(hw, host, specdb)
 
-    if not hw.gpus:
-        console.print(
-            f"[yellow]no GPUs detected[/] (vendor={hw.vendor or 'none'}); "
-            f"host RAM {hw.host_ram_gb:.0f} GB — CPU / LM Studio / Ollama only."
-        )
-        return
 
-    het = "" if hw.homogeneous else "  [yellow](heterogeneous)[/]"
-    console.print(
-        f"[bold]{hw.vendor}[/] · {len(hw.gpus)} GPU(s) · {hw.total_vram_gb:.0f} GB VRAM · "
-        f"host RAM {hw.host_ram_gb:.0f} GB · fingerprint [cyan]{hw.fingerprint}[/]{het}"
-    )
-    for g in hw.groups:
-        dl = ", ".join(g.native_dtypes) or "—"
-        console.print(
-            f"  [bold]{g.arch}[/] ×{g.count} @ {g.vram_gb:.0f}GB — native dtypes: "
-            f"[green]{dl}[/] [dim](source: {hw.dtype_source})[/]"
-        )
-
-    table = Table(title="GPUs", title_style="bold")
-    table.add_column("IDX")
-    table.add_column("NAME")
-    table.add_column("ARCH", style="cyan")
-    table.add_column("VRAM (GB)", justify="right")
-    for g in hw.gpus:
-        table.add_row(str(g.index), g.name, g.arch, f"{g.vram_gb:.0f}")
-    console.print(table)
-
-    nd = set(hw.native_dtypes)
-    fp8 = "[green]✓[/]" if "fp8" in nd else "[red]✗[/]"
-    fp4 = "[green]✓[/]" if "fp4" in nd else "[red]✗[/]"
-    console.print(f"  fp8 native: {fp8}    fp4 native: {fp4}")
+@app.command(name="gpu", hidden=True)
+def _gpu_alias(
+    json_output: bool = typer.Option(False, "--json"),
+    refresh: bool = typer.Option(False, "--refresh"),
+) -> None:
+    """Deprecated alias for `hinfo` (kept for muscle memory)."""
+    hinfo(json_output=json_output, refresh=refresh, refresh_specs=False)
 
 
 # --------------------------------------------------------------------------- registry
-registry_app = typer.Typer(add_completion=False, help="Inspect / seed / validate the model registry.")
-app.add_typer(registry_app, name="registry")
+registry_app = typer.Typer(add_completion=False, help="Inspect / seed / validate / normalize the model registry.")
+app.add_typer(registry_app, name="registry", rich_help_panel=_P_MODELS)
+
+
+def _registry_compact_table(models: dict) -> Table:
+    """Terse one-row-per-model index (shared by `registry show -c` and `up`'s picker)."""
+    t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
+    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
+        t.add_column(col)
+    for mid, m in sorted(models.items()):
+        ident = m.get("identity", {})
+        pls = m.get("placements", [])
+        backends = sorted({p.get("backend", "?") for p in pls})
+        t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
+                  str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
+    return t
+
+
+def _current_runtimes() -> dict:
+    """Backend -> current launch image, for staleness checks (loaded once per command)."""
+    from .registry import normalize as N
+
+    cfg = C.load_yaml(C.get_paths().config_file) or {}
+    return N.current_runtimes(cfg)
+
+
+def _running_pins() -> dict:
+    """(model_id, placement_id) -> actual GPU indices, for placements running *right now*.
+
+    A placement config has no fixed pins (they're assigned at launch from what's free), so
+    we only ever show real cards — read back from the running seat's `johnny.*` labels.
+    Best-effort: no docker / no seats -> {} and the view degrades to card counts."""
+    try:
+        from . import engine
+
+        pins: dict = {}
+        for s in engine.all_seats():
+            labels = (s.extra or {}).get("labels") or {}
+            model, pid = labels.get("johnny.model"), labels.get("johnny.placement")
+            if model and pid and s.gpus:
+                pins[(model, pid)] = list(s.gpus)
+        return pins
+    except Exception:
+        return {}
+
+
+def _fmt_toks(peak, single) -> str:
+    """peak/single tok/s as 'peak/single', '—' where unmeasured."""
+    if peak is None and single is None:
+        return "[dim]—[/]"
+    p = f"{peak:g}" if peak is not None else "—"
+    s = f"{single:g}" if single is not None else "—"
+    return f"{p}/{s}"
+
+
+def _status_cell(status: str) -> str:
+    return f"[{_STATUS_STYLE.get(status, 'white')}]{status}[/]"
+
+
+def _emit_table(renderable, wide: bool = False) -> None:
+    """Print a table fit-to-terminal (default — columns may collapse to '…'), or at full
+    natural width when `wide`: nothing is truncated, and the terminal wraps the long lines
+    (or pipe to `less -S` to scroll them). Uses a very wide virtual console so Rich sizes
+    every column to its content instead of squeezing to fit."""
+    if wide:
+        Console(width=10_000).print(renderable)
+    else:
+        console.print(renderable)
+
+
+def _print_worklist(worklist: list[dict]) -> None:
+    """Placements whose fix is a real benchmark (`johnny tune`), not a normalize pass."""
+    if not worklist:
+        return
+    console.print(f"\n[bold]needs `johnny tune`[/] — {len(worklist)} placement(s) lack trustworthy numbers:")
+    for w in worklist:
+        console.print(f"  {_status_cell(w['status'])}  [cyan]{w['model']}[/] / [bold]{w['placement']}[/]")
+
+
+def _gpus_cell(gcount, pins) -> str:
+    """'×N' card count, augmented with the live '[i,j]' pins when the placement is
+    running (pins are real; idle placements have no fixed cards, so count only)."""
+    base = f"×{gcount}" if gcount else "[dim]—[/]"
+    if pins:
+        return f"{base} [green]\\[{','.join(str(g) for g in pins)}][/]"
+    return base
+
+
+def _placements_table(rows, current, *, model_col: bool = False, pins: dict | None = None,
+                      identities: dict | None = None, title: str = "") -> Table:
+    """The standardized per-placement view: weights dtype + KV-cache dtype, GPUs the seat
+    takes, TP/parallelism, tuning priority, context, measured tok/s, honest status, and the
+    runtime it was tuned on.
+
+    `rows` is an iterable of (model_id, placement) so the all-models view can render one
+    scannable table (sparse MODEL column) rather than a header per model. `pins` maps
+    (model, placement) -> live GPU indices for running seats; `identities` maps model -> its
+    identity block (for the dtype fallback when a placement doesn't override quant). Numeric
+    columns are no_wrap so they never collapse to '…' on a narrow terminal."""
+    from .registry import normalize as N
+
+    pins, identities = pins or {}, identities or {}
+    t = Table(title=title or None, title_style="dim", title_justify="left", pad_edge=False)
+    if model_col:
+        t.add_column("MODEL", style="bold")
+    t.add_column("ID", style="cyan")
+    t.add_column("BACKEND", style="dim")
+    t.add_column("DTYPE", no_wrap=True)
+    for col in ("GPUS", "TP", "PRIORITY", "MML", "KV", "TOK/S"):
+        t.add_column(col, no_wrap=True)
+    t.add_column("STATUS", no_wrap=True)
+    t.add_column("TOOL", style="dim")
+
+    prev = None
+    for mid, p in rows:
+        v = N.placement_view(p, current)
+        dtype = v["dtype"] or (identities.get(mid, {}) or {}).get("quant") or "—"
+        cells = []
+        if model_col:
+            cells.append("" if mid == prev else mid)
+            prev = mid
+        cells += [
+            v["id"], v["backend"], dtype,
+            _gpus_cell(v["gpus"], pins.get((mid, v["id"]))),
+            v["tp"], v["priority"], str(v["mml"] or "—"), v["kv"] or "—",
+            _fmt_toks(v["peak"], v["single"]),
+            _status_cell(v["status"]), v["tool"],
+        ]
+        t.add_row(*cells)
+    return t
 
 
 @registry_app.command("show")
 def registry_show(
     model: str = typer.Argument(None, help="Model id to detail; omit to list all."),
     compact: bool = typer.Option(False, "--compact", "-c", help="Terse one-row-per-model index (omit placements)."),
+    wide: bool = typer.Option(False, "--wide", "-w", help="Render the full table even if wider than the terminal (no column collapsing; pipe to `less -S` to scroll)."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """List registry models with their placements (or detail one model).
 
     Placements are what you load (`up --placement <id>`) and prune
     (`registry delete <model> <id>`), so they're shown by default; -c for the index.
+    By default the table scales to your terminal (columns may collapse to '…'); -w
+    prints it at full width instead.
     """
     from .registry import store
 
@@ -332,19 +642,16 @@ def registry_show(
             console.print(_json.dumps(m, indent=2))
             return
         ident = m.get("identity", {})
+        pls = m.get("placements", [])
+        backends = ", ".join(sorted({p.get("backend", "?") for p in pls})) or "—"
         console.print(f"[bold]{model}[/]  [dim]{ident.get('local_path') or ident.get('repo_id')}[/]")
-        console.print(f"  arch={ident.get('arch')} quant={ident.get('quant')} ctx={m.get('capabilities',{}).get('native_context')}")
-        t = Table(title="placements")
-        for col in ("ID", "BACKEND", "USE", "TP", "MML", "GMU", "MTP", "KV", "SOURCE", "FINGERPRINT"):
-            t.add_column(col)
-        for p in m.get("placements", []):
-            k = p.get("knobs", {})
-            mtp = "on" if (k.get("mtp") or {}).get("enabled") else "—"
-            t.add_row(p.get("id", ""), p.get("backend", ""), str(p.get("use_case") or "—"),
-                      str(k.get("tensor_parallel_size") or "—"), str(k.get("max_model_len") or "—"),
-                      str(k.get("gpu_memory_util") or "—"), mtp, str(k.get("kv_cache_dtype") or "—"),
-                      p.get("source", ""), p.get("validation_key", {}).get("hardware_fingerprint", "—"))
-        console.print(t)
+        console.print(f"  arch={ident.get('arch')} quant={ident.get('quant')} "
+                      f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
+        pins = _running_pins()
+        _emit_table(_placements_table([(model, p) for p in pls], _current_runtimes(),
+                                      pins=pins, identities={model: ident}), wide)
+        if any((model, p.get("id")) in pins for p in pls):
+            console.print("[dim]\\[i,j] = live GPU pins (running now)[/]")
         return
 
     if json_output:
@@ -354,40 +661,21 @@ def registry_show(
         console.print("[dim]registry is empty.[/] Seed it with [bold]johnny registry import[/].")
         return
     if compact:
-        t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
-        for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PLACEMENTS", "BACKENDS"):
-            t.add_column(col)
-        for mid, m in sorted(models.items()):
-            ident = m.get("identity", {})
-            pls = m.get("placements", [])
-            backends = sorted({p.get("backend", "?") for p in pls})
-            t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
-                      str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)), ", ".join(backends))
-        console.print(t)
+        _emit_table(_registry_compact_table(models), wide)
         return
 
-    # Default: full picture — every model with its placements inline.
+    # Default: one scannable table across every model's placements (sparse MODEL column).
     console.print(f"[bold]registry — {len(models)} model(s)[/]  "
                   f"[dim]load: `johnny up <model> --placement <id>`  ·  -c for the terse index[/]")
-    for mid, m in sorted(models.items()):
-        ident = m.get("identity", {})
-        pls = m.get("placements", [])
-        cap = m.get("capabilities", {})
-        meta = " · ".join(x for x in [ident.get("arch"), ident.get("quant"),
-                          f"ctx {cap.get('native_context')}" if cap.get("native_context") else None] if x)
-        console.print(f"\n[bold]{mid}[/]  [dim]{meta}[/]")
-        if not pls:
-            console.print("  [dim](no placements — `johnny induct <model>` or `registry import`)[/]")
-            continue
-        for p in pls:
-            k = p.get("knobs", {})
-            perf = p.get("perf", {})
-            peak, single = perf.get("peak_tok_s"), perf.get("single_stream_tok_s")
-            perf_s = f" · {peak}/{single} tok/s" if peak else ""
-            console.print(
-                f"  • [cyan]{p.get('id')}[/]  [dim]tp{k.get('tensor_parallel_size') or '—'} · "
-                f"{p.get('use_case') or '—'} · mml{k.get('max_model_len') or '—'}{perf_s} · {p.get('source')}[/]"
-            )
+    rows = [(mid, p) for mid, m in sorted(models.items()) for p in (m.get("placements") or [])]
+    pins = _running_pins()
+    identities = {mid: (m.get("identity") or {}) for mid, m in models.items()}
+    _emit_table(_placements_table(rows, _current_runtimes(), model_col=True, pins=pins, identities=identities), wide)
+    if pins:
+        console.print("[dim]\\[i,j] = live GPU pins (running now)[/]")
+    empty = [mid for mid, m in sorted(models.items()) if not (m.get("placements") or [])]
+    if empty:
+        console.print(f"[dim]no placements: {', '.join(empty)} — `johnny induct <model>`[/]")
 
 
 @registry_app.command("import")
@@ -433,19 +721,93 @@ def registry_import(
 
 @registry_app.command("validate")
 def registry_validate(json_output: bool = typer.Option(False, "--json")) -> None:
-    """Validate the registry against the schema."""
-    from .registry import schema, store
+    """Validate the registry against the schema, and report the re-tune worklist.
 
-    errors = schema.validate(store.load())
+    Two distinct things: schema *errors* (structural — fix with `registry normalize` or by
+    editing) and the *worklist* of placements that are structurally fine but lack
+    trustworthy numbers (unmeasured / incomplete / stale) — those need `johnny tune`.
+    """
+    from .registry import normalize as N, schema, store
+
+    reg = store.load()
+    errors = schema.validate(reg)
+    worklist = N.retune_worklist(reg, _current_runtimes())
     if json_output:
-        console.print(_json.dumps({"valid": not errors, "errors": errors}, indent=2))
-        return
+        console.print(_json.dumps({"valid": not errors, "errors": errors, "worklist": worklist}, indent=2))
+        raise typer.Exit(code=1 if errors else 0)
     if not errors:
         console.print("[green]✓ registry is valid[/]")
-        return
-    for e in errors:
-        err.print(f"[red]✗[/] {e}")
-    raise typer.Exit(code=1)
+    else:
+        for e in errors:
+            err.print(f"[red]✗[/] {e}")
+    _print_worklist(worklist)
+    if errors:
+        raise typer.Exit(code=1)
+
+
+@registry_app.command("normalize")
+def registry_normalize(
+    apply: bool = typer.Option(False, "--apply", help="Write the normalized registry (timestamped backup)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Give every placement a consistent shape + honest status (preview by default).
+
+    Fills only structural gaps — gpu_count (derived from TP), the perf {peak, single}
+    shape, a default source, validation_key.backend, a validated_at placeholder. It never
+    invents a tok/s number: a missing benchmark stays visibly `unmeasured`, and an aborted
+    run with no provenance stays `incomplete`. Those need `johnny tune`, which this reports
+    as a worklist. `--apply` rewrites registry.yaml (a timestamped backup is kept).
+    """
+    import shutil
+    from datetime import datetime
+
+    from .registry import normalize as N, store
+
+    reg = store.load()
+    current = _current_runtimes()
+    models = store.models(reg)
+
+    plan = []
+    for mid, m in sorted(models.items()):
+        for p in m.get("placements") or []:
+            changes = N.normalization_changes(p)
+            if changes:
+                plan.append({"model": mid, "placement": p.get("id"),
+                             "status": N.placement_status(p, current), "changes": changes})
+    total = sum(len(x["changes"]) for x in plan)
+    worklist = N.retune_worklist(reg, current)
+
+    if json_output:
+        console.print(_json.dumps(
+            {"placements_touched": len(plan), "field_updates": total,
+             "plan": plan, "worklist": worklist, "applied": apply}, indent=2))
+    elif not plan:
+        console.print("[green]✓ registry already normalized[/] — every placement has a consistent shape.")
+    else:
+        verb = "normalized" if apply else "would normalize"
+        console.print(f"[bold]{verb}[/] {total} field(s) across {len(plan)} placement(s):")
+        for x in plan:
+            console.print(f"  [cyan]{x['model']}[/] / [bold]{x['placement']}[/]  {_status_cell(x['status'])}")
+            for c in x["changes"]:
+                console.print(f"      [dim]{c}[/]")
+
+    if apply and plan:
+        p = C.get_paths().registry_file
+        backup = None
+        if p.exists():
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = p.with_name(f"{p.name}.bak-{ts}")
+            shutil.copy2(p, backup)
+        for m in models.values():
+            m["placements"] = [N.normalize_placement(pl) for pl in (m.get("placements") or [])]
+        store.save(reg)
+        if not json_output:
+            console.print(f"[green]✓ wrote[/] {p}" + (f"  [dim](backup {backup.name})[/]" if backup else ""))
+    elif not apply and plan and not json_output:
+        console.print("\n[dim]preview only — re-run with [bold]--apply[/] to write (a backup is kept).[/]")
+
+    if not json_output:
+        _print_worklist(worklist)
 
 
 @registry_app.command("delete")
@@ -521,14 +883,15 @@ def _emit_err(e: Exception, json_output: bool):
 
 
 def _render_pick(it: dict) -> str:
-    """One placement line for the picker: model + id + key knobs + perf."""
-    p = it["p"]
-    k = p.get("knobs", {})
-    peak = (p.get("perf") or {}).get("peak_tok_s")
-    perf_s = f" · {peak} tok/s" if peak else ""
-    return (f"[bold]{it['model']}[/]  [cyan]{p.get('id')}[/]  "
-            f"[dim]tp{k.get('tensor_parallel_size') or '—'} · {p.get('use_case') or '—'} · "
-            f"mml{k.get('max_model_len') or '—'}{perf_s}[/]")
+    """One placement line for the picker: model + id + the standardized knobs + status."""
+    from .registry import normalize as N
+
+    v = N.placement_view(it["p"], it.get("current"))
+    tp = f"TP{v['tp']}" if v["tp"].isdigit() else v["tp"]
+    gpus = _gpus_cell(v["gpus"], (it.get("pins") or {}).get((it["model"], v["id"])))
+    return (f"[bold]{v['id']}[/] [dim]({it['model']})[/]  "
+            f"[dim]{gpus} · {tp} · {v['priority']} · mml{v['mml'] or '—'} · "
+            f"{_fmt_toks(v['peak'], v['single'])} tok/s[/]  {_status_cell(v['status'])}")
 
 
 def _pick_placement_interactive(json_output: bool) -> tuple[str, str]:
@@ -540,12 +903,18 @@ def _pick_placement_interactive(json_output: bool) -> tuple[str, str]:
     if json_output:
         _emit_err(ValueError("`up` needs a model id with --json (the picker needs a TTY)"), True)
     models = store.models(store.load())
-    items = [{"model": mid, "p": p}
+    current = _current_runtimes()
+    pins = _running_pins()
+    items = [{"model": mid, "p": p, "current": current, "pins": pins}
              for mid, m in sorted(models.items())
              for p in (m.get("placements") or [])]
     if not items:
         err.print("[yellow]no placements in the registry[/] — run `johnny induct <model>` first.")
         raise typer.Exit(code=1)
+    # Show what's loadable before the interactive pick — the "list of available models"
+    # johnny lacked at the `up` prompt (full detail: `johnny registry show`).
+    console.print(_registry_compact_table(models))
+    console.print("[dim]↓ pick a placement to load · full detail: `johnny registry show`[/]\n")
     i = picker.select(items, render=_render_pick, title="load a placement",
                       hint="↑/↓ move · enter load · q cancel")
     if i is None:
@@ -585,9 +954,9 @@ def _pick_seat_interactive(json_output: bool) -> str:
     return seats[i].name
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def up(
-    model: str = typer.Argument(None, help="Registry model id. Omit to pick a placement interactively."),
+    model: str = typer.Argument(None, help="Registry model id. Omit to list models + pick a placement (see `registry show`)."),
     placement: str = typer.Option(None, "--placement", help="Placement id or unique substring (e.g. 'tp4'); else best fit for this hardware."),
     port: int = typer.Option(None, "--port"),
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
@@ -597,8 +966,9 @@ def up(
 ) -> None:
     """Bring up a model seat (spawn on free GPUs, or swap a named seat).
 
-    With no model id, opens an interactive picker over every registry placement —
-    ↑/↓ to choose, enter to load.
+    With no model id, lists the available models then opens an interactive picker
+    over every registry placement — ↑/↓ to choose, enter to load. For a plain
+    (non-interactive) list of what you can load, run `johnny registry show`.
     """
     from .engine import launch
 
@@ -623,7 +993,7 @@ def up(
         console.print(f"  [dim]loading — poll `johnny resolve {res['model']}` or tail `johnny logs {res['seat']}`[/]")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def down(
     seat: str = typer.Argument(None, help="Seat/container name (or model id). Omit to pick interactively."),
     drain: bool = typer.Option(False, "--drain", help="Graceful drain (no-op without a router)."),
@@ -646,7 +1016,7 @@ def down(
     console.print(_json.dumps(res, indent=2) if json_output else f"[green]✓[/] down {res['seat']}")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def swap(
     seat: str = typer.Argument(..., help="Running seat to replace."),
     model: str = typer.Argument(..., help="Model to launch in its place."),
@@ -664,7 +1034,7 @@ def swap(
                   f"[green]●[/] swapped {seat} → [bold]{res['seat']}[/] (state {res.get('state')})")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def reap(
     idle_ttl: int = typer.Option(None, "--idle-ttl", help="Idle seconds before reaping (default 1800)."),
     dry_run: bool = typer.Option(False, "--dry-run"),
@@ -690,7 +1060,7 @@ def reap(
     console.print(t)
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def pin(
     seat: str = typer.Argument(...),
     ttl: int = typer.Option(None, "--ttl", help="Seconds; omit for indefinite."),
@@ -705,7 +1075,7 @@ def pin(
                   f"[green]✓[/] pinned {seat}" + (f" for {ttl}s" if ttl else " (indefinite)"))
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def unpin(seat: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
     """Remove a seat's reaper exemption."""
     from .telemetry import collect
@@ -714,7 +1084,7 @@ def unpin(seat: str = typer.Argument(...), json_output: bool = typer.Option(Fals
     console.print(_json.dumps({"unpinned": seat}, indent=2) if json_output else f"[green]✓[/] unpinned {seat}")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_SEATS)
 def resolve(
     target: str = typer.Argument(..., help="Role, seat, or model id."),
     json_output: bool = typer.Option(False, "--json"),
@@ -734,7 +1104,7 @@ def resolve(
     )
 
 
-@app.command()
+@app.command(rich_help_panel=_P_OBSERVE)
 def logs(
     seat: str = typer.Argument(...),
     follow: bool = typer.Option(False, "-f", "--follow"),
@@ -758,7 +1128,7 @@ def logs(
         console.print(out)
 
 
-@app.command()
+@app.command(rich_help_panel=_P_OBSERVE)
 def metrics(
     seat: str = typer.Argument(...),
     history: bool = typer.Option(False, "--history", help="Aggregate trends from the telemetry SQLite."),
@@ -837,7 +1207,7 @@ def _render_plan(pl: dict) -> None:
                   f"[dim](seeded search, not a brute grid)[/]")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_MODELS)
 def induct(
     model: str = typer.Argument(..., help="HF id, registry id, or local path."),
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
@@ -900,7 +1270,7 @@ def induct(
     console.print(f"  report: {res['report']}  ·  bench: {res['bench']}")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_MODELS)
 def tune(
     model: str = typer.Argument(..., help="Registry id or local path."),
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
@@ -929,7 +1299,7 @@ def _dtype_cell(d: dict) -> str:
     return "[dim]—[/]"
 
 
-@app.command()
+@app.command(rich_help_panel=_P_MODELS)
 def search(
     query: str = typer.Argument(..., help="HF search query, or a base model id with --quants."),
     quants: bool = typer.Option(False, "--quants", "-q",
@@ -990,7 +1360,7 @@ def search(
     console.print(t)
 
 
-@app.command()
+@app.command(rich_help_panel=_P_MODELS)
 def download(repo: str = typer.Argument(...), json_output: bool = typer.Option(False, "--json")) -> None:
     """Download a model into the models dir (gated models need `johnny login`)."""
     from .discover import search as dsearch
@@ -1008,7 +1378,7 @@ def download(repo: str = typer.Argument(...), json_output: bool = typer.Option(F
     console.print(_json.dumps(res, indent=2) if json_output else f"[green]✓ downloaded[/] {repo} → {res['path']}")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_MODELS)
 def login(
     token: str = typer.Option(None, "--token", help="HF token; omit to show status."),
     json_output: bool = typer.Option(False, "--json"),
@@ -1030,7 +1400,7 @@ def login(
 
 
 # --------------------------------------------------------------------------- chat TUI + provider (P6)
-@app.command()
+@app.command(rich_help_panel=_P_OBSERVE)
 def alive(
     model: str = typer.Option(None, "--model", help="Target a specific model."),
     seat: str = typer.Option(None, "--seat", help="Target a specific seat."),
@@ -1060,7 +1430,7 @@ def alive(
 
 
 provider_app = typer.Typer(add_completion=False, help="Sync an external chat tool's provider config.")
-app.add_typer(provider_app, name="provider")
+app.add_typer(provider_app, name="provider", rich_help_panel=_P_FLEET)
 
 
 @provider_app.command("sync")
@@ -1090,7 +1460,7 @@ def provider_sync(
 
 
 # --------------------------------------------------------------------------- lifecycle / cleanup (P8)
-@app.command()
+@app.command(rich_help_panel=_P_SETUP)
 def cleanup(
     apply: bool = typer.Option(False, "--apply", help="Actually delete (default: dry-run preview)."),
     json_output: bool = typer.Option(False, "--json"),
@@ -1130,7 +1500,7 @@ def cleanup(
         console.print("[dim]dry-run — `cleanup --apply` confirms each, or `johnny rm <model>` removes a single one.[/]")
 
 
-@app.command(name="rm")
+@app.command(name="rm", rich_help_panel=_P_SETUP)
 def rm(
     target: str = typer.Argument(..., help="Model id, local path (vendor/name), or directory."),
     registry_only: bool = typer.Option(False, "--registry-only", help="Deregister but keep the weights on disk."),
@@ -1176,7 +1546,7 @@ def rm(
 
 # --------------------------------------------------------------------------- daemon / request plane (P10)
 daemon_app = typer.Typer(add_completion=False, help="johnnyd: request-plane API + JIT gateway.")
-app.add_typer(daemon_app, name="daemon")
+app.add_typer(daemon_app, name="daemon", rich_help_panel=_P_FLEET)
 
 
 def _daemon_pidfile(agent: bool = False):
@@ -1282,7 +1652,7 @@ def daemon_down() -> None:
         console.print("[dim]johnnyd not running.[/]")
 
 
-@app.command()
+@app.command(rich_help_panel=_P_FLEET)
 def nodes(
     controller: str = typer.Option("http://127.0.0.1:8080", "--controller"),
     json_output: bool = typer.Option(False, "--json"),
@@ -1315,7 +1685,7 @@ def nodes(
 
 
 # --------------------------------------------------------------------------- TUI (P9)
-@app.command()
+@app.command(rich_help_panel=_P_OBSERVE)
 def tui() -> None:
     """Launch the live Textual dashboard (seats, concurrency, KV — by backend/model)."""
     from .tui.app import run as run_tui
@@ -1342,6 +1712,22 @@ def _make_stub(name: str, phase: str):
 
 for _name, _phase in _FUTURE.items():
     app.command(name=_name, hidden=True)(_make_stub(_name, _phase))
+
+
+# --------------------------------------------------------------------------- help order
+# Panels otherwise render in command-definition order; force the task-priority order
+# (Seats first, Setup last). Stable sort preserves within-panel order. Touches only
+# --help rendering / command listing, never dispatch (which is by name).
+_PANEL_ORDER = [_P_SEATS, _P_OBSERVE, _P_MODELS, _P_FLEET, _P_SETUP]
+
+
+def _panel_rank(info) -> int:
+    panel = getattr(info, "rich_help_panel", None)
+    return _PANEL_ORDER.index(panel) if panel in _PANEL_ORDER else len(_PANEL_ORDER)
+
+
+app.registered_commands.sort(key=_panel_rank)
+app.registered_groups.sort(key=_panel_rank)
 
 
 # --------------------------------------------------------------------------- root

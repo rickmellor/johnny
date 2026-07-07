@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "note": "Curated GPU AI-compute specs, keyed by gfx/sm arch. Values are manufacturer spec-sheet figures with per-entry provenance (source + as_of) — johnny never computes or guesses these (the theoretical vector TFLOPS in `hinfo` is a separate, clearly-labelled computation). Matrix figures are for the reference full-die config (cu_ref compute units); johnny scales by detected CU count and marks the result approximate when it differs. `johnny hinfo --refresh-specs` re-pulls this seed.",
+  "archs": {
+    "gfx1201": {
+      "label": "Navi 48 (RDNA4) — Radeon AI PRO R9700",
+      "cu_ref": 64,
+      "int8_matrix_tops": 383,
+      "int8_matrix_tops_sparse": 766,
+      "fp16_matrix_tflops": 191,
+      "fp16_matrix_tflops_sparse": 383,
+      "source": "https://www.amd.com/en/products/graphics/workstations/radeon-ai-pro/ai-9000-series/amd-radeon-ai-pro-r9700.html",
+      "as_of": "2026-01"
+    }
+  }
+}

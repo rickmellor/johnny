@@ -31,6 +31,8 @@ class GPU:
     vram_gb: float
     arch: str
     vendor: str
+    cu_count: int | None = None    # compute units (AMD) / SMs (NVIDIA)
+    clk_mhz: float | None = None   # max engine clock
 
 
 @dataclass
@@ -81,12 +83,13 @@ def _gfx_from_version(v: int) -> str | None:
     return f"gfx{major}{minor}{step:x}"
 
 
-def _kfd_archs() -> list[str]:
-    """gfx arch per compute node from KFD topology (skips the CPU node)."""
+def _kfd_nodes() -> list[dict]:
+    """Per-GPU compute-node facts from KFD topology (skips the CPU node): gfx arch, CU
+    count (simd_count / simd_per_cu), and max engine clock in MHz."""
     base = Path("/sys/class/kfd/kfd/topology/nodes")
     if not base.exists():
         return []
-    archs: list[str] = []
+    out: list[dict] = []
     nodes = sorted(base.iterdir(), key=lambda p: int(p.name) if p.name.isdigit() else 999)
     for nd in nodes:
         props = nd / "properties"
@@ -97,15 +100,21 @@ def _kfd_archs() -> list[str]:
             parts = line.split()
             if len(parts) == 2:
                 d[parts[0]] = parts[1]
-        if int(d.get("simd_count", "0")) > 0:
-            g = _gfx_from_version(int(d.get("gfx_target_version", "0")))
-            if g:
-                archs.append(g)
-    return archs
+        simd = int(d.get("simd_count", "0"))
+        if simd <= 0:
+            continue
+        arch = _gfx_from_version(int(d.get("gfx_target_version", "0")))
+        if not arch:
+            continue
+        spc = int(d.get("simd_per_cu", "0")) or 1
+        # fcompute = the shader/GPU engine clock (MHz); ccompute is the CPU-side clock.
+        clk = int(d.get("max_engine_clk_fcompute", "0"))
+        out.append({"arch": arch, "cu_count": simd // spc, "max_clk_mhz": clk or None})
+    return out
 
 
 def _detect_amd() -> list[GPU]:
-    archs = _kfd_archs()
+    nodes = _kfd_nodes()
     rc, out, _ = run(["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--json"], timeout=15)
     cards: dict = {}
     if rc == 0 and out.strip():
@@ -119,12 +128,25 @@ def _detect_amd() -> list[GPU]:
     for i, (_card, info) in enumerate(items):
         vram = int(info.get("VRAM Total Memory (B)", 0)) / 1024**3
         name = info.get("Card SKU") or info.get("Card series") or "AMD GPU"
-        arch = archs[i] if i < len(archs) else (archs[0] if archs else "unknown")
-        gpus.append(GPU(i, str(name), round(vram, 1), arch, "amd"))
+        nd = nodes[i] if i < len(nodes) else (nodes[0] if nodes else {})
+        gpus.append(GPU(i, str(name), round(vram, 1), nd.get("arch") or "unknown", "amd",
+                        cu_count=nd.get("cu_count"), clk_mhz=nd.get("max_clk_mhz")))
     # Fallback: KFD knows the GPUs even if rocm-smi gave nothing.
-    if not gpus and archs:
-        gpus = [GPU(i, "AMD GPU", 0.0, a, "amd") for i, a in enumerate(archs)]
+    if not gpus and nodes:
+        gpus = [GPU(i, "AMD GPU", 0.0, n["arch"], "amd", cu_count=n.get("cu_count"),
+                    clk_mhz=n.get("max_clk_mhz")) for i, n in enumerate(nodes)]
     return gpus
+
+
+def theoretical_tflops(g: GPU) -> dict | None:
+    """Computed *vector* peak from CU count x clock — honest arithmetic, not a spec sheet.
+    AMD RDNA/CDNA do 64 ALUs/CU x 2 FLOP (FMA) per clock for FP32; FP16 is packed at 2x.
+    This is the base ALU peak (RDNA3+ dual-issue can ~2x it in ideal code). Matrix/tensor
+    'AI TOPS' (WMMA/MFMA) is a separate architectural number we do NOT invent here."""
+    if not g.cu_count or not g.clk_mhz:
+        return None
+    fp32 = g.cu_count * 64 * 2 * (g.clk_mhz / 1000.0) / 1000.0  # -> TFLOPS
+    return {"fp32_tflops": round(fp32, 1), "fp16_tflops": round(fp32 * 2, 1)}
 
 
 def _detect_nvidia() -> list[GPU]:

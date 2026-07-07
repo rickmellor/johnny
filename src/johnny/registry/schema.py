@@ -49,8 +49,16 @@ def validate(reg: dict) -> list[str]:
                 errors.append(f"{pw}: use_case {p.get('use_case')!r} not in {sorted(x for x in USE_CASES if x)}")
             if p.get("source") not in SOURCES:
                 errors.append(f"{pw}: source {p.get('source')!r} not in {sorted(SOURCES)}")
-            vk = p.get("validation_key") or {}
-            for key in ("hardware_fingerprint", "backend", "runtime_version"):
-                if not vk.get(key):
-                    errors.append(f"{pw}.validation_key: missing {key}")
+            # An absent validation_key means an incomplete placement (never benchmarked —
+            # e.g. an aborted tune). That's honest, not malformed: it's surfaced as a
+            # re-tune worklist warning (see normalize.placement_status), not a schema error.
+            # A *partial* validation_key, though, is a real error — someone half-filled it.
+            vk = p.get("validation_key")
+            if vk is not None:
+                if not isinstance(vk, dict):
+                    errors.append(f"{pw}.validation_key: not a mapping")
+                else:
+                    for key in ("hardware_fingerprint", "backend", "runtime_version"):
+                        if not vk.get(key):
+                            errors.append(f"{pw}.validation_key: missing {key}")
     return errors
