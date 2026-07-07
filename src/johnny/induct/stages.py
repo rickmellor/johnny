@@ -21,19 +21,43 @@ TUNING_PORT = 9000
 
 
 def discover(model_ref: str, cfg: dict) -> tuple[str, str]:
-    """Resolve a ref (local path or 'vendor/name') to (model_id, local_path).
+    """Resolve a ref (local path, 'vendor/name' under models_dir, or a registry id) to
+    (model_id, local_path). HF download is P5; here the model must already be on disk.
 
-    HF download is P5; here the model must already be on disk.
+    A registry id resolves via its identity.local_path AND keeps the id as the model_id,
+    so re-tuning writes perf back to the same registry entry (mirrors llamacpp.gguf_ref,
+    which already did this for the GGUF path).
     """
+    models_dir = (cfg.get("roots") or {}).get("models_dir")
+
     p = Path(model_ref).expanduser()
     if p.exists() and (p / "config.json").exists():
         p = p.resolve()  # absolute: the container path→/models mount translation needs it
         return p.name, str(p)
-    models_dir = (cfg.get("roots") or {}).get("models_dir")
     if models_dir:
         full = (Path(models_dir).expanduser() / model_ref).resolve()
         if (full / "config.json").exists():
             return full.name, str(full)
+
+    # Registry id -> its identity.local_path; keep the id so induction updates *this* entry.
+    from ..registry import store
+
+    m = (store.load().get("models") or {}).get(model_ref)
+    if m:
+        ident = m.get("identity") or {}
+        lp = ident.get("local_path") or ident.get("repo_id")
+        if lp:
+            cand = Path(lp).expanduser()
+            if not cand.is_absolute() and models_dir:
+                cand = Path(models_dir).expanduser() / lp
+            cand = cand.resolve()
+            if (cand / "config.json").exists():
+                return model_ref, str(cand)
+            raise FileNotFoundError(
+                f"registry model '{model_ref}' → '{lp}' has no weights at {cand} "
+                f"(download/acquire arrives at P5; place them there or pass a local path)"
+            )
+
     raise FileNotFoundError(
         f"model '{model_ref}' not found on disk (download/acquire arrives at P5; "
         f"place it under {models_dir} or pass a local path)"
