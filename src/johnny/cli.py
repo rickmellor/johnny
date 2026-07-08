@@ -1013,6 +1013,8 @@ def up(
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
     force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
     wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
+    profile: str = typer.Option(None, "--profile", help="Bring up a whole named profile instead "
+                                "(alias for `johnny profile up`)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Bring up a model seat (spawn on free GPUs, or swap a named seat).
@@ -1022,6 +1024,12 @@ def up(
     (non-interactive) list of what you can load, run `johnny registry show`.
     """
     from .engine import launch
+
+    if profile is not None:
+        if model is not None:
+            _emit_err(ValueError("--profile brings up a fleet; don't pass a model too"), json_output)
+        profile_up(profile, wait=wait, json_output=json_output)
+        return
 
     if model is None:
         model, placement = _pick_placement_interactive(json_output)
@@ -1571,6 +1579,315 @@ def alive(
         os.execvp("tmux", ["tmux", "attach", "-t", res["session"]])
     else:
         console.print(f"  [dim]attach with: tmux attach -t {res['session']}[/]")
+
+
+# --------------------------------------------------------------------------- profiles (named fleets)
+profile_app = typer.Typer(add_completion=False,
+                          help="Named fleets: capture, bring up/down, auto-start at boot.")
+app.add_typer(profile_app, name="profile", rich_help_panel=_P_FLEET)
+
+
+def _parse_role_flags(role_flags: list[str]) -> dict:
+    roles = {}
+    for r in role_flags or []:
+        if "=" not in r:
+            raise typer.BadParameter(f"--role expects <model>=<role>, got '{r}'")
+        k, v = r.split("=", 1)
+        roles[k.strip()] = v.strip()
+    return roles
+
+
+def _render_profile_seats(seats: list[dict]) -> None:
+    t = Table(pad_edge=False)
+    for col in ("ROLE", "MODEL", "PLACEMENT", "PORT", "PINNED"):
+        t.add_column(col, no_wrap=(col != "PLACEMENT"))
+    for s in seats:
+        t.add_row(str(s.get("role") or "—"), str(s.get("model")), str(s.get("placement") or "—"),
+                  str(s.get("port") or "—"), "✓" if s.get("pinned") else "")
+    console.print(t)
+
+
+def _render_profile_results(res: dict) -> bool:
+    """Per-seat outcome table for profile up/down. Returns True if any seat errored."""
+    t = Table(title=f"profile {res['profile']}", title_style="bold", pad_edge=False)
+    for col in ("ROLE", "MODEL", "ACTION", "SEAT", "PORT", "GPUS", "STATE"):
+        t.add_column(col, no_wrap=True)
+    failed = False
+    for s in res.get("seats") or []:
+        action = s.get("action")
+        if action == "error":
+            failed = True
+        style = {"error": "red", "exists": "dim", "launched": "green", "down": "yellow"}.get(action, "white")
+        t.add_row(str(s.get("role") or "—"), str(s.get("model")),
+                  f"[{style}]{action}[/]", str(s.get("seat") or "—"), str(s.get("port") or "—"),
+                  " ".join(str(g) for g in s.get("gpus") or []) or "—",
+                  str(s.get("state") or ("" if action != "error" else "see below") or "—"))
+    console.print(t)
+    for s in res.get("seats") or []:
+        if s.get("action") == "error":
+            console.print(f"  [red]✗ {s.get('model')}[/]: {s.get('error')}")
+    return failed
+
+
+def _report_validation(errors: list[str], warnings: list[str]) -> None:
+    for e in errors:
+        console.print(f"  [red]✗ {e}[/]")
+    for w in warnings:
+        console.print(f"  [yellow]⚠ {w}[/]")
+
+
+@profile_app.command("save")
+def profile_save(
+    name: str = typer.Argument(..., help="Profile name (e.g. 'standard')."),
+    role: list[str] = typer.Option(None, "--role", help="Role for a captured seat, as <model>=<role> "
+                                   "(repeatable). Roles are what SAINT resolves (johnny_role); "
+                                   "pooling seats are auto-inferred as 'embed'."),
+    description: str = typer.Option(None, "--description", help="Human note stored on the profile."),
+    no_pins: bool = typer.Option(False, "--no-pins", help="Don't pin the seats (default: pin all — kept warm, reaper-exempt)."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing profile of the same name."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Capture the currently-running johnny fleet as a named profile.
+
+    Records each live seat's model + placement + port (+ role), so `profile up`
+    can re-create the whole fleet — e.g. after a reboot. Every seat needs a role;
+    supply non-inferable ones with --role.
+    """
+    from .engine import profiles
+    from .hardware import detect as hwd
+    from .registry import store
+
+    if profiles.get_profile(name) and not force:
+        _emit_err(ValueError(f"profile '{name}' exists (use --force to overwrite)"), json_output)
+    cap = profiles.capture(roles=_parse_role_flags(role))
+    seats = cap["seats"]
+    if not seats:
+        _emit_err(ValueError("no johnny-managed seats running — bring the fleet up first"), json_output)
+    missing = [s["model"] for s in seats if not s.get("role")]
+    if missing:
+        _emit_err(ValueError("every seat needs a role; add "
+                             + " ".join(f"--role {m}=<role>" for m in missing)), json_output)
+    if not no_pins:
+        for s in seats:
+            s["pinned"] = True
+    prof: dict = {"seats": seats}
+    if description:
+        prof["description"] = description
+
+    errors, warnings = profiles.validate(prof, store.load(), hwd.detect(), name=name)
+    if errors:
+        if json_output:
+            console.print(_json.dumps({"error": "validation failed", "errors": errors}, indent=2))
+            raise typer.Exit(code=1)
+        console.print("[red]validation failed[/] — profile not saved:")
+        _report_validation(errors, warnings)
+        raise typer.Exit(code=1)
+
+    profiles.save(name, prof)
+    if json_output:
+        console.print(_json.dumps({"profile": name, "seats": seats, "skipped": cap["skipped"],
+                                   "warnings": warnings}, indent=2))
+        return
+    console.print(f"[green]✓ saved[/] profile [bold]{name}[/] ({len(seats)} seat(s)) "
+                  f"→ {C.get_paths().profiles_file}")
+    _render_profile_seats(seats)
+    _report_validation([], warnings)
+    if cap["skipped"]:
+        console.print(f"[yellow]⚠ not captured[/] (no johnny labels — not johnny-managed): "
+                      f"{', '.join(cap['skipped'])}")
+        console.print("  [dim]adopt with `johnny up <model> --placement <id>` after stopping the original, then re-save.[/]")
+
+
+@profile_app.command("list")
+def profile_list(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """List saved profiles."""
+    from .engine import profiles
+
+    profs = profiles.all_profiles()
+    if json_output:
+        console.print(_json.dumps(profs, indent=2))
+        return
+    if not profs:
+        console.print("[dim]no profiles — capture your running fleet with `johnny profile save <name>`[/]")
+        return
+    t = Table(pad_edge=False)
+    for col in ("PROFILE", "SEATS", "ROLES", "PINNED", "DESCRIPTION"):
+        t.add_column(col, no_wrap=(col != "DESCRIPTION"))
+    for name, p in profs.items():
+        seats = p.get("seats") or []
+        t.add_row(name, str(len(seats)),
+                  " ".join(str(s.get("role")) for s in seats if s.get("role")) or "—",
+                  str(sum(1 for s in seats if s.get("pinned"))),
+                  p.get("description") or "—")
+    console.print(t)
+
+
+@profile_app.command("show")
+def profile_show(
+    name: str = typer.Argument(..., help="Profile name."),
+    saint: bool = typer.Option(False, "--saint", help="Print SAINT [backends.*] stanza suggestions for these seats."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Show a profile's seats, cross-checked against the registry."""
+    from .engine import profiles
+    from .hardware import detect as hwd
+    from .registry import store
+
+    prof = profiles.get_profile(name)
+    if prof is None:
+        _emit_err(ValueError(f"no profile '{name}'"), json_output)
+    errors, warnings = profiles.validate(prof, store.load(), hwd.detect(), name=name)
+    if json_output:
+        console.print(_json.dumps({"profile": name, **prof, "errors": errors, "warnings": warnings}, indent=2))
+        return
+    console.print(f"[bold]{name}[/]" + (f"  [dim]{prof.get('description')}[/]" if prof.get("description") else ""))
+    _render_profile_seats(prof.get("seats") or [])
+    _report_validation(errors, warnings)
+    if saint:
+        console.print("\n[dim]# SAINT config.toml suggestions — static fallbacks matching the profile ports.")
+        console.print("# The live path stays `johnny resolve <role>` via each backend's johnny_role.[/]")
+        for s in prof.get("seats") or []:
+            console.print(f"""
+\\[backends.local-{s.get('role')}]
+provider     = "openai"
+base_url     = "http://localhost:{s.get('port')}/v1"   # static fallback — johnny's live seat overrides
+model        = "{s.get('model')}"
+api_key      = "local"
+johnny_role  = "{s.get('role')}\"""")
+
+
+@profile_app.command("rm")
+def profile_rm(
+    name: str = typer.Argument(..., help="Profile name."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Remove a profile (does not stop any running seats)."""
+    from .engine import profiles
+
+    if profiles.get_profile(name) is None:
+        _emit_err(ValueError(f"no profile '{name}'"), json_output)
+    if not yes and not json_output:
+        if not typer.confirm(f"remove profile '{name}'?"):
+            raise typer.Exit()
+    profiles.remove(name)
+    if json_output:
+        console.print(_json.dumps({"removed": name}, indent=2))
+        return
+    console.print(f"[green]✓ removed[/] profile [bold]{name}[/]")
+
+
+@profile_app.command("up")
+def profile_up(
+    name: str = typer.Argument(..., help="Profile name."),
+    wait: bool = typer.Option(False, "--wait", help="Block until each seat is serving (serial)."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Bring up every seat in a profile (idempotent: running seats are skipped).
+
+    Best-effort — one seat's failure doesn't block the rest. Pinned seats are
+    pinned (kept warm / reaper-exempt) even if they were already running.
+    """
+    from .engine import launch, profiles
+
+    try:
+        res = profiles.up_profile(name, wait=wait)
+    except launch.PlacementError as e:
+        _emit_err(e, json_output)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        if any(s.get("action") == "error" for s in res.get("seats") or []):
+            raise typer.Exit(code=1)
+        return
+    if _render_profile_results(res):
+        raise typer.Exit(code=1)
+
+
+@profile_app.command("down")
+def profile_down(
+    name: str = typer.Argument(..., help="Profile name."),
+    drain: bool = typer.Option(False, "--drain", help="Drain before stopping (no-op for vLLM today)."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Stop every running seat of a profile (clears their pins)."""
+    from .engine import launch, profiles
+
+    try:
+        res = profiles.down_profile(name, drain=drain)
+    except launch.PlacementError as e:
+        _emit_err(e, json_output)
+    if json_output:
+        console.print(_json.dumps(res, indent=2))
+        return
+    _render_profile_results(res)
+
+
+@profile_app.command("enable")
+def profile_enable(
+    name: str = typer.Argument(..., help="Profile name."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the unit + commands without writing/enabling."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Auto-start this profile at boot (user systemd unit).
+
+    Writes ~/.config/systemd/user/johnny-profile@.service and enables this
+    profile's instance. True at-boot start (no login) needs lingering:
+    `loginctl enable-linger $USER`.
+    """
+    from . import boot
+    from .engine import profiles
+    from .util import run as _run
+
+    if profiles.get_profile(name) is None:
+        _emit_err(ValueError(f"no profile '{name}' (see `johnny profile list`)"), json_output)
+    text = boot.unit_text()
+    cmds = boot.enable_commands(name)
+    if dry_run:
+        console.print(f"[dim]# would write {boot.unit_path()}:[/]\n{text}")
+        for c in cmds:
+            console.print(f"[dim]# would run:[/] {' '.join(c)}")
+        return
+    boot.unit_dir().mkdir(parents=True, exist_ok=True)
+    boot.unit_path().write_text(text)
+    ran = []
+    for c in cmds:
+        rc, out, errout = _run(c, timeout=1800)
+        ran.append({"cmd": " ".join(c), "rc": rc})
+        if rc != 0:
+            _emit_err(RuntimeError(f"{' '.join(c)} failed: {errout.strip() or out.strip()}"), json_output)
+    if json_output:
+        console.print(_json.dumps({"enabled": boot.instance(name), "unit": str(boot.unit_path()), "ran": ran}, indent=2))
+        return
+    console.print(f"[green]✓ enabled[/] [bold]{boot.instance(name)}[/] — starts at boot (unit: {boot.unit_path()})")
+    console.print("  [dim]at-boot start needs lingering: loginctl enable-linger $USER[/]")
+
+
+@profile_app.command("disable")
+def profile_disable(
+    name: str = typer.Argument(..., help="Profile name."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Stop auto-starting this profile at boot.
+
+    Running seats are left alone (plain `systemctl --user disable`, never
+    --now — the unit's ExecStop would down the fleet). Use `johnny profile
+    down` to actually stop seats.
+    """
+    from . import boot
+    from .util import run as _run
+
+    ran = []
+    for c in boot.disable_commands(name):
+        rc, out, errout = _run(c, timeout=60)
+        ran.append({"cmd": " ".join(c), "rc": rc})
+        if rc != 0:
+            _emit_err(RuntimeError(f"{' '.join(c)} failed: {errout.strip() or out.strip()}"), json_output)
+    if json_output:
+        console.print(_json.dumps({"disabled": boot.instance(name), "ran": ran}, indent=2))
+        return
+    console.print(f"[green]✓ disabled[/] [bold]{boot.instance(name)}[/] — no longer auto-starts (seats left running)")
 
 
 provider_app = typer.Typer(add_completion=False, help="Sync an external chat tool's provider config.")
