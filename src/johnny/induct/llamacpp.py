@@ -125,12 +125,13 @@ def _offload_regex(n_layer: int, gpu_count: int, k_per_group: int) -> str:
     return rf"blk\.({alt})\.ffn_(gate|up|down)_exps\.weight=CPU"
 
 
-def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None) -> list[dict]:
+def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None,
+                     mml_override: int | None = None) -> list[dict]:
     """llama-server sweep. If the weights fit all-GPU, sweep the throughput knob
     (`--parallel`). If not (e.g. bf16 > VRAM), sweep two balanced expert-offload
     levels (`-ot` → experts on CPU RAM), since that's the only way it runs."""
     native = audit_info.get("native_context") or 32768
-    ctx = min(32768, native)
+    ctx = mml_override or min(32768, native)
     size_gb = (audit_info.get("size_bytes") or 0) / 1e9
     n_layer = audit_info.get("n_layer") or 0
 
@@ -156,7 +157,22 @@ def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None) -
     return pts
 
 
+def cpu_candidate_points(audit_info: dict, ncpu: int, max_points: int | None,
+                         mml_override: int | None = None) -> list[dict]:
+    """CPU-only sweep (`-ngl 0`): everything runs on CPU, so the knob that matters is the
+    thread count. Sweep logical vs. physical-ish (ncpu, ncpu/2) — llama.cpp is often fastest
+    at physical cores, and CPU decode saturates on memory bandwidth well before all threads."""
+    native = audit_info.get("native_context") or 32768
+    ctx = mml_override or min(32768, native)
+    threads = list(dict.fromkeys([ncpu, max(1, ncpu // 2)]))
+    pts = [{"backend": "llamacpp", "device": "cpu", "n_gpu_layers": 0, "flash_attn": "off",
+            "max_model_len": ctx, "threads": t, "gpu_count": 0, "parallel": 1} for t in threads]
+    return pts[:max_points] if max_points else pts
+
+
 def _point_sig(p: dict) -> str:
+    if p.get("device") == "cpu":
+        return f"llama-cpu-t{p.get('threads')}-mml{p.get('max_model_len')}"
     base = f"llama-ngl{p.get('n_gpu_layers')}-par{p.get('parallel')}-mml{p.get('max_model_len')}"
     if p.get("override_tensor"):
         base += f"-ot{p.get('offload_layers')}"
@@ -200,21 +216,35 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
         if md and str(gguf_path).startswith(str(Path(md).expanduser()))
         else gguf_path
     )
-    visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
-    argv = [
-        "docker", "run", "--rm", "--name", TUNING_CONTAINER,
-        "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render",
-        "--security-opt", "seccomp=unconfined", "--ipc=host",
-        "-v", f"{md}:/models:ro",
-        "-e", f"{visible_env}={','.join(str(g) for g in gpus)}",
-        "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
-        "-m", cpath, "-ngl", str(point.get("n_gpu_layers", 999)), "-fa", "0",
-        "-p", "512", "-n", "128", "-r", "2",
-    ]
-    if point.get("n_cpu_moe"):
-        argv += ["-ncmoe", str(point["n_cpu_moe"])]
-    if point.get("override_tensor"):
-        argv += ["-ot", point["override_tensor"]]
+    if point.get("device") == "cpu":
+        # CPU-only: no GPU devices at all (the HIP build detects no ROCm device and falls
+        # back to CPU) — so the seat truly runs off-GPU and doesn't need free cards.
+        import os
+
+        argv = [
+            "docker", "run", "--rm", "--name", TUNING_CONTAINER, "--ipc=host",
+            "-v", f"{md}:/models:ro",
+            "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
+            "-m", cpath, "-ngl", "0", "-fa", "0",
+            "-t", str(point.get("threads") or os.cpu_count() or 8),
+            "-p", "512", "-n", "128", "-r", "2",
+        ]
+    else:
+        visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
+        argv = [
+            "docker", "run", "--rm", "--name", TUNING_CONTAINER,
+            "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render",
+            "--security-opt", "seccomp=unconfined", "--ipc=host",
+            "-v", f"{md}:/models:ro",
+            "-e", f"{visible_env}={','.join(str(g) for g in gpus)}",
+            "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
+            "-m", cpath, "-ngl", str(point.get("n_gpu_layers", 999)), "-fa", "0",
+            "-p", "512", "-n", "128", "-r", "2",
+        ]
+        if point.get("n_cpu_moe"):
+            argv += ["-ncmoe", str(point["n_cpu_moe"])]
+        if point.get("override_tensor"):
+            argv += ["-ot", point["override_tensor"]]
 
     result = {"point": point, "ok": False}
     run(["docker", "rm", "-f", TUNING_CONTAINER], timeout=20)  # idempotent
@@ -232,6 +262,7 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
 # --- placement ---------------------------------------------------------------
 def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtime_version: str, use_case: str | None) -> dict:
     p = winner["point"]
+    is_cpu = p.get("device") == "cpu"
     return {
         "id": f"induct-{_point_sig(p)}",
         "backend": "llamacpp",
@@ -244,11 +275,16 @@ def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtim
             "max_model_len": p.get("max_model_len"),
             "n_cpu_moe": p.get("n_cpu_moe"),
             "parallel": p.get("parallel"),
+            **({"threads": p.get("threads")} if is_cpu else {}),
         },
         "extra": {"jinja": True, "nickname": audit_info.get("name") or model_id,
+                  **({"device": "cpu"} if is_cpu else {}),
                   **({"override_tensor": p["override_tensor"]} if p.get("override_tensor") else {})},
         "env": {},
-        "perf": {"prefill_tok_s": winner.get("prefill_tok_s"), "decode_tok_s": winner.get("decode_tok_s")},
+        # Keep the llama-native prefill/decode AND the standardized peak/single the registry
+        # view + status read (decode is the single-stream rate for llama.cpp).
+        "perf": {"prefill_tok_s": winner.get("prefill_tok_s"), "decode_tok_s": winner.get("decode_tok_s"),
+                 "peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")},
         "validation_key": {
             "hardware_fingerprint": hardware.fingerprint,
             "backend": "llamacpp",
@@ -288,18 +324,31 @@ def _write_report(run_dir: Path, model_id: str, a: dict, results: list[dict], wi
 
 
 # --- entry points ------------------------------------------------------------
-def plan(model_id: str, gguf_path: str, max_points: int | None = None, cfg: dict | None = None) -> dict:
+def plan(model_id: str, gguf_path: str, max_points: int | None = None, cfg: dict | None = None,
+         device: str = "auto", mml_override: int | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
     a = audit(gguf_path)
+    audit_view = {"arch": a.get("arch"), "quant": a.get("quant") or a.get("file_type_id"),
+                  "size_gb": round(a.get("size_bytes", 0) / 1e9, 1), "native_ctx": a.get("native_context")}
+    if device == "cpu":
+        import os
+
+        pts = cpu_candidate_points(a, os.cpu_count() or 8, max_points, mml_override=mml_override)
+        return {
+            "model_id": model_id, "path": gguf_path, "backend": "llamacpp",
+            "audit": audit_view, "free_gpus": free_gpus(hw, all_seats(cfg)),
+            "device": "cpu", "gpu_count": 0, "arch_supported": True, "arch_warning": None,
+            "viable": [{"device": "cpu", "per_host_gb": audit_view["size_gb"]}],
+            "pruned": [], "priors": 0, "points": pts,
+        }
     free = free_gpus(hw, all_seats(cfg))
     total_gpus = len(free_gpus(hw, []))  # all GPUs, ignoring current occupancy
     gc = _gpu_count_for(a.get("size_bytes", 0), total_gpus)
-    pts = candidate_points(a, gc, max_points)
+    pts = candidate_points(a, gc, max_points, mml_override=mml_override)
     return {
         "model_id": model_id, "path": gguf_path, "backend": "llamacpp",
-        "audit": {"arch": a.get("arch"), "quant": a.get("quant") or a.get("file_type_id"),
-                  "size_gb": round(a.get("size_bytes", 0) / 1e9, 1), "native_ctx": a.get("native_context")},
+        "audit": audit_view,
         "free_gpus": free, "device": "gpu", "gpu_count": gc,
         "arch_supported": True, "arch_warning": None,
         "viable": [{"gpu_count": gc, "n_gpu_layers": 999}], "pruned": [], "priors": 0,
@@ -308,7 +357,7 @@ def plan(model_id: str, gguf_path: str, max_points: int | None = None, cfg: dict
 
 
 def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: int | None = None,
-        cfg: dict | None = None, progress=None) -> dict:
+        cfg: dict | None = None, progress=None, device: str = "auto", mml_override: int | None = None) -> dict:
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
@@ -316,34 +365,52 @@ def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: 
     _p(f"audit: {a.get('arch')} · {round(a.get('size_bytes', 0) / 1e9, 1)}GB · "
        f"experts={a.get('n_expert')} · ctx={a.get('native_context')}")
 
-    free = free_gpus(hw, all_seats(cfg))
-    total_gpus = len(free_gpus(hw, []))  # all GPUs, ignoring current occupancy
-    gc = _gpu_count_for(a.get("size_bytes", 0), total_gpus)
-    points = candidate_points(a, gc, max_points)
-    _p(f"backend=llamacpp · gpu_count={gc} · {len(free)} free GPU(s) · {len(points)} point(s)")
-    if len(free) < gc:
-        return {"model_id": model_id, "error": f"need {gc} free GPUs, {len(free)} free "
-                f"(down a seat first)", "backend": "llamacpp"}
-
     results = []
-    for i, point in enumerate(points, 1):
-        gpus = assign_gpus(gc, hw, free_gpus(hw, all_seats(cfg)))
-        if len(gpus) < gc:
-            results.append({"point": point, "ok": False, "error": "insufficient free GPUs"})
-            _p(f"[{i}/{len(points)}] {_point_sig(point)}: skipped (insufficient GPUs)")
-            continue
-        _p(f"[{i}/{len(points)}] {_point_sig(point)}: launching on GPU {gpus} + benching…")
-        collect.add_pin(TUNING_CONTAINER)
-        try:
-            r = tune_point(model_id, gguf_path, point, gpus, cfg, hw)
-        finally:
-            collect.remove_pin(TUNING_CONTAINER)
-        if r.get("ok"):
-            _p(f"[{i}/{len(points)}] {_point_sig(point)}: prefill {r.get('prefill_tok_s')} tok/s, "
-               f"decode {r.get('decode_tok_s')} tok/s")
-        else:
-            _p(f"[{i}/{len(points)}] {_point_sig(point)}: FAILED — {(r.get('error') or '')[:80]}")
-        results.append(r)
+    if device == "cpu":
+        import os
+
+        points = cpu_candidate_points(a, os.cpu_count() or 8, max_points, mml_override=mml_override)
+        _p(f"backend=llamacpp · device=cpu · {len(points)} point(s)")
+        for i, point in enumerate(points, 1):
+            _p(f"[{i}/{len(points)}] {_point_sig(point)}: benching on CPU (t={point.get('threads')})…")
+            collect.add_pin(TUNING_CONTAINER)
+            try:
+                r = tune_point(model_id, gguf_path, point, [], cfg, hw)  # gpus=[] — CPU-only
+            finally:
+                collect.remove_pin(TUNING_CONTAINER)
+            if r.get("ok"):
+                _p(f"[{i}/{len(points)}] {_point_sig(point)}: prefill {r.get('prefill_tok_s')} tok/s, "
+                   f"decode {r.get('decode_tok_s')} tok/s")
+            else:
+                _p(f"[{i}/{len(points)}] {_point_sig(point)}: FAILED — {(r.get('error') or '')[:80]}")
+            results.append(r)
+    else:
+        free = free_gpus(hw, all_seats(cfg))
+        total_gpus = len(free_gpus(hw, []))  # all GPUs, ignoring current occupancy
+        gc = _gpu_count_for(a.get("size_bytes", 0), total_gpus)
+        points = candidate_points(a, gc, max_points, mml_override=mml_override)
+        _p(f"backend=llamacpp · gpu_count={gc} · {len(free)} free GPU(s) · {len(points)} point(s)")
+        if len(free) < gc:
+            return {"model_id": model_id, "error": f"need {gc} free GPUs, {len(free)} free "
+                    f"(down a seat first)", "backend": "llamacpp"}
+        for i, point in enumerate(points, 1):
+            gpus = assign_gpus(gc, hw, free_gpus(hw, all_seats(cfg)))
+            if len(gpus) < gc:
+                results.append({"point": point, "ok": False, "error": "insufficient free GPUs"})
+                _p(f"[{i}/{len(points)}] {_point_sig(point)}: skipped (insufficient GPUs)")
+                continue
+            _p(f"[{i}/{len(points)}] {_point_sig(point)}: launching on GPU {gpus} + benching…")
+            collect.add_pin(TUNING_CONTAINER)
+            try:
+                r = tune_point(model_id, gguf_path, point, gpus, cfg, hw)
+            finally:
+                collect.remove_pin(TUNING_CONTAINER)
+            if r.get("ok"):
+                _p(f"[{i}/{len(points)}] {_point_sig(point)}: prefill {r.get('prefill_tok_s')} tok/s, "
+                   f"decode {r.get('decode_tok_s')} tok/s")
+            else:
+                _p(f"[{i}/{len(points)}] {_point_sig(point)}: FAILED — {(r.get('error') or '')[:80]}")
+            results.append(r)
 
     winner = stages.synthesize(results, use_case)
     run_dir = C.get_paths().runs_dir / f"induct-{model_id.replace('/', '__')}"

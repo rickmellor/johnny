@@ -817,67 +817,111 @@ def registry_normalize(
         _print_worklist(worklist)
 
 
+def _find_placement_global(reg: dict, pid: str) -> list[tuple[str, dict]]:
+    """All (model_id, placement) whose id equals `pid` (exact), else contains it (substring).
+    Placement ids are near-unique, so a single-arg delete can find one without the model."""
+    models = reg.get("models") or {}
+    exact = [(mid, p) for mid, m in models.items() for p in (m.get("placements") or []) if p.get("id") == pid]
+    if exact:
+        return exact
+    return [(mid, p) for mid, m in models.items() for p in (m.get("placements") or []) if pid in (p.get("id") or "")]
+
+
 @registry_app.command("delete")
 def registry_delete(
-    model: str = typer.Argument(..., help="Model id (see `johnny registry show`)."),
-    placement: str = typer.Argument(None, help="Placement id to delete — exact or a unique substring (e.g. 'tp2'). Omit with --all."),
-    all_placements: bool = typer.Option(False, "--all", help="Delete ALL placements for the model (keeps the model entry)."),
+    target: str = typer.Argument(..., help="Placement id to delete (searched across ALL models) — or a model id when a PLACEMENT arg or --all follows."),
+    placement: str = typer.Argument(None, help="Placement id within TARGET, when TARGET is a model (exact or unique substring)."),
+    all_placements: bool = typer.Option(False, "--all", help="Delete ALL placements of the model TARGET (keeps the model entry)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
-    """Delete a placement (or all) from a model — placement-level pruning.
+    """Delete placement(s) from the registry — placement-level pruning (keeps the model).
 
-    Keeps the model and its other placements. To remove a whole model (and optionally
-    its weights), use `johnny rm <model>`.
+    Three forms:
+      johnny registry delete <placement-id>          # by id, found across all models
+      johnny registry delete <model> <placement-id>  # scoped to one model
+      johnny registry delete <model> --all           # every placement of the model
+
+    To remove a whole model (and optionally its weights), use `johnny rm <model>`.
     """
     from .registry import store
 
     reg = store.load()
-    m = store.get(reg, model)
-    if not m:
-        err.print(f"[red]no model[/] '{model}' in the registry")
-        raise typer.Exit(code=1)
-    pls = m.get("placements") or []
-    if not pls:
-        console.print(f"[yellow]'{model}' has no placements.[/]")
-        return
 
-    if all_placements:
-        targets = list(pls)
-    elif placement:
-        exact = [p for p in pls if p.get("id") == placement]
-        subs = [p for p in pls if placement in (p.get("id") or "")]
-        targets = exact or subs
-        if not targets:
-            err.print(f"[red]no placement[/] matching '{placement}' in '{model}'.")
-            console.print("  known: " + ", ".join(p.get("id", "") for p in pls))
+    if placement is not None or all_placements:
+        # Model-scoped: TARGET is a model.
+        model = target
+        m = store.get(reg, model)
+        if not m:
+            err.print(f"[red]no model[/] '{model}' in the registry")
             raise typer.Exit(code=1)
-        if len(targets) > 1:
-            err.print(f"[red]'{placement}' is ambiguous[/] — matches {len(targets)}:")
-            for p in targets:
-                console.print(f"  • {p.get('id')}")
-            raise typer.Exit(code=1)
+        pls = m.get("placements") or []
+        if not pls:
+            console.print(f"[yellow]'{model}' has no placements.[/]")
+            return
+        if all_placements:
+            targets = [(model, p) for p in pls]
+        else:
+            hits = [p for p in pls if p.get("id") == placement] or [p for p in pls if placement in (p.get("id") or "")]
+            if not hits:
+                err.print(f"[red]no placement[/] matching '{placement}' in '{model}'.")
+                console.print("  known: " + ", ".join(p.get("id", "") for p in pls))
+                raise typer.Exit(code=1)
+            if len(hits) > 1:
+                err.print(f"[red]'{placement}' is ambiguous[/] in '{model}' — matches {len(hits)}:")
+                for p in hits:
+                    console.print(f"  • {p.get('id')}")
+                raise typer.Exit(code=1)
+            targets = [(model, hits[0])]
     else:
-        console.print(f"[yellow]specify a placement id to delete (or --all).[/] '{model}' has:")
-        for p in pls:
-            k = p.get("knobs", {})
-            console.print(f"  • [cyan]{p.get('id')}[/]  [dim](tp{k.get('tensor_parallel_size') or '—'} · "
-                          f"{p.get('use_case') or '—'} · {p.get('source')})[/]")
-        raise typer.Exit(code=1)
+        # Single arg: resolve as a placement id across all models.
+        is_model = store.get(reg, target) is not None
+        exact = [(mid, p) for mid, m in (reg.get("models") or {}).items()
+                 for p in (m.get("placements") or []) if p.get("id") == target]
+        if is_model and exact:  # names BOTH a model and a placement — don't guess
+            err.print(f"[yellow]'{target}' is both a model id and a placement id — be explicit:[/]")
+            console.print(f"  that placement:                  johnny registry delete {target} {target}")
+            console.print(f"  all of the model's placements:   johnny registry delete {target} --all")
+            raise typer.Exit(code=1)
+        hits = _find_placement_global(reg, target)
+        if not hits:
+            if is_model:
+                pls = (store.get(reg, target) or {}).get("placements") or []
+                console.print(f"[yellow]'{target}' is a model, not a placement.[/] Pass a placement id, add --all, "
+                              f"or use `johnny rm {target}` to remove the model. It has:")
+                for p in pls:
+                    console.print(f"  • [cyan]{p.get('id')}[/]")
+            else:
+                err.print(f"[red]no placement[/] matching '{target}' in any model.")
+            raise typer.Exit(code=1)
+        if len(hits) > 1:
+            err.print(f"[red]'{target}' is ambiguous[/] — matches {len(hits)} placements:")
+            for mid, p in hits:
+                console.print(f"  • [cyan]{mid}[/] / {p.get('id')}")
+            console.print("  [dim]disambiguate with: johnny registry delete <model> <placement>[/]")
+            raise typer.Exit(code=1)
+        targets = [hits[0]]
 
-    ids = [p.get("id", "") for p in targets]
+    by_model: dict[str, list[str]] = {}
+    for mid, p in targets:
+        by_model.setdefault(mid, []).append(p.get("id", ""))
     if not yes and not json_output:
-        console.print(f"will delete from [bold]{model}[/]: " + ", ".join(ids))
+        console.print("will delete → " + "; ".join(f"[bold]{mid}[/]: {', '.join(ids)}" for mid, ids in by_model.items()))
         if not typer.confirm("Proceed?", default=False):
             raise typer.Exit(code=1)
-    for pid in ids:
-        store.delete_placement(reg, model, pid)
+
+    deleted = []
+    for mid, ids in by_model.items():
+        for pid in ids:
+            if store.delete_placement(reg, mid, pid):
+                deleted.append({"model": mid, "placement": pid})
     store.save(reg)
-    remaining = len(m.get("placements") or [])
     if json_output:
-        console.print(_json.dumps({"model": model, "deleted": ids, "remaining": remaining}, indent=2))
+        console.print(_json.dumps({"deleted": deleted}, indent=2))
     else:
-        console.print(f"[green]✓ deleted[/] {len(ids)} placement(s) from {model}  [dim]({remaining} remaining)[/]")
+        for mid, ids in by_model.items():
+            remaining = len((store.get(reg, mid) or {}).get("placements") or [])
+            console.print(f"[green]✓ deleted[/] {len(ids)} from {mid}  [dim]({remaining} remaining)[/]")
 
 
 # --------------------------------------------------------------------------- seat lifecycle (P3)
@@ -1206,6 +1250,8 @@ def _render_plan(pl: dict) -> None:
             console.print("[dim]pruned:[/]")
             for p in pl["pruned"]:
                 console.print(f"  [yellow]✗ tp={p.get('tp')}[/] — {p.get('reason')}")
+    for w in pl.get("warnings", []):
+        console.print(f"[yellow]⚠ {w}[/]")
     if pl.get("arch_supported") is False:
         console.print(f"[red]✗ unsupported architecture[/] — {pl.get('arch_warning')}")
         console.print("[dim]nothing to sweep; induct would abort before launching any seat.[/]")
@@ -1214,15 +1260,81 @@ def _render_plan(pl: dict) -> None:
                   f"[dim](seeded search, not a brute grid)[/]")
 
 
-def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes, json_output) -> None:
+def _norm_kv(s: str) -> str:
+    """Normalize a --kv value to vLLM's KV-cache-dtype vocabulary (16-bit 'auto' or 'fp8')."""
+    v = s.strip().lower()
+    if v in ("8", "fp8"):
+        return "fp8"
+    if v in ("16", "fp16", "bf16", "auto"):
+        return "auto"
+    err.print(f"[red]--kv must be 8/fp8 or 16/fp16/auto[/] (got {s!r})")
+    raise typer.Exit(code=2)
+
+
+def _kv_dtypes(kv: str | None, sweep_kv: bool) -> tuple:
+    """Resolve --kv / --sweep-kv to the KV-cache dtypes to sweep. --sweep-kv wins if both
+    are given. vLLM offers only 16-bit ('auto') and 8-bit ('fp8')."""
+    if sweep_kv:
+        return ("auto", "fp8")
+    if kv:
+        return (_norm_kv(kv),)
+    return ("auto",)
+
+
+_KNOB_LABEL = {"tp": "TP", "max_model_len": "MML", "gpu_memory_util": "GMU",
+               "max_num_seqs": "SEQS", "max_num_batched_tokens": "BT", "kv_cache_dtype": "KV",
+               "threads": "THREADS", "parallel": "PAR", "n_gpu_layers": "NGL", "n_cpu_moe": "NCMOE"}
+
+
+def _render_sweep_results(results, winner, use_case) -> None:
+    """Compact table of the benched points showing only the knobs that VARIED across the
+    sweep (so it's obvious what differed), plus peak/single/KV, with the winner marked and
+    the pick basis spelled out. Backend-agnostic (vLLM tp/gmu/seqs, llama.cpp threads/parallel)."""
+    pts = [r for r in results if r.get("point")]
+    if len(pts) < 2:
+        return
+    keys = ["tp", "threads", "parallel", "n_gpu_layers", "n_cpu_moe", "gpu_memory_util",
+            "max_num_seqs", "max_num_batched_tokens", "kv_cache_dtype", "max_model_len"]
+    varying = [k for k in keys if len({(r.get("point") or {}).get(k) for r in pts}) > 1]
+    if not varying:
+        varying = ["max_num_seqs"]
+
+    t = Table(title="sweep results", title_style="dim", title_justify="left", pad_edge=False)
+    t.add_column("")
+    for k in varying:
+        t.add_column(_KNOB_LABEL.get(k, k), no_wrap=True)
+    for col in ("PEAK", "SINGLE", "KV-TOK"):
+        t.add_column(col, no_wrap=True)
+    for r in results:
+        p = r.get("point") or {}
+        win = r is winner  # winner is one of the result dicts — identity match, no fragile sig
+        row = ["[green]✓[/]" if win else ""] + [str(p.get(k)) for k in varying]
+        if r.get("ok"):
+            kv = r.get("kv_cache_tokens")
+            row += [str(r.get("peak_tok_s")), str(r.get("single_tok_s")), f"{kv/1e6:.2f}M" if kv else "—"]
+        else:
+            row += ["[red]fail[/]", "—", "—"]
+        t.add_row(*row)
+    console.print(t)
+    basis = {"latency": "fastest single-stream · ties (≤5%) tipped by >15% peak",
+             "context": "largest context · ties (≤5%) tipped by >15% peak"}.get(
+                 use_case, "highest peak throughput · ties (≤5%) tipped by >15% single")
+    console.print(f"  [dim]winner basis ({use_case or 'throughput'}): {basis}[/]")
+
+
+def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes,
+                json_output, kv=None, sweep_kv=False, mml=None) -> None:
     """Shared induction implementation for `induct` and `tune`. A plain function so neither
     command invokes the other: calling a Typer command directly passes its unfilled options
     as raw OptionInfo sentinels (the `--tp <OptionInfo>` bug), never the real defaults."""
     from .induct import pipeline
 
+    kv_dtypes = _kv_dtypes(kv, sweep_kv)
+
     if plan:
         try:
-            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp,
+                               kv_dtypes=kv_dtypes, mml_override=mml)
         except Exception as e:
             _emit_err(e, json_output)
         if json_output:
@@ -1233,7 +1345,8 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
 
     if not yes and not json_output:
         try:
-            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp)
+            pl = pipeline.plan(model, max_points=max_points, device=device, embeddings=embeddings, tp=tp,
+                               kv_dtypes=kv_dtypes, mml_override=mml)
         except Exception as e:
             _emit_err(e, json_output)
         _render_plan(pl)
@@ -1246,7 +1359,8 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
     prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
         res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points,
-                           progress=prog, device=device, embeddings=embeddings, tp=tp)
+                           progress=prog, device=device, embeddings=embeddings, tp=tp,
+                           kv_dtypes=kv_dtypes, mml_override=mml)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -1255,11 +1369,17 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
     if res.get("error"):
         err.print(f"[red]{res['error']}[/]")
         raise typer.Exit(code=1)
+    _render_sweep_results(res.get("results") or [], res.get("winner"), use_case)
     w = res.get("winner")
     if w:
         wp = w["point"]
-        console.print(f"[green]✓ winner[/] TP={wp.get('tp')} gmu={wp.get('gpu_memory_util')} "
-                      f"mml={wp.get('max_model_len')} → peak {w.get('peak_tok_s')} tok/s, single {w.get('single_tok_s')} tok/s")
+        # Show only the knobs that apply to this backend (vLLM: tp/seqs/kv/gmu; llama.cpp:
+        # threads/parallel/ngl) — skip the ones that are None so the line isn't full of noise.
+        knobs = [("TP", "tp"), ("threads", "threads"), ("par", "parallel"), ("ngl", "n_gpu_layers"),
+                 ("seqs", "max_num_seqs"), ("kv", "kv_cache_dtype"), ("gmu", "gpu_memory_util"),
+                 ("mml", "max_model_len")]
+        shown = " · ".join(f"{label}={wp.get(key)}" for label, key in knobs if wp.get(key) is not None)
+        console.print(f"[green]✓ winner[/] {shown} → peak {w.get('peak_tok_s')} · single {w.get('single_tok_s')} tok/s")
         console.print(f"  wrote placement [bold]{res['placement_id']}[/] to the registry")
     else:
         console.print("[yellow]no winning config[/] (all points failed — see the report)")
@@ -1272,6 +1392,9 @@ def induct(
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
     device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU if no GPU fits)."),
     tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be a viable placement). Overrides the auto winner's TP."),
+    kv: str = typer.Option(None, "--kv", help="Force KV-cache dtype: 8/fp8 or 16/fp16/auto (vLLM supports these two)."),
+    sweep_kv: bool = typer.Option(False, "--sweep-kv", help="Sweep both 16-bit and 8-bit KV cache (fp8 ≈ 2× the context per GB). Overrides --kv."),
+    mml: int = typer.Option(None, "--mml", help="Force max_model_len (capped at the VRAM ceiling for the KV dtype)."),
     embeddings: bool = typer.Option(None, "--embeddings/--no-embeddings", help="Force embeddings vs generative bench (default: auto-detect)."),
     bench: bool = typer.Option(False, "--bench", help="Also run the quality harness (heavy/opt-in)."),
     plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
@@ -1281,14 +1404,19 @@ def induct(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
-    _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes, json_output)
+    _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes,
+                json_output, kv, sweep_kv, mml)
 
 
 @app.command(rich_help_panel=_P_MODELS)
 def tune(
     model: str = typer.Argument(..., help="Registry id or local path."),
     use_case: str = typer.Option(None, "--use-case", help="Winner pick: throughput (max peak tok/s under concurrency) | latency (fastest single-stream tok/s) | context (largest usable context)"),
+    device: str = typer.Option("auto", "--device", help="gpu | cpu | auto (auto falls back to CPU only if no GPU placement fits). Use `cpu` to force a CPU bench."),
     tp: int = typer.Option(None, "--tp", help="Force tensor-parallel size: sweep only this TP (must be viable on this hardware)."),
+    kv: str = typer.Option(None, "--kv", help="Force KV-cache dtype: 8/fp8 or 16/fp16/auto (vLLM supports these two)."),
+    sweep_kv: bool = typer.Option(False, "--sweep-kv", help="Sweep both 16-bit and 8-bit KV cache (fp8 ≈ 2× the context per GB). Overrides --kv."),
+    mml: int = typer.Option(None, "--mml", help="Force max_model_len (capped at the VRAM ceiling for the KV dtype)."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
     yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
@@ -1296,7 +1424,8 @@ def tune(
 ) -> None:
     """Re-tune an existing model (induction, tuning-only). A focused alias for `induct`
     with tuning-only behavior; see `johnny induct --help` for the full option set."""
-    _run_induct(model, use_case, "auto", tp, None, False, False, resume, max_points, yes, json_output)
+    _run_induct(model, use_case, device, tp, None, False, False, resume, max_points, yes,
+                json_output, kv, sweep_kv, mml)
 
 
 # --------------------------------------------------------------------------- discovery (P5)

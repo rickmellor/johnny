@@ -95,7 +95,8 @@ def viable_placements(size_bytes: int, d: dict, quant: str | None, hardware, fre
     need_dtype = _QUANT_DTYPE.get((quant or "").lower())
     vram = min((g.vram_gb for g in hardware.groups), default=0.0)
     viable, pruned = [], []
-    kv_pt = kv_bytes_per_token(d, 2)
+    kv_pt = kv_bytes_per_token(d, 2)  # 16-bit (model dtype) bytes/token
+    native_ctx = d.get("ctx")
     tps = sorted({1, 2, 4, 8, free_count} & set(range(1, max(free_count, 1) + 1))) or [1]
     for tp in tps:
         if tp > free_count:
@@ -110,13 +111,16 @@ def viable_placements(size_bytes: int, d: dict, quant: str | None, hardware, fre
             pruned.append({"tp": tp, "reason": f"weights {per_gpu/1e9:.1f}GB/GPU + KV/overhead exceed {budget/1e9:.1f}GB"})
             continue
         free_for_kv = budget - per_gpu - _OVERHEAD_BYTES
+        # kv_free_tokens: the uncapped context budget at 16-bit KV. Kept so the point
+        # generator can rescale it per KV dtype (fp8 ≈ 2× the tokens) — see _kv_ceiling.
         if kv_pt:
-            max_ctx = int(free_for_kv * tp / kv_pt)
-            if d.get("ctx"):
-                max_ctx = min(max_ctx, d["ctx"])
+            kv_free_tokens = int(free_for_kv * tp / kv_pt)
+            max_ctx = min(kv_free_tokens, native_ctx) if native_ctx else kv_free_tokens
         else:
-            max_ctx = d.get("ctx")
-        viable.append({"tp": tp, "quant": quant, "per_gpu_gb": round(per_gpu / 1e9, 1), "kv_ceiling_ctx": max_ctx})
+            kv_free_tokens = None
+            max_ctx = native_ctx
+        viable.append({"tp": tp, "quant": quant, "per_gpu_gb": round(per_gpu / 1e9, 1),
+                       "kv_ceiling_ctx": max_ctx, "kv_free_tokens": kv_free_tokens, "native_ctx": native_ctx})
     return viable, pruned
 
 
@@ -139,51 +143,79 @@ def cpu_viable(size_bytes: int, host_ram_gb: float, headroom: float = 0.7) -> di
 
 
 def cpu_candidate_points(embeddings: bool, ncpu: int, native_ctx: int | None,
-                         priors: list, max_points: int | None = None) -> list[dict]:
+                         priors: list, max_points: int | None = None,
+                         mml_override: int | None = None) -> list[dict]:
     """CPU sweep: a small grid over cpuset (threads) × context/batch.
 
     Embeddings get a batch×threads grid at native (small) context; generative CPU
-    LLMs sweep threads × a couple of seq settings.
+    LLMs sweep threads × a couple of seq settings. `mml_override` (--mml) pins the
+    context — important on CPU, where a large max_model_len makes vLLM's warmup slow.
     """
     half = max(1, ncpu // 2)
     cpusets = list(dict.fromkeys([f"0-{ncpu - 1}", f"0-{half - 1}"]))
     prior = priors[0] if priors else {}
+    # A GPU prior can carry a big batched-tokens; that bloats CPU warmup, so cap it on CPU.
+    base_batched = min(int(prior.get("max_num_batched_tokens") or 4096), 8192)
     pts: list[dict] = []
     if embeddings:
-        mml = prior.get("max_model_len") or native_ctx or 2048
+        mml = mml_override or prior.get("max_model_len") or native_ctx or 2048
         for cs in cpusets:
-            for batched in dict.fromkeys([prior.get("max_num_batched_tokens") or 8192, 16384]):
+            for batched in dict.fromkeys([min(int(prior.get("max_num_batched_tokens") or 8192), 8192), 16384]):
                 pts.append({"device": "cpu", "embeddings": True, "cpuset": cs, "max_model_len": mml,
                             "max_num_batched_tokens": batched, "max_num_seqs": prior.get("max_num_seqs") or 256})
     else:
-        mml = prior.get("max_model_len") or (min(native_ctx, 16384) if native_ctx else 8192)
+        mml = mml_override or prior.get("max_model_len") or (min(native_ctx, 16384) if native_ctx else 8192)
         for cs in cpusets:
             for seqs in dict.fromkeys([prior.get("max_num_seqs") or 8, 16]):
                 pts.append({"device": "cpu", "embeddings": False, "cpuset": cs, "max_model_len": mml,
-                            "max_num_seqs": seqs, "max_num_batched_tokens": prior.get("max_num_batched_tokens") or 4096})
+                            "max_num_seqs": seqs, "max_num_batched_tokens": base_batched})
     if max_points:
         pts = pts[:max_points]
     return pts
 
 
-def candidate_points(viable: list, priors: list, max_points: int | None = None) -> list[dict]:
+# KV-cache dtype bytes/token relative to 16-bit (model dtype). vLLM only offers these two:
+# "auto" = model dtype (16-bit), "fp8" = 8-bit. Higher quant isn't supported (or wanted).
+_KV_BYTE_FACTOR = {"auto": 1.0, "fp8": 0.5}
+
+
+def _kv_ceiling(sk: dict, kv_dtype: str) -> int | None:
+    """Context ceiling for a viable placement at a given KV dtype — fp8 roughly doubles the
+    16-bit token budget — capped at the model's native context."""
+    kv_free = sk.get("kv_free_tokens")
+    if kv_free is None:
+        return sk.get("kv_ceiling_ctx")
+    ceil = int(kv_free / _KV_BYTE_FACTOR.get(kv_dtype, 1.0))
+    native = sk.get("native_ctx")
+    return min(ceil, native) if native else ceil
+
+
+def candidate_points(viable: list, priors: list, max_points: int | None = None,
+                     kv_dtypes: tuple = ("auto",), mml_override: int | None = None) -> list[dict]:
+    """Seeded sweep grid. kv_dtypes adds a KV-cache-dtype dimension (e.g. ("auto","fp8")
+    to compare 16- vs 8-bit KV); mml_override pins max_model_len (still capped at the
+    VRAM ceiling for that KV dtype, so it can't OOM)."""
     prior = priors[0] if priors else {}
     base_batched = prior.get("max_num_batched_tokens") or 16384
     base_gmu = prior.get("gpu_memory_util") or 0.90
     base_seqs = prior.get("max_num_seqs") or 64
     pts: list[dict] = []
     for sk in viable:
-        ceil = sk.get("kv_ceiling_ctx")
-        mml_opts = [x for x in (ceil, prior.get("max_model_len")) if x]
-        mml = min(mml_opts) if mml_opts else ceil
-        for gmu in dict.fromkeys([base_gmu, 0.92]):
-            for seqs in dict.fromkeys([base_seqs, 32]):
-                pts.append({
-                    "tp": sk["tp"], "quant": sk["quant"], "max_model_len": mml,
-                    "gpu_memory_util": gmu, "max_num_seqs": seqs,
-                    "max_num_batched_tokens": base_batched, "kv_cache_dtype": "auto",
-                    "mtp": {"enabled": False},
-                })
+        for kv in kv_dtypes:
+            ceil = _kv_ceiling(sk, kv)
+            if mml_override:
+                mml = min(mml_override, ceil) if ceil else mml_override
+            else:
+                mml_opts = [x for x in (ceil, prior.get("max_model_len")) if x]
+                mml = min(mml_opts) if mml_opts else ceil
+            for gmu in dict.fromkeys([base_gmu, 0.92]):
+                for seqs in dict.fromkeys([base_seqs, 32]):
+                    pts.append({
+                        "tp": sk["tp"], "quant": sk["quant"], "max_model_len": mml,
+                        "gpu_memory_util": gmu, "max_num_seqs": seqs,
+                        "max_num_batched_tokens": base_batched, "kv_cache_dtype": kv,
+                        "mtp": {"enabled": False},
+                    })
     if max_points:
         pts = pts[:max_points]
     return pts

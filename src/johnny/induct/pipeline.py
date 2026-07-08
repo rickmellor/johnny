@@ -42,7 +42,8 @@ def _save_state(model_id: str, st: dict) -> None:
     (d / "state.json").write_text(json.dumps(st, indent=2))
 
 
-def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp=None) -> dict:
+def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp=None,
+                  kv_dtypes=("auto",), mml_override=None) -> dict:
     """Choose GPU vs CPU placements + candidate points. device: gpu|cpu|auto.
     auto = GPU if any GPU placement fits, else fall back to CPU.
     tp: force a tensor-parallel size — sweep only that TP (must be viable)."""
@@ -66,12 +67,19 @@ def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp
             return {"free": free, "device": "cpu", "embeddings": emb, "viable": [],
                     "pruned": [{"tp": "cpu", "reason": cv["reason"]}], "priors": len(priors), "points": []}
         ncpu = os.cpu_count() or 4
-        pts = grid.cpu_candidate_points(emb, ncpu, native_ctx, priors, max_points=max_points)
+        pts = grid.cpu_candidate_points(emb, ncpu, native_ctx, priors, max_points=max_points,
+                                        mml_override=mml_override)
+        warnings = []
+        if a.get("multimodal") and not emb:
+            warnings.append("multimodal model on CPU: vLLM runs a vision/warmup profiling pass "
+                            "that is known to hang on CPU — a text-only model is strongly "
+                            "recommended for --device cpu (this run will likely time out).")
         return {"free": free, "device": "cpu", "embeddings": emb,
                 "viable": [{"device": "cpu", "per_host_gb": cv["per_host_gb"]}],
-                "pruned": [], "priors": len(priors), "points": pts}
+                "pruned": [], "priors": len(priors), "points": pts, "warnings": warnings}
 
-    pts = grid.candidate_points(gpu_viable, priors, max_points=max_points)
+    pts = grid.candidate_points(gpu_viable, priors, max_points=max_points,
+                                kv_dtypes=kv_dtypes, mml_override=mml_override)
     for p in pts:
         p["embeddings"] = emb
     return {"free": free, "device": "gpu", "embeddings": emb, "viable": gpu_viable,
@@ -79,17 +87,19 @@ def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp
 
 
 def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
-         device: str = "auto", embeddings: bool | None = None, tp: int | None = None) -> dict:
+         device: str = "auto", embeddings: bool | None = None, tp: int | None = None,
+         kv_dtypes=("auto",), mml_override: int | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     _g = _llamacpp.gguf_ref(model_ref, cfg)
     if _g:  # GGUF -> llama.cpp backend path
-        return _llamacpp.plan(_g[0], _g[1], max_points=max_points, cfg=cfg)
+        return _llamacpp.plan(_g[0], _g[1], max_points=max_points, cfg=cfg,
+                              device=device, mml_override=mml_override)
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
     a = stages.audit(path)
-    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp)
-    img_key = "cpu_image" if rp["device"] == "cpu" else "vllm_image"
-    image = (cfg.get("docker") or {}).get(img_key)
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp,
+                       kv_dtypes=kv_dtypes, mml_override=mml_override)
+    image = C.resolve_image(cfg, device=rp["device"])
     arch_ok, arch_why = stages.arch_supported(a.get("arch"), image)
     return {
         "model_id": model_id,
@@ -107,6 +117,7 @@ def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
         "viable": rp["viable"],
         "pruned": rp["pruned"],
         "priors": rp["priors"],
+        "warnings": rp.get("warnings", []),
         # An unsupported arch can't launch — present zero sweepable points.
         "points": rp["points"] if arch_ok else [],
     }
@@ -123,12 +134,15 @@ def run(
     device: str = "auto",
     embeddings: bool | None = None,
     tp: int | None = None,
+    kv_dtypes=("auto",),
+    mml_override: int | None = None,
 ) -> dict:
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
     _g = _llamacpp.gguf_ref(model_ref, cfg)
     if _g:  # GGUF -> llama.cpp backend path (self-contained; not TP/vLLM-shaped)
-        return _llamacpp.run(_g[0], _g[1], use_case=use_case, max_points=max_points, cfg=cfg, progress=progress)
+        return _llamacpp.run(_g[0], _g[1], use_case=use_case, max_points=max_points, cfg=cfg,
+                             progress=progress, device=device, mml_override=mml_override)
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
 
@@ -141,12 +155,12 @@ def run(
     _save_state(model_id, st)
     _p(f"audit: {a.get('arch')} · {round(a.get('size_bytes', 0) / 1e9, 1)}GB · quant={a.get('quant')}")
 
-    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp)
+    rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp,
+                       kv_dtypes=kv_dtypes, mml_override=mml_override)
     _p(f"device={rp['device']} · embeddings={rp['embeddings']} · {len(rp['viable'])} viable, {len(rp['pruned'])} pruned")
 
     # Arch pre-flight: refuse to launch seats the image's vLLM can't even register.
-    img_key = "cpu_image" if rp["device"] == "cpu" else "vllm_image"
-    image = (cfg.get("docker") or {}).get(img_key)
+    image = C.resolve_image(cfg, device=rp["device"])
     ok, why = stages.arch_supported(a.get("arch"), image)
     if not ok:
         _p(f"abort: {why}")

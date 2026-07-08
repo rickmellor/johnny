@@ -169,6 +169,8 @@ class LlamaCppDriver(Driver):
         args += ["--host", "0.0.0.0", "--port", str(_CONTAINER_PORT)]
         args += ["--alias", spec["served_model_name"]]
         args += ["-ngl", str(knobs.get("n_gpu_layers", 999))]
+        if knobs.get("threads"):  # CPU placement: serve at the tuned thread count
+            args += ["-t", str(knobs["threads"])]
         # Flash-attn: DeepSeek-V4 head-dim-512 kernel is unstable on RDNA4 -> default off.
         args += ["-fa", str(knobs.get("flash_attn", "off"))]
         if knobs.get("max_model_len"):

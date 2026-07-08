@@ -30,8 +30,9 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     ident = model.get("identity") or {}
     local_path = ident.get("local_path")
     backend = placement.get("backend") or "vllm"
-    _img_key = "llamacpp_image" if backend == "llamacpp" else "vllm_image"
-    image = placement.get("image") or docker.get(_img_key)
+    # A CPU/pooling placement must launch on the CPU image, not the GPU one.
+    device = "cpu" if (placement.get("extra") or {}).get("device") == "cpu" else "gpu"
+    image = placement.get("image") or C.resolve_image(cfg, device=device, backend=backend)
     visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
     return {
         "container_name": f"johnny-{model_id}-{port}",

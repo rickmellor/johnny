@@ -20,18 +20,47 @@ PROMPTS=(
   "Embedded systems engineering"
 )
 
-echo "=== Warmup (4 requests) ==="
-for i in {1..4}; do
-  curl -s "${BASE_URL}/v1/completions" \
-    -H "Content-Type: application/json" \
-    -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPTS[0]}\",\"max_tokens\":100}" \
-    -o /dev/null
+echo "=== Warmup (adaptive: sustained load until throughput plateaus) ==="
+# A few quick requests measure COLD: on aggressive-idle GPUs (RDNA4 deep-idles between
+# seats) the clock hasn't ramped to boost and CUDA graphs/kernels aren't warm, so a
+# cold-launched seat benches far slower than one launched right after another — which made
+# the *second* point of every (tp) group look ~3x faster purely from run order.
+#
+# Rather than a fixed, hardware-specific duration, we fire rounds of concurrent load and
+# watch round-over-round throughput: while clocks ramp it keeps rising; once it stops
+# improving by > TOL for STABLE_ROUNDS rounds we're at steady state and stop. Self-calibrates
+# across GPUs. Bounded by MIN/MAX seconds. All knobs are env-overridable.
+WARM_CONC=${WARMUP_CONCURRENCY:-24}
+WARM_TOK=128
+WARMUP_TOL=${WARMUP_TOL:-0.03}              # a round must beat best by >3% to count as "still ramping"
+WARMUP_STABLE_ROUNDS=${WARMUP_STABLE_ROUNDS:-3}
+WARMUP_MIN_SECONDS=${WARMUP_MIN_SECONDS:-4}
+WARMUP_MAX_SECONDS=${WARMUP_MAX_SECONDS:-30}
+warm_start=$(date +%s); best=0; stable=0; round=0
+while : ; do
+  round=$((round + 1))
+  T=$(date +%s.%N)
+  for i in $(seq 1 "$WARM_CONC"); do
+    curl -s "${BASE_URL}/v1/completions" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"${MODEL}\",\"prompt\":\"${PROMPTS[$((i % 8))]} warm ${round}\",\"max_tokens\":${WARM_TOK}}" \
+      -o /dev/null &
+  done
+  wait
+  T2=$(date +%s.%N)
+  elapsed=$(echo "$T2 - $T" | bc)
+  tps=$(echo "scale=3; $WARM_CONC * $WARM_TOK / $elapsed" | bc)
+  total=$(( $(date +%s) - warm_start ))
+  if [ "$(echo "$tps > $best * (1 + $WARMUP_TOL)" | bc -l)" -eq 1 ]; then best=$tps; stable=0; else stable=$((stable + 1)); fi
+  printf "  round %d: %.0f tok/s (best %.0f · stable %d/%d · %ds)\n" "$round" "$tps" "$best" "$stable" "$WARMUP_STABLE_ROUNDS" "$total"
+  if [ "$total" -ge "$WARMUP_MAX_SECONDS" ]; then echo "  (max ${WARMUP_MAX_SECONDS}s — using current)"; break; fi
+  if [ "$stable" -ge "$WARMUP_STABLE_ROUNDS" ] && [ "$total" -ge "$WARMUP_MIN_SECONDS" ]; then echo "  (plateaued at steady state)"; break; fi
 done
-echo "Done."
+echo "Done (${total}s)."
 
 echo ""
 echo "=== Concurrency sweep (repeated prompt, prefix cache friendly) ==="
-for n in 16 32 64 128 256 512 1024; do
+for n in ${BENCH_CONCURRENCY:-16 32 64 128 256 512 1024}; do
   echo -n "Concurrency ${n}: "
   T=$(date +%s.%N)
   for i in $(seq 1 $n); do
@@ -49,7 +78,7 @@ done
 
 echo ""
 echo "=== Concurrency sweep (varied prompts, no prefix cache) ==="
-for n in 16 32 64 128 256 512 1024; do
+for n in ${BENCH_CONCURRENCY:-16 32 64 128 256 512 1024}; do
   echo -n "Concurrency ${n}: "
   T=$(date +%s.%N)
   for i in $(seq 1 $n); do
@@ -68,7 +97,7 @@ done
 
 echo ""
 echo "=== Single-request latency ==="
-for i in {1..3}; do
+for i in {1..5}; do
   echo -n "Run ${i}: "
   T=$(date +%s.%N)
   RESULT=$(curl -s "${BASE_URL}/v1/completions" \

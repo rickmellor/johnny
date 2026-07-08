@@ -142,6 +142,18 @@ def _default_vllm_image(vendor: str | None) -> str:
     return DEFAULT_VLLM_IMAGE_AMD
 
 
+def resolve_image(cfg: dict, *, device: str = "gpu", backend: str = "vllm") -> str | None:
+    """Effective docker image for a launch. Defaults the vLLM CPU image when the config
+    omits `docker.cpu_image` (configs from before it existed), so `--device cpu` just works
+    instead of launching with a null image."""
+    docker = (cfg or {}).get("docker") or {}
+    if backend == "llamacpp":
+        return docker.get("llamacpp_image")
+    if device == "cpu":
+        return docker.get("cpu_image") or DEFAULT_VLLM_CPU_IMAGE
+    return docker.get("vllm_image")
+
+
 def build_default_config(disc: dict | None = None) -> dict:
     disc = disc or autodiscover()
     cfg: dict = {

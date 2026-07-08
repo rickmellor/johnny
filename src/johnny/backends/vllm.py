@@ -227,6 +227,10 @@ class VllmDriver(Driver):
             args += ["--gpu-memory-utilization", str(knobs["gpu_memory_util"])]
         if not pooling:
             args += ["--enable-prefix-caching"]
+        if is_cpu:
+            # CPU gains little from graph compilation and its warmup is slow-to-hanging;
+            # eager keeps startup usable.
+            args += ["--enforce-eager"]
         if knobs.get("max_num_seqs"):
             args += ["--max-num-seqs", str(knobs["max_num_seqs"])]
         if knobs.get("max_num_batched_tokens"):

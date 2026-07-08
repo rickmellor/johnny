@@ -33,9 +33,11 @@ def _point_sig(point: dict) -> str:
     if point.get("device") == "cpu":
         return (f"cpu-{point.get('cpuset')}-mml{point.get('max_model_len')}"
                 f"-bt{point.get('max_num_batched_tokens')}-seqs{point.get('max_num_seqs')}")
+    kv = point.get("kv_cache_dtype")
+    kv_sfx = f"-kv{kv}" if kv and kv != "auto" else ""
     return (
         f"tp{point.get('tp')}-gmu{point.get('gpu_memory_util')}-seqs{point.get('max_num_seqs')}"
-        f"-bt{point.get('max_num_batched_tokens')}-mml{point.get('max_model_len')}"
+        f"-bt{point.get('max_num_batched_tokens')}-mml{point.get('max_model_len')}{kv_sfx}"
     )
 
 

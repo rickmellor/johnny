@@ -70,6 +70,12 @@ def audit(path: str) -> dict:
     config = grid.read_config(path)
     info["dims"] = grid.dims(config)
     info["size_bytes"] = grid.model_size_bytes(path)
+    # Multimodal models carry a vision/audio tower whose warmup profiling is slow-to-hanging
+    # on vLLM-CPU (see the CPU pre-flight warning) — flag it so induction can warn.
+    info["multimodal"] = bool(
+        config.get("vision_config") or config.get("audio_config")
+        or str(info.get("arch") or "").endswith("ForConditionalGeneration")
+    )
     if not info.get("quant"):
         low = path.lower()
         for tok in ("fp8", "awq", "int4", "bf16"):
@@ -265,15 +271,17 @@ def _parse_kv_cache(log: str) -> dict:
 
 
 def _parse_bench(out: str) -> dict:
-    """peak tok/s = max over the sweep; single ≈ first tok/s in the latency section."""
+    """peak tok/s = max over the sweep; single = best of the single-request runs (the first
+    run right after the concurrency sweep can be transitional — take the steady-state best)."""
     nums = [float(x) for x in re.findall(r"([\d.]+)\s*tok/s", out)]
     peak = max(nums) if nums else None
     single = None
     if "Single-request" in out:
+        # Bound to the single-request section (stop at the next '=== ' header).
         tail = out.split("Single-request", 1)[1]
-        m = re.search(r"([\d.]+)\s*tok/s", tail)
-        if m:
-            single = float(m.group(1))
+        tail = re.split(r"^===", tail, maxsplit=1, flags=re.MULTILINE)[0]
+        singles = [float(x) for x in re.findall(r"([\d.]+)\s*tok/s", tail)]
+        single = max(singles) if singles else None
     return {"peak_tok_s": peak, "single_tok_s": single}
 
 
@@ -283,9 +291,8 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
     Bench selection: embeddings models use the embeddings throughput probe; generative
     models reuse bench.sh (/v1/completions).
     """
-    docker = cfg.get("docker") or {}
     is_cpu = point.get("device") == "cpu"
-    drv = VllmDriver(image=(docker.get("cpu_image") if is_cpu else docker.get("vllm_image")))
+    drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu"))
     spec = _cpu_tuning_spec(model_id, local_path, point, cfg) if is_cpu \
         else _tuning_spec(model_id, local_path, point, gpus, cfg, hardware)
 
@@ -313,9 +320,20 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
             if not bench_script:
                 result["error"] = "bench script unavailable (not bundled and no scripts.bench override)"
                 return result
+            import os
+
             from ..util import run
 
-            rc, out, errout = run(["bash", bench_script, str(TUNING_PORT), model_id], timeout=1200)
+            # CPU can't parallelize like a GPU: the default sweep to concurrency 1024 serializes
+            # through a few CPU seqs and never finishes in the window. Bench CPU with a light,
+            # single-stream-focused sweep and a lighter warmup (CPUs don't deep-idle-downclock
+            # like RDNA4, so the ramp warmup GPUs need is unnecessary here).
+            bench_env = None
+            if is_cpu:
+                bench_env = {**os.environ, "BENCH_CONCURRENCY": "1 2 4 8",
+                             "WARMUP_CONCURRENCY": "4", "WARMUP_MAX_SECONDS": "8"}
+            rc, out, errout = run(["bash", bench_script, str(TUNING_PORT), model_id],
+                                  timeout=1200, env=bench_env)
             parsed = _parse_bench(out)
             if parsed.get("peak_tok_s") is None:
                 parsed["error"] = (errout or out)[-300:]
@@ -330,7 +348,9 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
 _FAILURE_SIGNATURES = (
     ("are not supported for now", "unsupported architecture for this vLLM image"),
     ("not supported", "unsupported model/feature for this vLLM image"),
-    ("trust_remote_code", "needs --trust-remote-code / custom modeling code"),
+    # Match the actual error ("... pass trust_remote_code=True"), not vLLM's benign config
+    # echo (`trust_remote_code=False`), which otherwise false-flags every failed CPU seat.
+    ("trust_remote_code=True", "needs --trust-remote-code / custom modeling code"),
     ("out of memory", "GPU OOM during load"),
     ("CUDA out of memory", "GPU OOM during load"),
     ("HIP out of memory", "GPU OOM during load"),
@@ -418,12 +438,46 @@ def _wait_ready(drv, container: str, port: int, timeout: float) -> tuple[bool, s
     return False, "tuning seat did not become ready in time"
 
 
+# Winner selection is tolerance-based, not exact: primaries within TIE_PCT are a "tie"
+# (measurement noise / not worth chasing), and a tie is only overturned when a candidate's
+# secondary metric is more than TIP_PCT better. So 'latency' won't trade 34% of peak
+# throughput for a +0.3% single-stream blip, but a genuinely faster config still wins.
+_TIE_PCT = 0.05   # primaries within 5% count as tied
+_TIP_PCT = 0.15   # a >15% better secondary tips a tie
+
+
+def _single(r):
+    return r.get("single_tok_s") or 0
+
+
+def _peak(r):
+    return r.get("peak_tok_s") or 0
+
+
+def _mml(r):
+    return (r.get("point") or {}).get("max_model_len") or 0
+
+
+def _pick(cands: list[dict], primary, secondary) -> dict:
+    """Best by `primary`; but if a candidate ties on primary (within TIE_PCT of the leader)
+    and beats the leader's `secondary` by more than TIP_PCT, that candidate wins. Deterministic
+    (compares the best-secondary tie-band member against the primary leader — no cycles)."""
+    leader = max(cands, key=primary)
+    lp = primary(leader)
+    tie_band = [c for c in cands if lp <= 0 or primary(c) >= lp * (1 - _TIE_PCT)]
+    challenger = max(tie_band, key=secondary)
+    if secondary(challenger) > secondary(leader) * (1 + _TIP_PCT):
+        return challenger
+    return leader
+
+
 def synthesize(results: list[dict], use_case: str | None) -> dict | None:
+    """Pick the winner for the use case with tolerance-based tie-breaking (see _pick)."""
     ok = [r for r in results if r.get("ok")]
     if not ok:
         return None
-    if use_case == "latency":
-        return max(ok, key=lambda r: r.get("single_tok_s") or r.get("peak_tok_s") or 0)
-    if use_case == "context":
-        return max(ok, key=lambda r: (r["point"].get("max_model_len") or 0))
-    return max(ok, key=lambda r: r.get("peak_tok_s") or 0)  # throughput / default
+    if use_case == "latency":     # fastest single-stream; ties tipped by peak throughput
+        return _pick(ok, _single, _peak)
+    if use_case == "context":     # largest context; ties tipped by peak throughput
+        return _pick(ok, _mml, _peak)
+    return _pick(ok, _peak, _single)  # throughput / default: peak, ties tipped by single
