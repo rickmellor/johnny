@@ -134,13 +134,17 @@ def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None,
     ctx = mml_override or min(32768, native)
     size_gb = (audit_info.get("size_bytes") or 0) / 1e9
     n_layer = audit_info.get("n_layer") or 0
+    # Flash-attn off is a DeepSeek-only workaround (head-dim-512 kernel unstable on
+    # RDNA4); other archs measure fine with fa on (qwen35moe validated) and fa is a
+    # prerequisite for quantized KV cache, so don't pay the tax globally.
+    fa = "off" if "deepseek" in (audit_info.get("arch") or "").lower() else "on"
 
     def _mk(**kw):
         return {"backend": "llamacpp", "gpu_count": gpu_count, "n_gpu_layers": 999,
-                "flash_attn": "off", "max_model_len": ctx, "parallel": 4, **kw}
+                "flash_attn": fa, "max_model_len": ctx, "parallel": 4, **kw}
 
-    if not n_layer or size_gb <= gpu_count * _FIT_GB_PER_GPU:
-        pts = [_mk(parallel=4), _mk(parallel=16)]  # fits: sweep concurrency
+    if not n_layer or size_gb <= gpu_count * _WEIGHT_TARGET_GB_PER_GPU:
+        pts = [_mk(parallel=4), _mk(parallel=16)]  # fits with headroom: sweep concurrency
     else:
         import math
         layer_gb = size_gb / n_layer
@@ -148,7 +152,15 @@ def candidate_points(audit_info: dict, gpu_count: int, max_points: int | None,
         need = max(1, math.ceil(overflow / layer_gb))  # expert-layers to shed
         k = max(1, math.ceil(need / gpu_count))  # per-group, balanced
         pts = []
-        for kk in (k, k + 1):  # two offload levels: just-fits vs. more headroom
+        # Boundary zone (validated: Ornith 397B, 119.5 GB on 4×32 GB): weights squeeze
+        # into raw VRAM but leave <5 GB/GPU for KV+buffers — sweep the no-offload point
+        # too and let the measured run decide, instead of trusting the fit line.
+        if size_gb <= gpu_count * _FIT_GB_PER_GPU:
+            pts.append(_mk(parallel=4))
+        # k is an overestimate (layer_gb counts attention/shared weights, but only the
+        # expert tensors move), so sweep k-1 as well: lighter offload = faster decode
+        # (Ornith measured: k=1 20.1 t/s vs k=2 18.5 t/s).
+        for kk in [x for x in (k - 1, k, k + 1) if x >= 1]:
             layers = min(kk * gpu_count, n_layer)
             pts.append(_mk(override_tensor=_offload_regex(n_layer, gpu_count, kk),
                            offload_layers=layers))
@@ -357,7 +369,9 @@ def plan(model_id: str, gguf_path: str, max_points: int | None = None, cfg: dict
 
 
 def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: int | None = None,
-        cfg: dict | None = None, progress=None, device: str = "auto", mml_override: int | None = None) -> dict:
+        cfg: dict | None = None, progress=None, device: str = "auto", mml_override: int | None = None,
+        select=None) -> dict:
+    """select: optional (results, winner) -> results to write placements for (see pipeline.run)."""
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
@@ -416,21 +430,28 @@ def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: 
     run_dir = C.get_paths().runs_dir / f"induct-{model_id.replace('/', '__')}"
     report_path = _write_report(run_dir, model_id, a, results, winner)
 
-    placement = None
+    placements, winner_pid = [], None
     if winner:
         rtv = str((cfg.get("docker") or {}).get("llamacpp_image", "")).split(":")[-1] or "unknown"
-        placement = to_placement(model_id, winner, a, hw, rtv, use_case)
+        chosen = (select(results, winner) if select else None) or [winner]
         md = (cfg.get("roots") or {}).get("models_dir")
         try:
             lp = str(Path(gguf_path).relative_to(Path(md).expanduser())) if md else None
         except (ValueError, TypeError):
             lp = None
-        report.write_placement(model_id, a, placement, hw, local_path=lp)
+        for r in chosen:
+            # Only the winner carries the use-case tag (see pipeline.run).
+            placement = to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None)
+            report.write_placement(model_id, a, placement, hw, local_path=lp)
+            placements.append(placement)
+            if r is winner:
+                winner_pid = placement["id"]
 
     return {
         "model_id": model_id, "backend": "llamacpp", "points": len(points),
         "results": results, "winner": winner,
-        "placement_id": placement["id"] if placement else None,
+        "placement_id": winner_pid or (placements[0]["id"] if placements else None),
+        "placement_ids": [p["id"] for p in placements],
         "report": str(report_path),
         "bench": "throughput sweep complete (bench.sh)",
     }

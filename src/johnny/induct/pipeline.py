@@ -86,6 +86,14 @@ def _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp
             "pruned": gpu_pruned, "priors": len(priors), "points": pts}
 
 
+def cached_count(model_id: str, points: list[dict]) -> int:
+    """How many of these plan points already have benched results in the resumable
+    state (state.json) — lets the CLI's pre-sweep confirm tell real launches from
+    cache replays. 0 for backends that don't persist state (llamacpp)."""
+    done = _load_state(model_id).get("results") or {}
+    return sum(1 for p in points if report._point_sig(p) in done)
+
+
 def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
          device: str = "auto", embeddings: bool | None = None, tp: int | None = None,
          kv_dtypes=("auto",), mml_override: int | None = None) -> dict:
@@ -136,13 +144,18 @@ def run(
     tp: int | None = None,
     kv_dtypes=("auto",),
     mml_override: int | None = None,
+    select=None,
 ) -> dict:
+    """select: optional callback (results, winner) -> list of benched result dicts to
+    write placements for. None or an empty return → winner only. Lets the CLI offer an
+    end-of-sweep pick (e.g. also keep the best tp=1/tp=2 seats, not just the winner)."""
     _p = progress or (lambda *_: None)
     cfg = cfg if cfg is not None else load_config()
     _g = _llamacpp.gguf_ref(model_ref, cfg)
     if _g:  # GGUF -> llama.cpp backend path (self-contained; not TP/vLLM-shaped)
         return _llamacpp.run(_g[0], _g[1], use_case=use_case, max_points=max_points, cfg=cfg,
-                             progress=progress, device=device, mml_override=mml_override)
+                             progress=progress, device=device, mml_override=mml_override,
+                             select=select)
     hw = hwd.detect()
     model_id, path = stages.discover(model_ref, cfg)
 
@@ -217,22 +230,29 @@ def run(
     run_dir = C.get_paths().runs_dir / f"induct-{model_id.replace('/', '__')}"
     report_path = report.write_report(run_dir, model_id, a, results, winner)
 
-    placement = None
+    placements, winner_pid = [], None
     if winner:
         rtv = ((cfg.get("docker") or {}).get("vllm_image", "") or "").split(":")[-1] or "unknown"
-        placement = report.to_placement(model_id, winner, a, hw, rtv, use_case)
-        ex = placement.get("extra") or {}
-        if ex.get("tool_call_parser") or ex.get("reasoning_parser"):
-            _p(f"derived parsers (arch={a.get('arch')}): tool={ex.get('tool_call_parser')} "
-               f"reasoning={ex.get('reasoning_parser')}"
-               + (" +chat-template" if ex.get('chat_template') else "")
-               + " — override in the registry if a variant differs")
+        chosen = (select(results, winner) if select else None) or [winner]
         md = (cfg.get("roots") or {}).get("models_dir")
         try:
             lp = str(Path(path).relative_to(Path(md).expanduser())) if md else None
         except (ValueError, TypeError):
             lp = None
-        report.write_placement(model_id, a, placement, hw, local_path=lp)
+        for r in chosen:
+            # Only the winner carries the use-case tag: a manually kept seat isn't the
+            # "<use-case> winner", and the tag would skew launch-time auto-pick.
+            placement = report.to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None)
+            report.write_placement(model_id, a, placement, hw, local_path=lp)
+            placements.append(placement)
+            if r is winner:
+                winner_pid = placement["id"]
+        ex = placements[0].get("extra") or {}
+        if ex.get("tool_call_parser") or ex.get("reasoning_parser"):
+            _p(f"derived parsers (arch={a.get('arch')}): tool={ex.get('tool_call_parser')} "
+               f"reasoning={ex.get('reasoning_parser')}"
+               + (" +chat-template" if ex.get('chat_template') else "")
+               + " — override in the registry if a variant differs")
 
     st["done"] = True
     _save_state(model_id, st)
@@ -241,9 +261,12 @@ def run(
         "points": len(points),
         "results": results,
         "winner": winner,
-        "placement_id": placement["id"] if placement else None,
+        "placement_id": winner_pid or (placements[0]["id"] if placements else None),
+        "placement_ids": [p["id"] for p in placements],
         "report": str(report_path),
-        # The quality harness (lm-eval/arc/humaneval/needle) is heavy + opt-in; its
-        # orchestration is wired but a real run is the user's GPU-time call.
-        "bench": "requested (run the quality harness explicitly)" if bench else "skipped (tuning-only default)",
+        # The quality harness is heavy + opt-in; a real run is the user's GPU-time call,
+        # so even --bench only points at the command instead of burning hours implicitly.
+        "bench": (f"run `johnny bench {winner_pid or model_id}` (quality harness)" if bench
+                  else "skipped (tuning-only default — quality: `johnny bench "
+                       f"{winner_pid or model_id}`)"),
     }
