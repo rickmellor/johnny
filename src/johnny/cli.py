@@ -15,6 +15,7 @@ Design notes:
 from __future__ import annotations
 
 import json as _json
+import sys as _sys
 import time
 
 import typer
@@ -1249,10 +1250,12 @@ def _render_plan(pl: dict) -> None:
             console.print(f"  [yellow]✗ {p.get('tp')}[/] — {p.get('reason')}")
     else:
         vt = Table(title="viable placements", title_style="bold")
-        for col in ("TP", "QUANT", "GB/GPU", "KV-CEILING CTX"):
+        for col in ("TP/GPUs", "QUANT", "GB/GPU", "KV-CEILING CTX"):
             vt.add_column(col)
         for v in pl["viable"]:
-            vt.add_row(str(v["tp"]), str(v.get("quant")), str(v.get("per_gpu_gb")), str(v.get("kv_ceiling_ctx")))
+            # vLLM placements carry "tp"; llamacpp layer-split ones carry "gpu_count".
+            span = v.get("tp") if v.get("tp") is not None else f"{v.get('gpu_count', '?')}×layer-split"
+            vt.add_row(str(span), str(v.get("quant")), str(v.get("per_gpu_gb")), str(v.get("kv_ceiling_ctx")))
         console.print(vt)
         if pl["pruned"]:
             console.print("[dim]pruned:[/]")
@@ -1294,18 +1297,24 @@ _KNOB_LABEL = {"tp": "TP", "max_model_len": "MML", "gpu_memory_util": "GMU",
                "threads": "THREADS", "parallel": "PAR", "n_gpu_layers": "NGL", "n_cpu_moe": "NCMOE"}
 
 
-def _render_sweep_results(results, winner, use_case) -> None:
-    """Compact table of the benched points showing only the knobs that VARIED across the
-    sweep (so it's obvious what differed), plus peak/single/KV, with the winner marked and
-    the pick basis spelled out. Backend-agnostic (vLLM tp/gmu/seqs, llama.cpp threads/parallel)."""
-    pts = [r for r in results if r.get("point")]
-    if len(pts) < 2:
-        return
+def _varying_knobs(results) -> list[str]:
+    """The knob keys that VARIED across these benched points (so tables/pickers show
+    only what differed). Backend-agnostic (vLLM tp/gmu/seqs, llama.cpp threads/parallel)."""
     keys = ["tp", "threads", "parallel", "n_gpu_layers", "n_cpu_moe", "gpu_memory_util",
             "max_num_seqs", "max_num_batched_tokens", "kv_cache_dtype", "max_model_len"]
-    varying = [k for k in keys if len({(r.get("point") or {}).get(k) for r in pts}) > 1]
-    if not varying:
-        varying = ["max_num_seqs"]
+    varying = [k for k in keys if len({(r.get("point") or {}).get(k) for r in results}) > 1]
+    return varying or ["max_num_seqs"]
+
+
+def _render_sweep_results(results, winner, use_case) -> list:
+    """Compact table of the benched points showing only the knobs that varied, plus
+    peak/single/KV, with the winner marked and the pick basis spelled out. Returns the
+    ok results in row order (the seat picker's index space)."""
+    ok_rows = [r for r in results if r.get("ok")]
+    pts = [r for r in results if r.get("point")]
+    if len(pts) < 2:
+        return ok_rows
+    varying = _varying_knobs(pts)
 
     t = Table(title="sweep results", title_style="dim", title_justify="left", pad_edge=False)
     t.add_column("")
@@ -1328,6 +1337,39 @@ def _render_sweep_results(results, winner, use_case) -> None:
              "context": "largest context · ties (≤5%) tipped by >15% peak"}.get(
                  use_case, "highest peak throughput · ties (≤5%) tipped by >15% single")
     console.print(f"  [dim]winner basis ({use_case or 'throughput'}): {basis}[/]")
+    return ok_rows
+
+
+def _pick_seats(results, winner, use_case, state) -> list | None:
+    """End-of-sweep seat picker: after the sweep table, open a checkbox picker (↑/↓ move,
+    space toggle, enter accept — same TUI as `up`'s placement picker) over the benched
+    seats, so e.g. the best tp=1/tp=2 runs can be kept alongside the tp=4 winner. The
+    winner starts selected; cancel or an empty pick → pipeline default (winner only)."""
+    from .external import picker as _pk
+
+    ok_rows = _render_sweep_results(results, winner, use_case)
+    state["rendered"] = True
+    if len(ok_rows) < 2:
+        return None  # nothing to choose between — pipeline writes the winner
+    varying = _varying_knobs(ok_rows)
+    pts = [r.get("point") or {} for r in ok_rows]
+    widths = {k: max(len(str(p.get(k))) for p in pts) for k in varying}
+
+    def _line(r):
+        p = r.get("point") or {}
+        knobs = " ".join(f"{_KNOB_LABEL.get(k, k)}={str(p.get(k)).ljust(widths[k])}" for k in varying)
+        kv = r.get("kv_cache_tokens")
+        perf = f"peak {r.get('peak_tok_s')} · single {r.get('single_tok_s')} tok/s"
+        if kv:
+            perf += f" · KV {kv/1e6:.2f}M"
+        return f"{knobs}  {perf}" + ("  [green]✓ winner[/]" if r is winner else "")
+
+    pre = {ok_rows.index(winner)} if winner in ok_rows else set()
+    idxs = _pk.multi_select(ok_rows, render=_line, title="write launchers (placements) for which seats?",
+                            preselected=pre)
+    if not idxs:
+        return None  # cancelled or emptied — pipeline writes the winner only
+    return [ok_rows[i] for i in idxs]
 
 
 def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes,
@@ -1360,15 +1402,28 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
         _render_plan(pl)
         if not pl["points"]:
             raise typer.Exit(code=1)
+        # --resume: points already benched into state.json replay from cache — only ask
+        # the launch question about the ones that will really load a model.
+        cached = pipeline.cached_count(pl["model_id"], pl["points"]) if resume else 0
+        n_new = len(pl["points"]) - cached
         where = "CPU" if pl.get("device") == "cpu" else "GPU"
-        if not typer.confirm(f"Launch {len(pl['points'])} {where} tuning seat(s)? (each is a real load + bench)"):
+        if n_new == 0:
+            console.print(f"[dim]all {len(pl['points'])} point(s) already benched — replaying from cache, no launches.[/]")
+        elif not typer.confirm(f"Launch {n_new} {where} tuning seat(s)?"
+                               + (f" ({cached} more replay from cache)" if cached else "")
+                               + " (each is a real load + bench)"):
             raise typer.Exit(code=1)
 
     prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
+    # End-of-sweep seat picker: interactive terminals get to choose which benched seats
+    # become launchers (registry placements); --yes/--json/non-tty keep winner-only.
+    sel = {"rendered": False}
+    picker = (None if (json_output or yes or not _sys.stdin.isatty())
+              else (lambda results, winner: _pick_seats(results, winner, use_case, sel)))
     try:
         res = pipeline.run(model, use_case=use_case, bench=bench, resume=resume, max_points=max_points,
                            progress=prog, device=device, embeddings=embeddings, tp=tp,
-                           kv_dtypes=kv_dtypes, mml_override=mml)
+                           kv_dtypes=kv_dtypes, mml_override=mml, select=picker)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -1377,7 +1432,8 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
     if res.get("error"):
         err.print(f"[red]{res['error']}[/]")
         raise typer.Exit(code=1)
-    _render_sweep_results(res.get("results") or [], res.get("winner"), use_case)
+    if not sel["rendered"]:
+        _render_sweep_results(res.get("results") or [], res.get("winner"), use_case)
     w = res.get("winner")
     if w:
         wp = w["point"]
@@ -1388,7 +1444,13 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
                  ("mml", "max_model_len")]
         shown = " · ".join(f"{label}={wp.get(key)}" for label, key in knobs if wp.get(key) is not None)
         console.print(f"[green]✓ winner[/] {shown} → peak {w.get('peak_tok_s')} · single {w.get('single_tok_s')} tok/s")
-        console.print(f"  wrote placement [bold]{res['placement_id']}[/] to the registry")
+        pids = res.get("placement_ids") or ([res["placement_id"]] if res.get("placement_id") else [])
+        if len(pids) == 1:
+            console.print(f"  wrote placement [bold]{pids[0]}[/] to the registry")
+        else:
+            console.print(f"  wrote {len(pids)} placements to the registry:")
+            for pid in pids:
+                console.print(f"    [bold]{pid}[/]")
     else:
         console.print("[yellow]no winning config[/] (all points failed — see the report)")
     console.print(f"  report: {res['report']}  ·  bench: {res['bench']}")
@@ -1408,7 +1470,7 @@ def induct(
     plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
+    yes: bool = typer.Option(False, "--yes", help="Skip prompts (pre-sweep confirmation + end-of-sweep seat picker; writes the winner only)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
@@ -1427,7 +1489,7 @@ def tune(
     mml: int = typer.Option(None, "--mml", help="Force max_model_len (capped at the VRAM ceiling for the KV dtype)."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the pre-sweep confirmation."),
+    yes: bool = typer.Option(False, "--yes", help="Skip prompts (pre-sweep confirmation + end-of-sweep seat picker; writes the winner only)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Re-tune an existing model (induction, tuning-only). A focused alias for `induct`
@@ -1436,8 +1498,124 @@ def tune(
                 json_output, kv, sweep_kv, mml)
 
 
+@app.command(rich_help_panel=_P_MODELS)
+def bench(
+    target: str = typer.Argument(None, help="Model id or placement id (exact or unique substring). Omit to pick from the registry."),
+    suite: str = typer.Option("perf,arc", "--suite", help="Comma-separated suites: perf (throughput/single-stream bench — refreshes the placement's perf numbers) · arc (ARC-Challenge CoT accuracy; needs the optional eval deps: `pipx inject johnny-fleet openai datasets`). Planned: humaneval, needle."),
+    limit: int = typer.Option(None, "--limit", help="arc: only the first N questions — a quick smoke. The full set is 1172 CoT questions (an hour-ish on a mid-size seat)."),
+    concurrency: int = typer.Option(8, "--concurrency", help="arc: parallel requests against the seat."),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="arc: leave model thinking on. Default off — reasoning models score ~0 when the answer drowns in an unclosed think block."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the temp-seat launch confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Benchmark an inducted placement (quality + perf) and record the scores.
+
+    Reuses the placement's *running* seat when one matches (no relaunch); otherwise
+    launches a temporary tuning seat from the registry knobs and stops it after.
+
+    TARGET accepts a registry model id (its placement; picker if it has several) or a
+    placement id — exact or unique substring:
+
+      johnny bench Ornith-1.0-9B-AWQ-FP8
+
+      johnny bench induct-tp2-gmu0.92-seqs32-bt16384-mml262144
+
+      johnny bench tp2-gmu0.92 --suite arc --limit 100
+
+    Perf refreshes the placement's `perf`; quality lands under its `quality` block;
+    both plus a BENCH_REPORT.md under the runs dir. To re-tune knobs instead, see
+    `johnny tune`.
+    """
+    from . import bench as B
+    from .engine import load_config as _load_cfg
+    from .registry import store
+
+    suites = [s.strip().lower() for s in suite.split(",") if s.strip()]
+    if not suites:
+        err.print("[red]--suite is empty[/] — available: " + ", ".join(B.SUITES))
+        raise typer.Exit(code=1)
+    for s in suites:
+        if s in B.PLANNED:
+            err.print(f"[yellow]suite '{s}' isn't wired yet[/] — {B.PLANNED[s]}.")
+            raise typer.Exit(code=1)
+        if s not in B.SUITES:
+            err.print(f"[red]unknown suite '{s}'[/] — available: {', '.join(B.SUITES)}; planned: {', '.join(B.PLANNED)}.")
+            raise typer.Exit(code=1)
+
+    reg = store.load()
+    if target:
+        cands = B.resolve_target(reg, target)
+    else:
+        if json_output:
+            _emit_err(ValueError("`bench` needs a model or placement id with --json (the picker needs a TTY)"), True)
+        cands = [(mid, p) for mid, m in sorted(store.models(reg).items())
+                 for p in (m.get("placements") or [])]
+    if not cands:
+        err.print(f"[red]'{target}' matches no model or placement[/] — ids: `johnny registry show`; "
+                  "create one: `johnny induct <model>`.")
+        raise typer.Exit(code=1)
+    if len(cands) == 1:
+        model_id, placement = cands[0]
+    else:
+        if json_output:
+            _emit_err(ValueError(f"'{target}' is ambiguous ({len(cands)} placements) — pass a placement id"), True)
+        from .external import picker as _pk
+
+        current, pins = _current_runtimes(), _running_pins()
+        items = [{"model": mid, "p": p, "current": current, "pins": pins} for mid, p in cands]
+        i = _pk.select(items, render=_render_pick, title="bench which placement?",
+                       hint="↑/↓ move · enter bench · q cancel")
+        if i is None:
+            console.print("[dim]cancelled.[/]")
+            raise typer.Exit(code=0)
+        model_id, placement = cands[i]
+
+    pid = placement.get("id")
+    cfg = _load_cfg()
+    if not yes and not json_output and B.find_running_seat(model_id, pid, cfg) is None:
+        console.print(f"[dim]no running seat matches {pid} — a temporary tuning seat will be "
+                      "launched (and stopped after).[/]")
+        if "arc" in suites and not limit:
+            console.print("[dim]full ARC-Challenge is 1172 CoT questions — `--limit 100` is a quick smoke.[/]")
+        if not typer.confirm(f"Bench {model_id} · {pid} ({', '.join(suites)})?"):
+            raise typer.Exit(code=1)
+
+    prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
+    try:
+        res = B.run(model_id, placement, suites, cfg=cfg, limit=limit, concurrency=concurrency,
+                    thinking=thinking, progress=prog)
+    except Exception as e:
+        _emit_err(e, json_output)
+    if json_output:
+        console.print(_json.dumps(res, indent=2, default=str))
+        return
+    if res.get("error"):
+        err.print(f"[red]{res['error']}[/]")
+        raise typer.Exit(code=1)
+    failed = False
+    for s in suites:
+        r = (res.get("results") or {}).get(s) or {}
+        if not r.get("ok"):
+            failed = True
+            console.print(f"[red]✗ {s}[/] — {r.get('error')}")
+        elif s == "perf":
+            kv = r.get("kv_cache_tokens")
+            console.print(f"[green]✓ perf[/] peak {r.get('peak_tok_s')} · single {r.get('single_tok_s')} tok/s"
+                          + (f" · KV {kv/1e6:.2f}M tok" if kv else ""))
+        elif s == "arc":
+            console.print(f"[green]✓ arc[/] ARC-Challenge {r.get('accuracy_pct')}% "
+                          f"({r.get('correct')}/{r.get('total')}"
+                          + (f", first {r['limit']}" if r.get("limit") else "") + ")")
+    if res.get("registry_updated"):
+        console.print(f"  [dim]scores recorded on [bold]{pid}[/bold] in the registry[/]")
+    console.print(f"  report: {res['report']}")
+    if failed:
+        raise typer.Exit(code=1)
+
+
 # --------------------------------------------------------------------------- discovery (P5)
-_VERDICT_STYLE = {"fits": "green", "tight": "yellow", "wont-fit": "red", "unknown": "dim"}
+_VERDICT_STYLE = {"fits": "green", "tight": "yellow", "offload": "yellow", "wont-fit": "red",
+                  "unknown": "dim", "inducted": "green"}
 
 
 def _dtype_cell(d: dict) -> str:
@@ -1456,7 +1634,7 @@ def search(
     query: str = typer.Argument(..., help="HF search query, or a base model id with --quants."),
     quants: bool = typer.Option(False, "--quants", "-q",
                                 help="List quantizations of QUERY (a base model id) with a dtype-fit verdict."),
-    limit: int = typer.Option(10, "--limit", help="Max results to return (default 10)."),
+    limit: int = typer.Option(50, "--limit", help="Max results to scan (default 50)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Search Hugging Face with a fit verdict for your hardware + capability badges.
@@ -1480,13 +1658,14 @@ def search(
             return
         t = Table(title=f"quantizations of {query}  ·  native dtypes: {', '.join(hw.native_dtypes) or '—'}",
                   title_style="bold")
-        for col in ("MODEL", "QUANT", "DTYPE", "SIZE", "FIT"):
+        for col in ("MODEL", "REG", "QUANT", "DTYPE", "SIZE", "FIT"):
             t.add_column(col)
         for r in res["results"]:
             v = r["fit"]
             verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
             label = r["id"] + ("  [dim](base)[/]" if r.get("base") else "")
-            t.add_row(label, str(r.get("quant") or "—"), _dtype_cell(r["dtype"]),
+            t.add_row(label, "[green]✓[/]" if r.get("inducted") else "",
+                      str(r.get("quant") or "—"), _dtype_cell(r["dtype"]),
                       f"{r['size_gb']}GB" if r["size_gb"] else "—",
                       f"{verdict} [dim]{v.get('detail', '')}[/]")
         console.print(t)
@@ -1501,29 +1680,55 @@ def search(
         console.print(_json.dumps(res, indent=2))
         return
     t = Table(title=f"HF search: {query}", title_style="bold")
-    for col in ("MODEL", "DOWNLOADS", "GATED", "SIZE", "DTYPE", "FIT", "BADGES"):
+    for col in ("MODEL", "REG", "DOWNLOADS", "GATED", "SIZE", "DTYPE", "FIT", "BADGES"):
         t.add_column(col)
     for r in res["results"]:
         v = r["fit"]
         verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
-        t.add_row(r["id"], str(r.get("downloads") or "—"), "🔒" if r["gated"] else "",
+        t.add_row(r["id"], "[green]✓[/]" if r.get("inducted") else "",
+                  str(r.get("downloads") or "—"), "🔒" if r["gated"] else "",
                   f"{r['size_gb']}GB" if r["size_gb"] else "—", _dtype_cell(r.get("dtype")),
                   f"{verdict} {v.get('detail', '')}", ", ".join(r["badges"]) or "—")
     console.print(t)
+    if any(r.get("inducted") for r in res["results"]):
+        console.print("[dim]REG ✓ = already inducted in the registry (`johnny registry show`)[/]")
 
 
 @app.command(rich_help_panel=_P_MODELS)
-def download(repo: str = typer.Argument(..., help="Hugging Face repo id to download."), json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
-    """Download a model into the models dir (gated models need `johnny login`)."""
+def download(
+    repo: str = typer.Argument(..., help="Hugging Face repo id to download."),
+    quant: str = typer.Option(None, "--quant", "-q", help="GGUF quant/variant to download (e.g. UD-Q4_K_XL); default: best fit for this hardware."),
+    include: list[str] = typer.Option(None, "--include", help="Only download files matching this glob (repeatable; overrides --quant)."),
+    all_files: bool = typer.Option(False, "--all", help="Download the entire repo, every quant included."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be downloaded and stop."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Download a model into the models dir (gated models need `johnny login`).
+
+    Multi-quant GGUF repos download a single variant — the best fit for this
+    hardware, or the one named with --quant — never the whole multi-TB repo
+    unless --all is given. Refuses downloads that won't fit on disk."""
     from .discover import search as dsearch
+    from .hardware import detect as hwdetect
 
     cfg = C.load_yaml(C.get_paths().config_file) or {}
     models_dir = (cfg.get("roots") or {}).get("models_dir")
     if not models_dir:
         err.print("[red]no models_dir in config[/] — run `johnny init`.")
         raise typer.Exit(code=1)
-    console.print(f"[dim]downloading {repo} → {models_dir}/{repo} … (large; ^C to abort)[/]")
-    res = dsearch.acquire(repo, models_dir)
+    kw = dict(variant=quant, include=list(include) if include else None,
+              all_files=all_files, hardware=hwdetect.detect())
+    plan = dsearch.acquire(repo, models_dir, dry_run=True, **kw)
+    if plan.get("error"):
+        err.print(f"[red]{plan['error']}[/]")
+        raise typer.Exit(code=1)
+    what = f"{repo} [bold]{plan['variant']}[/]" if plan.get("variant") else repo
+    console.print(f"[dim]downloading {what} → {models_dir}/{repo} — "
+                  f"~{plan['download_gb']} GB to fetch ({plan['files']} files), {plan['free_gb']} GB free (^C to abort)[/]")
+    if dry_run:
+        console.print(_json.dumps(plan, indent=2) if json_output else "[yellow]dry run — nothing downloaded.[/]")
+        return
+    res = dsearch.acquire(repo, models_dir, **kw)
     if res.get("error"):
         err.print(f"[red]{res['error']}[/]")
         raise typer.Exit(code=1)
@@ -2155,9 +2360,7 @@ def tui() -> None:
 
 
 # --------------------------------------------------------------------------- future stubs
-_FUTURE = {
-    "bench": "P4",  # quality-eval harness orchestration (heavy/opt-in); wired via `induct --bench`
-}
+_FUTURE: dict[str, str] = {}
 
 
 def _make_stub(name: str, phase: str):
