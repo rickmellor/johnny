@@ -801,6 +801,63 @@ Beyond the foundation, designed *toward* so we don't paint ourselves into a corn
 - **Full cross-OS / cloud reach.** The hardest portability (Windows-native paths, cloud GPU
   rentals as just another node). The abstractions (hardware, backends, registry, telemetry,
   agents) are deliberately not vLLM- or Linux-locked, so this stays open.
+- **Replica seats (same model, N instances).** `johnny up` and `profile up` both dedupe
+  by model name, so a data-parallel fleet — e.g. 4× gemma-4-12B TP=1, one per R9700,
+  ports 8000-8003, the layout that beat TP=2/TP=4 aggregate throughput on 2026-07-17 —
+  cannot be expressed: all four profile entries resolved "exists" onto one seat. Seats
+  should key on (model, port) or an instance id, not model alone. Until then the
+  workaround is docker-cloning the johnny seat with its naming convention
+  (status/logs pick the clones up; reaper/telemetry/profile-reconstruct do not) — see
+  profile `12b-quad` in profiles.yaml for the intended shape.
+- **Smoke-eval tier for induction (`--smoke`), between tuning-only and full `--bench`.**
+  A ~17-item objectively-scored battery (math word problems with exact-answer extraction,
+  code gen *executed* against asserts, instruction-following checked mechanically —
+  JSON-only/word-count/bullet-count, factual recall, needle-in-4k-haystack) runs in
+  ~1–2 min per model at temperature 0 against a live seat — vs the heavy dataset-pulling
+  `--bench` harness. Use it as the default quality gate on induction (catch broken
+  parsers/templates/quants immediately); keep `--bench` opt-in for real model-vs-model
+  discrimination, since parity on the smoke battery is a competence floor, not a ranking.
+  Working prototype (validated 2026-07-17 comparing gemma-4-12B FP8 vs 26B-A4B FP8 — both
+  17/17): `scratch/quality_smoke_eval.py`. Two lessons baked in from that run: give
+  reasoning models ≥1500 max_tokens or scores are truncation artifacts (first run
+  "failed" 4 tasks at 400 tokens, all mid-derivation clips), and score from raw content
+  with regex extraction, not parsed fields. Guard the module-level battery execution
+  under `__main__` before reuse (importing it re-runs everything).
+- **Induction never stamps `validated_at`.** A fresh induct writes perf numbers +
+  validation_key but leaves `validated_at: null`, so `registry validate` immediately
+  reports the brand-new placement as "stale" on the re-tune worklist (seen 2026-07-17 on
+  gemma-4-12B-it-FP8-Dynamic, minutes after a successful sweep + verified launch; several
+  older placements show the same null). Either stamp on sweep completion or on first
+  successful `up` probe. Also: placements record `image: null` even when induction ran on
+  a non-default image (the temporary config bump) — the resolved image should be baked
+  into the placement so a config revert can't strand it on an incompatible runtime.
+- **Search: warn on fuzzy family mismatch.** `johnny search "gemma 4 9b"` silently returned
+  Gemma **2** 9B community quants (HF fuzzy match; Gemma 4 has no 9B — the family is
+  E2B/E4B/12B/26B-A4B/31B), steering model selection toward stale int4/GGUF leftovers.
+  When results' base-family tags don't match the query's family/version tokens, flag it
+  ("no gemma-4 9B exists; nearest family sizes: 12B, 26B-A4B") instead of presenting
+  look-alikes as answers. (Found 2026-07-17.)
+- **Search `--quants`: don't rely solely on HF model-tree links.** `--quants
+  google/gemma-4-12B-it` missed every FP8 repo (incl. RedHatAI/gemma-4-12B-it-FP8-Dynamic,
+  25k downloads — the preferred dtype on this box's RDNA4) while finding w4a16/AWQ/GGUF;
+  quants not tagged as children of the base are invisible to tree-walking. Supplement with
+  a name-pattern HF search (`<base-name> FP8|AWQ|GPTQ|w4a16|GGUF`) and merge/dedupe, so
+  the dtype-fit verdict actually covers the natively-accelerated options. (Found
+  2026-07-17.)
+- **MoE kernel tuning in induction (`benchmark_moe.py`).** vLLM's fused-MoE Triton kernel
+  reads per-(E, N, dtype, device) config JSONs; nothing ships tuned for R9700
+  (gfx1201), so MoE models run on generic defaults (vLLM warns "Using default MoE
+  config" at load — that warning is the detection signal, or check `config.json` for
+  `num_experts`). Induction should run the offline tuner
+  (`/app/vllm/benchmarks/kernels/benchmark_moe.py --model … --tp-size … --dtype … --tune`,
+  in-container, GPUs otherwise idle, ~30 min–2 h, Ray-parallel across GPUs) **before**
+  the serving-param sweep (§3.6 step 4), since kernel perf shifts that sweep's optimum.
+  Gotchas: N is the per-GPU expert shard, so each TP degree needs its own tuning run;
+  cache the JSONs host-side keyed by image tag (re-tune on image bump — moot while
+  pinned to 0.20.2) and mount via `-e VLLM_TUNED_CONFIG_FOLDER=/tuned-configs` — no
+  image rebuild. Dense models skip the step entirely. Typical win: 20–50% on the
+  expert GEMMs, the dominant kernel for MoE. (Found 2026-07-16 on the
+  gemma-4-26B-A4B FP8 seats.)
 
 ---
 
