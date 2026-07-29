@@ -18,9 +18,13 @@ Entry points:
 - placement_view(p, current)  -> flat dict for the fixed-column table / picker line
 - retune_worklist(reg, current) -> placements that need real numbers (`johnny tune`)
 - current_runtimes(cfg)       -> {backend: current launch image} for staleness checks
+- identity_gaps(mid, m, models_dir) -> derivable identity fills (params / quant)
 """
 
 from __future__ import annotations
+
+import re
+from pathlib import Path
 
 # Derived, never stored blindly (see the module docstring on why status is computed on
 # read rather than stamped): a stored status is exactly the kind of field that drifts.
@@ -224,6 +228,73 @@ def normalization_changes(raw: dict) -> list[str]:
         changes.append("validated_at → null (add placeholder)")
 
     return changes
+
+
+# --------------------------------------------------------------------------- identity
+# '…-30B-A3B-…' ids name total and active params outright; '…-397B-…' just the total.
+_MOE_PARAMS_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)B-A(\d+(?:\.\d+)?)B(?![A-Za-z0-9])", re.I)
+_DENSE_PARAMS_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)B(?![A-Za-z0-9])", re.I)
+# GGUF quant labels (incl. unsloth's UD- dynamic prefix) and safetensors dtype tokens.
+_QUANT_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:UD-)?IQ\d_[A-Z0-9]+|(?:UD-)?Q\d(?:_[A-Z0-9]+)+"
+    r"|MXFP4|NVFP4|BF16|FP16|F16|FP8|INT[48]|AWQ|GPTQ)(?![A-Za-z0-9])", re.I)
+
+
+def _params_from_names(names: list[str]) -> str | None:
+    """'26B-A4B' / '397B' when a name states it. MoE checked across every name before
+    the dense fallback, so 'gemma-4-26b' (id) still reads 26B-A4B off its local_path."""
+    for rx, fmt in ((_MOE_PARAMS_RE, lambda m: f"{m.group(1)}B-A{m.group(2)}B"),
+                    (_DENSE_PARAMS_RE, lambda m: f"{m.group(1)}B")):
+        for s in names:
+            m = rx.search(str(s))
+            if m:
+                return fmt(m).upper()
+    return None
+
+
+def _quant_from_names(names: list[str]) -> str | None:
+    for s in names:
+        m = _QUANT_RE.search(str(s))
+        if m:
+            tok = m.group(1)
+            # GGUF quant labels are conventionally upper (IQ3_XXS); dtype tokens lower (fp8).
+            return tok.upper() if re.match(r"(?i)(UD-)?I?Q\d", tok) else tok.lower()
+    return None
+
+
+def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict:
+    """Derivable fills for a model's identity — {field: value} for params/quant that are
+    currently empty. Sources, in trust order: the GGUF header (general.size_label; needs
+    the weights on disk under models_dir), then the naming conventions above across
+    local_path / model id / repo_id. Nothing is invented beyond an explicit token in a
+    name or header — an underivable field stays empty. Never overwrites a set value."""
+    ident = m.get("identity") or {}
+    names = [s for s in (ident.get("local_path"), model_id, ident.get("repo_id")) if s]
+    need_params, need_quant = not ident.get("params"), not ident.get("quant")
+
+    meta: dict = {}
+    lp = ident.get("local_path")
+    if (need_params or need_quant) and models_dir and lp and str(lp).endswith(".gguf"):
+        p = Path(models_dir).expanduser() / lp
+        if p.exists():
+            try:
+                from ..backends.llamacpp import _gguf_metadata
+
+                meta = _gguf_metadata(p) or {}
+            except Exception:
+                meta = {}
+
+    gaps: dict = {}
+    if need_params:
+        v = meta.get("size_label") or _params_from_names(names)
+        if v:
+            gaps["params"] = str(v)
+    if need_quant:
+        header_quant = meta.get("quant") if isinstance(meta.get("quant"), str) else None
+        v = _quant_from_names(names) or header_quant
+        if v:
+            gaps["quant"] = v
+    return gaps
 
 
 def retune_worklist(reg: dict, current: dict | None = None) -> list[dict]:

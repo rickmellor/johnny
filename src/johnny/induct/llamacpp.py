@@ -32,27 +32,69 @@ _SHARD_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d+)-of-(?P<tot>\d+)\.gguf$")
 
 
 # --- discovery ---------------------------------------------------------------
+def _gguf_stem(p: Path) -> str:
+    """Variant stem of a GGUF file: the filename minus any -NNNNN-of-NNNNN split."""
+    m = _SHARD_RE.match(p.name)
+    return m.group("base") if m else p.stem
+
+
+def _dir_ref(d: Path) -> tuple[str, str] | None:
+    """Resolve a directory ref (repo root or quant subdir) to the GGUF inside.
+    Exactly one variant → (stem, first-shard path). Several (`download` fetches
+    one, but a repo accreted by hand can hold many) → interactive picker, or an
+    error naming them when there's no TTY to ask. No GGUFs → None, so non-GGUF
+    dirs fall through to the vLLM path."""
+    if not d.is_dir():
+        return None
+    variants: dict[str, Path] = {}
+    sizes: dict[str, int] = {}
+    for f in sorted(d.rglob("*.gguf")):
+        stem = _gguf_stem(f)
+        variants.setdefault(stem, f)  # sorted → shard -00001 wins
+        sizes[stem] = sizes.get(stem, 0) + f.stat().st_size
+    if not variants:
+        return None
+    if len(variants) > 1:
+        from ..external import picker
+
+        order = sorted(variants, key=lambda s: sizes[s])
+        idx = picker.select(
+            order, lambda s: f"{s}  [dim]{sizes[s] / 1e9:.1f} GB[/]",
+            title=f"{len(order)} GGUF variants in {d.name} — induct which?",
+        ) if picker._interactive_capable() else None
+        if idx is None:
+            raise FileNotFoundError(
+                f"{len(variants)} GGUF variants under {d}: {', '.join(order)} "
+                "— pass the variant's subdirectory or a .gguf path")
+        stem = order[idx]
+        return stem, str(variants[stem].resolve())
+    stem, f = variants.popitem()
+    return stem, str(f.resolve())
+
+
 def gguf_ref(model_ref: str, cfg: dict) -> tuple[str, str] | None:
     """(model_id, gguf_path) if model_ref points at a GGUF, else None.
 
-    Accepts: a direct .gguf path, a .gguf under models_dir, or a registry model id
-    whose identity.local_path is a .gguf / that has a llamacpp placement.
+    Accepts: a direct .gguf path, a .gguf under models_dir, a directory (absolute
+    or under models_dir — e.g. the 'vendor/repo' a `johnny download` produced,
+    where the GGUF sits in a quant subdir), or a registry model id whose
+    identity.local_path is a .gguf / that has a llamacpp placement.
     """
     md = (cfg.get("roots") or {}).get("models_dir")
 
-    def _mid(p: Path) -> str:
-        name = p.name
-        m = _SHARD_RE.match(name)
-        stem = m.group("base") if m else p.stem
-        return stem
-
     p = Path(model_ref).expanduser()
     if p.suffix == ".gguf" and p.exists():
-        return _mid(p), str(p.resolve())
+        return _gguf_stem(p), str(p.resolve())
+    hit = _dir_ref(p)
+    if hit:
+        return hit
     if md:
         cand = Path(md).expanduser() / model_ref
         if cand.suffix == ".gguf" and cand.exists():
-            return _mid(cand), str(cand.resolve())
+            return _gguf_stem(cand), str(cand.resolve())
+        hit = _dir_ref(cand)
+        if hit:
+            return hit
 
     reg = store.load()
     m = (reg.get("models") or {}).get(model_ref)
@@ -271,12 +313,53 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
     return result
 
 
+# --- memory split ------------------------------------------------------------
+def _split_tensors(tensors, override_tensor: str | None, n_cpu_moe) -> tuple[int, int]:
+    """(vram bytes, ram bytes) over [(name, bytes)] for an offload config: -ot
+    'regex=CPU' sends matching tensors to RAM; -ncmoe N sends the first N layers'
+    routed-expert FFNs. Everything else lands on GPU (ngl 999 placements)."""
+    pat = re.compile(override_tensor.split("=", 1)[0]) if override_tensor else None
+    ncmoe = int(n_cpu_moe or 0)
+    vram = ram = 0
+    for name, nbytes in tensors:
+        to_cpu = bool(pat and pat.search(name))
+        if not to_cpu and ncmoe:
+            m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.", name)
+            to_cpu = bool(m and int(m.group(1)) < ncmoe)
+        if to_cpu:
+            ram += nbytes
+        else:
+            vram += nbytes
+    return vram, ram
+
+
+def weight_split(gguf_path: str, override_tensor: str | None = None, n_cpu_moe=None) -> dict | None:
+    """{'vram_gb', 'ram_gb'} weight placement for an offload config, from the
+    GGUF tensor table across all shards. None when the file can't be parsed.
+    Weights only — KV cache and compute buffers land on top of the VRAM side."""
+    from ..backends.llamacpp import gguf_tensors
+
+    p = Path(gguf_path)
+    m = _SHARD_RE.match(p.name)
+    shards = sorted(p.parent.glob(f"{m.group('base')}-*-of-{m.group('tot')}.gguf")) if m else [p]
+    tensors = [t for s in shards for t in gguf_tensors(s)]
+    if not tensors:
+        return None
+    vram, ram = _split_tensors(tensors, override_tensor, n_cpu_moe)
+    return {"vram_gb": round(vram / 1024**3, 1), "ram_gb": round(ram / 1024**3, 1)}
+
+
 # --- placement ---------------------------------------------------------------
-def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtime_version: str, use_case: str | None) -> dict:
+def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtime_version: str, use_case: str | None,
+                 gguf_path: str | None = None) -> dict:
     p = winner["point"]
     is_cpu = p.get("device") == "cpu"
+    mem = weight_split(gguf_path, p.get("override_tensor"), p.get("n_cpu_moe")) if gguf_path else None
+    if mem and is_cpu:
+        mem = {"vram_gb": 0.0, "ram_gb": round(mem["vram_gb"] + mem["ram_gb"], 1)}
     return {
         "id": f"induct-{_point_sig(p)}",
+        **({"mem": mem} if mem else {}),
         "backend": "llamacpp",
         "image": (load_config().get("docker") or {}).get("llamacpp_image"),
         "use_case": use_case,
@@ -441,7 +524,8 @@ def run(model_id: str, gguf_path: str, use_case: str | None = None, max_points: 
             lp = None
         for r in chosen:
             # Only the winner carries the use-case tag (see pipeline.run).
-            placement = to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None)
+            placement = to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None,
+                                     gguf_path=gguf_path)
             report.write_placement(model_id, a, placement, hw, local_path=lp)
             placements.append(placement)
             if r is winner:

@@ -48,25 +48,94 @@ def _gguf_variant(rfilename: str) -> str:
     return re.sub(r"-\d{5}-of-\d{5}$", "", stem)
 
 
-def _repo_size_bytes(api, repo: str, token: str | None) -> tuple[int, dict[str, int]]:
-    """(total weight bytes, gguf variant -> bytes). GGUF presence routes the fit
-    verdict to the llamacpp path (VRAM+RAM), even when the repo id names no quant
-    token. Multi-quant GGUF repos host every quant level side by side, so the fit
-    must judge one downloadable variant — never the sum of all of them."""
+# '…-30B-A3B-…' style ids name total and active params outright.
+_AB_RE = re.compile(r"(\d+(?:\.\d+)?)b[-_]a(\d+(?:\.\d+)?)b", re.IGNORECASE)
+
+
+def _params_from_id(repo: str) -> tuple[int | None, int | None]:
+    m = _AB_RE.search(repo)
+    if not m:
+        return None, None
+    return int(float(m.group(1)) * 1e9), int(float(m.group(2)) * 1e9)
+
+
+def _active_params(total: int, cfg: dict) -> int | None:
+    """Params live per token, for the common routed-MoE decoder shape (DeepSeek/
+    GLM/Qwen style): total minus the routed experts NOT selected — attention,
+    embeddings, shared experts and dense layers always run. A dense config →
+    total; None when the config lacks the fields for the subtraction.
+    (Checks out within ~2% on DeepSeek-V3 671B→37B and Qwen3 30B→3.3B.)"""
+    if not cfg:
+        return None
+    experts = next((cfg[k] for k in ("n_routed_experts", "num_routed_experts",
+                                     "num_local_experts", "num_experts") if cfg.get(k)), None)
+    if not experts:
+        return total
+    top_k = cfg.get("num_experts_per_tok") or cfg.get("moe_top_k")
+    layers, hidden = cfg.get("num_hidden_layers"), cfg.get("hidden_size")
+    moe_int = cfg.get("moe_intermediate_size")
+    if not (top_k and layers and hidden and moe_int):
+        return None
+    dense = cfg.get("first_k_dense_replace") or 0
+    step = cfg.get("decoder_sparse_step") or 1
+    moe_layers = max(0, layers - dense) // step
+    # gated MLP: gate+up+down = 3 matrices per expert
+    inactive = moe_layers * (experts - top_k) * 3 * hidden * moe_int
+    return max(0, total - inactive) or None
+
+
+def _fetch_config(repo: str, token: str | None) -> dict:
+    try:
+        import json
+
+        from huggingface_hub import hf_hub_download
+        with open(hf_hub_download(repo, "config.json", token=token)) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _repo_stats(api, repo: str, token: str | None) -> tuple[int, dict[str, int], int | None, int | None]:
+    """(total weight bytes, gguf variant -> bytes, total params, active params).
+
+    GGUF presence routes the fit verdict to the llamacpp path (VRAM+RAM), even
+    when the repo id names no quant token. Multi-quant GGUF repos host every
+    quant level side by side, so the fit must judge one downloadable variant —
+    never the sum of all of them.
+
+    Param counts ride the same model_info call (safetensors/gguf metadata);
+    active params need config.json (MoE expert math) — the repo's own, else its
+    card-declared base_model's (quant/GGUF repos rarely ship one), else an
+    id-pattern ('…-30B-A3B-…'). Either may be None when nothing states it."""
     try:
         info = api.model_info(repo, files_metadata=True, token=token)
     except Exception:
-        return 0, {}
+        return 0, {}, None, None
     total, variants = 0, {}
+    has_config = False
     for s in getattr(info, "siblings", []) or []:
         name = (s.rfilename or "").lower()
+        has_config = has_config or name == "config.json"
         size = getattr(s, "size", None)
         if size and name.endswith((".safetensors", ".bin", ".gguf", ".pt")):
             total += size
             if name.endswith(".gguf"):
                 key = _gguf_variant(s.rfilename)
                 variants[key] = variants.get(key, 0) + size
-    return total, variants
+    st = getattr(info, "safetensors", None)
+    id_total, id_active = _params_from_id(repo)
+    params = getattr(st, "total", None) or (getattr(info, "gguf", None) or {}).get("total") or id_total
+    active = None
+    if params and has_config:
+        active = _active_params(params, _fetch_config(repo, token))
+    if params and active is None:
+        base = getattr(getattr(info, "card_data", None), "base_model", None)
+        base = base[0] if isinstance(base, list) and base else base
+        if isinstance(base, str) and "/" in base:
+            active = _active_params(params, _fetch_config(base, token))
+    if params and active is None:
+        active = id_active
+    return total, variants, params, active
 
 
 # fits and tight are one class — both run fully on GPU, so the larger quant wins.
@@ -180,11 +249,11 @@ def search(query: str, hardware, limit: int = 50) -> dict:
     except Exception as e:
         return {"error": f"HF search failed: {e}"}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        sizes = list(pool.map(lambda m: _repo_size_bytes(api, m.id, token), models))
+        stats = list(pool.map(lambda m: _repo_stats(api, m.id, token), models))
     reg = _load_registry()
     inducted = _registry_repo_keys(reg)
     results = []
-    for m, (total, gguf_variants) in zip(models, sizes):
+    for m, (total, gguf_variants, params, active) in zip(models, stats):
         tags = [str(t).lower() for t in (getattr(m, "tags", None) or [])]
         badges = [name for name, fn in _BADGES if fn(tags)]
         quant = _quant_from_id(m.id) or ("gguf" if gguf_variants else None)
@@ -202,6 +271,8 @@ def search(query: str, hardware, limit: int = 50) -> dict:
             "quant": quant,
             "dtype": fit.dtype_fit(quant, hardware),
             "size_gb": round(size / 1e9, 1) if size else None,
+            "params": params,
+            "active_params": active,
             "fit": verdict,
         })
     seen = {r["id"].lower() for r in results}
@@ -211,7 +282,7 @@ def search(query: str, hardware, limit: int = 50) -> dict:
 
 def _quant_row(api, repo: str, hardware, token: str | None, base: bool = False,
                inducted: set[str] | None = None) -> dict:
-    size, gguf_variants = _repo_size_bytes(api, repo, token)
+    size, gguf_variants, params, active = _repo_stats(api, repo, token)
     quant = _quant_from_id(repo) or ("gguf" if gguf_variants else None)
     if gguf_variants:
         size, verdict = _gguf_best_fit(gguf_variants, hardware)
@@ -224,6 +295,8 @@ def _quant_row(api, repo: str, hardware, token: str | None, base: bool = False,
         "quant": quant or ("—" if base else None),
         "dtype": fit.dtype_fit(quant, hardware),
         "size_gb": round(size / 1e9, 1) if size else None,
+        "params": params,
+        "active_params": active,
         "fit": verdict,
     }
 

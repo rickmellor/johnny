@@ -104,6 +104,35 @@ def test_variant_patterns_match_both_layouts():
         assert not any(fnmatch.fnmatch(f, p) for p in pats + pats_dir), f
 
 
+def test_params_from_id_ab_notation():
+    assert search._params_from_id("unsloth/Qwen3-30B-A3B-GGUF") == (int(30e9), int(3e9))
+    assert search._params_from_id("google/gemma-4-26B-A4B-it") == (int(26e9), int(4e9))
+    assert search._params_from_id("zai-org/GLM-5.2") == (None, None)
+
+
+def test_active_params_deepseek_v3_shape():
+    cfg = {"n_routed_experts": 256, "num_experts_per_tok": 8, "num_hidden_layers": 61,
+           "hidden_size": 7168, "moe_intermediate_size": 2048, "first_k_dense_replace": 3}
+    active = search._active_params(int(671e9), cfg)
+    assert abs(active - 37e9) < 2e9  # real answer: 37B
+
+
+def test_active_params_qwen3_moe_shape():
+    cfg = {"num_experts": 128, "num_experts_per_tok": 8, "num_hidden_layers": 48,
+           "hidden_size": 2048, "moe_intermediate_size": 768}
+    active = search._active_params(int(30.5e9), cfg)
+    assert abs(active - 3.3e9) < 0.5e9  # 30B-A3B
+
+
+def test_active_params_dense_config_is_total():
+    assert search._active_params(int(27e9), {"num_hidden_layers": 62, "hidden_size": 5120}) == int(27e9)
+
+
+def test_active_params_unknown_on_empty_or_partial_config():
+    assert search._active_params(int(100e9), {}) is None
+    assert search._active_params(int(100e9), {"n_routed_experts": 64}) is None
+
+
 def _reg(*identities):
     return {"models": {f"m{i}": {"identity": ident} for i, ident in enumerate(identities)}}
 

@@ -178,7 +178,15 @@ class LlamaCppDriver(Driver):
             args += ["--n-cpu-moe", str(knobs["n_cpu_moe"])]
         ot = extra.get("override_tensor")
         if ot:
-            args += ["--override-tensor", ot, "--no-mmap"]
+            # mmap stays ON (llama.cpp default): CPU-offloaded expert tensors page
+            # in lazily via the OS cache, so the seat is ready after the VRAM upload
+            # (~1-2 min) instead of first copying 100+ GB into RSS single-threaded
+            # (10+ min on the 222 GB GLM quants), and a restart reuses the warm
+            # cache. Induction benches via llama-bench with mmap on, so serving now
+            # matches the measured config. First tokens after a cold start fault
+            # experts in from disk — brief warm-up, not a regression. Opt out
+            # per-placement with extra_flags: ["--no-mmap"].
+            args += ["--override-tensor", ot]
         if knobs.get("parallel"):
             args += ["--parallel", str(knobs["parallel"])]
         args += ["--metrics"]  # expose Prometheus /metrics
@@ -254,14 +262,17 @@ def _gpus_from_inspect(name: str) -> list[int]:
 
 
 # GGUF value type ids -> struct reader (see ggml gguf spec).
-def _gguf_metadata(path: Path) -> dict:
-    """Minimal GGUF header reader: returns arch/context/quant/experts/layers."""
+def _gguf_parse(path: Path, want_tensors: bool = False) -> tuple[int, dict, list[tuple[str, int]]]:
+    """(version, header KV, [(tensor name, ~bytes)]). Tensor sizes come from
+    offset deltas within the data section (infos are offset-ordered per spec),
+    so no ggml quant-type block-size table is needed; the ≤alignment padding
+    per tensor is noise at model scale."""
     with open(path, "rb") as f:
         magic = f.read(4)
         if magic != b"GGUF":
-            return {}
+            return 0, {}, []
         (ver,) = struct.unpack("<I", f.read(4))
-        struct.unpack("<Q", f.read(8))  # n_tensors
+        (n_tensors,) = struct.unpack("<Q", f.read(8))
         (n_kv,) = struct.unpack("<Q", f.read(8))
 
         def rstr() -> str:
@@ -309,6 +320,39 @@ def _gguf_metadata(path: Path) -> dict:
                 v = f"<array len={len(v)}>"
             kv[k] = v
 
+        tensors: list[tuple[str, int]] = []
+        if want_tensors:
+            infos = []
+            for _ in range(n_tensors):
+                name = rstr()
+                (nd,) = struct.unpack("<I", f.read(4))
+                f.read(8 * nd + 4)  # dims + ggml type — offsets carry the sizes
+                (off,) = struct.unpack("<Q", f.read(8))
+                infos.append((name, off))
+            align = kv.get("general.alignment") or 32
+            data_start = f.tell()
+            data_start += (-data_start) % align
+            data_len = path.stat().st_size - data_start
+            infos.sort(key=lambda x: x[1])
+            for i, (name, off) in enumerate(infos):
+                nxt = infos[i + 1][1] if i + 1 < len(infos) else data_len
+                tensors.append((name, max(0, nxt - off)))
+    return ver, kv, tensors
+
+
+def gguf_tensors(path: Path) -> list[tuple[str, int]]:
+    """[(tensor name, ~bytes)] for one GGUF file; [] on any parse trouble."""
+    try:
+        return _gguf_parse(path, want_tensors=True)[2]
+    except Exception:
+        return []
+
+
+def _gguf_metadata(path: Path) -> dict:
+    """Minimal GGUF header reader: returns arch/context/quant/experts/layers."""
+    ver, kv, _ = _gguf_parse(path)
+    if not kv:
+        return {}
     arch = kv.get("general.architecture")
     def g(suffix, default=None):
         return kv.get(f"{arch}.{suffix}", default) if arch else default

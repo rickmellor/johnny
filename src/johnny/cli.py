@@ -488,17 +488,26 @@ registry_app = typer.Typer(add_completion=False, help="Inspect / seed / validate
 app.add_typer(registry_app, name="registry", rich_help_panel=_P_MODELS)
 
 
+def _ident_params(ident: dict) -> str:
+    """identity.params as stored — a '284.33B'-style string or a raw count; '—' when unset."""
+    p = (ident or {}).get("params")
+    if not p:
+        return "[dim]—[/]"
+    return _fmt_b(p) if isinstance(p, (int, float)) else str(p)
+
+
 def _registry_compact_table(models: dict) -> Table:
     """Terse one-row-per-model index (shared by `registry show -c` and `up`'s picker)."""
     t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
-    for col in ("MODEL", "ARCH", "QUANT", "CTX", "#PL", "BACKENDS", "PATH"):
+    for col in ("MODEL", "ARCH", "PARAMS", "QUANT", "CTX", "#PL", "BACKENDS", "PATH"):
         t.add_column(col, style="dim" if col == "PATH" else None)
     for mid, m in sorted(models.items()):
         ident = m.get("identity", {})
         pls = m.get("placements", [])
         backends = sorted({p.get("backend", "?") for p in pls})
         path = ident.get("local_path") or ident.get("repo_id") or "—"
-        t.add_row(mid, str(ident.get("arch") or "—"), str(ident.get("quant") or "—"),
+        t.add_row(mid, str(ident.get("arch") or "—"), _ident_params(ident),
+                  str(ident.get("quant") or "—"),
                   str(m.get("capabilities", {}).get("native_context") or "—"), str(len(pls)),
                   ", ".join(backends), path)
     return t
@@ -565,6 +574,18 @@ def _print_worklist(worklist: list[dict]) -> None:
         console.print(f"  {_status_cell(w['status'])}  [cyan]{w['model']}[/] / [bold]{w['placement']}[/]")
 
 
+def _mem_cell(p: dict) -> str:
+    """Weight placement: '111G+111G' = VRAM + CPU-RAM offload (yellow), '111G' =
+    all-GPU. Recorded at induction for llamacpp placements; '—' when unknown."""
+    mem = p.get("mem") or {}
+    v, r = mem.get("vram_gb"), mem.get("ram_gb")
+    if v is None:
+        return "[dim]—[/]"
+    if r:
+        return f"{v:.0f}G+[yellow]{r:.0f}G[/]"
+    return f"{v:.0f}G"
+
+
 def _gpus_cell(gcount, pins) -> str:
     """'×N' card count, augmented with the live '[i,j]' pins when the placement is
     running (pins are real; idle placements have no fixed cards, so count only)."""
@@ -591,10 +612,11 @@ def _placements_table(rows, current, *, model_col: bool = False, pins: dict | No
     t = Table(title=title or None, title_style="dim", title_justify="left", pad_edge=False)
     if model_col:
         t.add_column("MODEL", style="bold")
+        t.add_column("PARAMS", no_wrap=True)
     t.add_column("ID", style="cyan")
     t.add_column("BACKEND", style="dim")
     t.add_column("DTYPE", no_wrap=True)
-    for col in ("GPUS", "TP", "PRIORITY", "MML", "KV", "TOK/S"):
+    for col in ("GPUS", "MEM", "TP", "PRIORITY", "MML", "KV", "TOK/S"):
         t.add_column(col, no_wrap=True)
     t.add_column("STATUS", no_wrap=True)
     t.add_column("TOOL", style="dim")
@@ -605,11 +627,14 @@ def _placements_table(rows, current, *, model_col: bool = False, pins: dict | No
         dtype = v["dtype"] or (identities.get(mid, {}) or {}).get("quant") or "—"
         cells = []
         if model_col:
-            cells.append("" if mid == prev else mid)
+            first = mid != prev
+            cells.append(mid if first else "")
+            cells.append(_ident_params(identities.get(mid, {})) if first else "")
             prev = mid
         cells += [
             v["id"], v["backend"], dtype,
             _gpus_cell(v["gpus"], pins.get((mid, v["id"]))),
+            _mem_cell(p),
             v["tp"], v["priority"], str(v["mml"] or "—"), v["kv"] or "—",
             _fmt_toks(v["peak"], v["single"]),
             _status_cell(v["status"]), v["tool"],
@@ -648,7 +673,7 @@ def registry_show(
         pls = m.get("placements", [])
         backends = ", ".join(sorted({p.get("backend", "?") for p in pls})) or "—"
         console.print(f"[bold]{model}[/]  [dim]path: {ident.get('local_path') or ident.get('repo_id') or '—'}[/]")
-        console.print(f"  arch={ident.get('arch')} quant={ident.get('quant')} "
+        console.print(f"  arch={ident.get('arch')} params={ident.get('params') or '—'} quant={ident.get('quant')} "
                       f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
         pins = _running_pins()
         _emit_table(_placements_table([(model, p) for p in pls], _current_runtimes(),
@@ -761,10 +786,12 @@ def registry_normalize(
     """Give every placement a consistent shape + honest status (preview by default).
 
     Fills only structural gaps — gpu_count (derived from TP), the perf {peak, single}
-    shape, a default source, validation_key.backend, a validated_at placeholder. It never
-    invents a tok/s number: a missing benchmark stays visibly `unmeasured`, and an aborted
-    run with no provenance stays `incomplete`. Those need `johnny tune`, which this reports
-    as a worklist. `--apply` rewrites registry.yaml (a timestamped backup is kept).
+    shape, a default source, validation_key.backend, a validated_at placeholder — plus
+    empty identity fields (params, quant) that are derivable from the GGUF header or the
+    model's own naming. It never invents a tok/s number: a missing benchmark stays visibly
+    `unmeasured`, and an aborted run with no provenance stays `incomplete`. Those need
+    `johnny tune`, which this reports as a worklist. `--apply` rewrites registry.yaml
+    (a timestamped backup is kept).
     """
     import shutil
     from datetime import datetime
@@ -774,6 +801,7 @@ def registry_normalize(
     reg = store.load()
     current = _current_runtimes()
     models = store.models(reg)
+    models_dir = (C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir")
 
     plan = []
     for mid, m in sorted(models.items()):
@@ -782,24 +810,34 @@ def registry_normalize(
             if changes:
                 plan.append({"model": mid, "placement": p.get("id"),
                              "status": N.placement_status(p, current), "changes": changes})
-    total = sum(len(x["changes"]) for x in plan)
+    ident_plan = []
+    for mid, m in sorted(models.items()):
+        fills = N.identity_gaps(mid, m, models_dir)
+        if fills:
+            ident_plan.append({"model": mid, "fills": fills})
+    total = sum(len(x["changes"]) for x in plan) + sum(len(x["fills"]) for x in ident_plan)
     worklist = N.retune_worklist(reg, current)
 
     if json_output:
         console.print(_json.dumps(
-            {"placements_touched": len(plan), "field_updates": total,
-             "plan": plan, "worklist": worklist, "applied": apply}, indent=2))
-    elif not plan:
+            {"placements_touched": len(plan), "models_backfilled": len(ident_plan),
+             "field_updates": total, "plan": plan, "identity": ident_plan,
+             "worklist": worklist, "applied": apply}, indent=2))
+    elif not plan and not ident_plan:
         console.print("[green]✓ registry already normalized[/] — every placement has a consistent shape.")
     else:
         verb = "normalized" if apply else "would normalize"
-        console.print(f"[bold]{verb}[/] {total} field(s) across {len(plan)} placement(s):")
+        console.print(f"[bold]{verb}[/] {total} field(s) across "
+                      f"{len(plan)} placement(s) + {len(ident_plan)} identity block(s):")
         for x in plan:
             console.print(f"  [cyan]{x['model']}[/] / [bold]{x['placement']}[/]  {_status_cell(x['status'])}")
             for c in x["changes"]:
                 console.print(f"      [dim]{c}[/]")
+        for x in ident_plan:
+            fills = "  ".join(f"identity.{k} → {v!r}" for k, v in x["fills"].items())
+            console.print(f"  [cyan]{x['model']}[/]  [dim]{fills}[/]")
 
-    if apply and plan:
+    if apply and (plan or ident_plan):
         p = C.get_paths().registry_file
         backup = None
         if p.exists():
@@ -808,10 +846,12 @@ def registry_normalize(
             shutil.copy2(p, backup)
         for m in models.values():
             m["placements"] = [N.normalize_placement(pl) for pl in (m.get("placements") or [])]
+        for x in ident_plan:
+            models[x["model"]].setdefault("identity", {}).update(x["fills"])
         store.save(reg)
         if not json_output:
             console.print(f"[green]✓ wrote[/] {p}" + (f"  [dim](backup {backup.name})[/]" if backup else ""))
-    elif not apply and plan and not json_output:
+    elif not apply and (plan or ident_plan) and not json_output:
         console.print("\n[dim]preview only — re-run with [bold]--apply[/] to write (a backup is kept).[/]")
 
     if not json_output:
@@ -1629,6 +1669,42 @@ def _dtype_cell(d: dict) -> str:
     return "[dim]—[/]"
 
 
+def _fmt_b(n: float) -> str:
+    if n >= 999.5e9:
+        return f"{n / 1e12:.1f}T"
+    v = n / 1e9
+    return f"{v:.0f}B" if v >= 9.95 else f"{v:.1f}B"
+
+
+def _fmt_count(n) -> str:
+    if not n:
+        return "—"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return str(n)
+
+
+def _model_cell(r: dict) -> str:
+    """Model id with inline ✓ (inducted) / 🔒 (gated) markers — one-glyph booleans
+    don't earn their own table columns when names already wrap. The ✓ leads (padded
+    so every name aligns and a mark pops at the left edge); a suffix after a long
+    name is invisible."""
+    mark = "[green]✓[/] " if r.get("inducted") else "  "
+    return mark + r["id"] + (" 🔒" if r.get("gated") else "")
+
+
+def _params_cell(r: dict) -> str:
+    """'754B·A44B' for MoE, plain '27B' for dense, '—' when nothing states it."""
+    p, a = r.get("params"), r.get("active_params")
+    if not p:
+        return "[dim]—[/]"
+    if a and a < p:
+        return f"{_fmt_b(p)}[dim]·A{_fmt_b(a)}[/]"
+    return _fmt_b(p)
+
+
 @app.command(rich_help_panel=_P_MODELS)
 def search(
     query: str = typer.Argument(..., help="HF search query, or a base model id with --quants."),
@@ -1658,14 +1734,14 @@ def search(
             return
         t = Table(title=f"quantizations of {query}  ·  native dtypes: {', '.join(hw.native_dtypes) or '—'}",
                   title_style="bold")
-        for col in ("MODEL", "REG", "QUANT", "DTYPE", "SIZE", "FIT"):
+        for col in ("MODEL", "QUANT", "PARAMS", "DTYPE", "SIZE", "FIT"):
             t.add_column(col)
         for r in res["results"]:
             v = r["fit"]
             verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
-            label = r["id"] + ("  [dim](base)[/]" if r.get("base") else "")
-            t.add_row(label, "[green]✓[/]" if r.get("inducted") else "",
-                      str(r.get("quant") or "—"), _dtype_cell(r["dtype"]),
+            label = _model_cell(r) + ("  [dim](base)[/]" if r.get("base") else "")
+            t.add_row(label,
+                      str(r.get("quant") or "—"), _params_cell(r), _dtype_cell(r["dtype"]),
                       f"{r['size_gb']}GB" if r["size_gb"] else "—",
                       f"{verdict} [dim]{v.get('detail', '')}[/]")
         console.print(t)
@@ -1680,18 +1756,23 @@ def search(
         console.print(_json.dumps(res, indent=2))
         return
     t = Table(title=f"HF search: {query}", title_style="bold")
-    for col in ("MODEL", "REG", "DOWNLOADS", "GATED", "SIZE", "DTYPE", "FIT", "BADGES"):
+    for col in ("MODEL", "DOWNLOADS", "PARAMS", "SIZE", "DTYPE", "FIT", "BADGES"):
         t.add_column(col)
     for r in res["results"]:
         v = r["fit"]
         verdict = f"[{_VERDICT_STYLE.get(v['verdict'], 'white')}]{v['verdict']}[/]"
-        t.add_row(r["id"], "[green]✓[/]" if r.get("inducted") else "",
-                  str(r.get("downloads") or "—"), "🔒" if r["gated"] else "",
+        t.add_row(_model_cell(r), _fmt_count(r.get("downloads")),
+                  _params_cell(r),
                   f"{r['size_gb']}GB" if r["size_gb"] else "—", _dtype_cell(r.get("dtype")),
                   f"{verdict} {v.get('detail', '')}", ", ".join(r["badges"]) or "—")
     console.print(t)
+    legend = []
     if any(r.get("inducted") for r in res["results"]):
-        console.print("[dim]REG ✓ = already inducted in the registry (`johnny registry show`)[/]")
+        legend.append("✓ = inducted in the registry (`johnny registry show`)")
+    if any(r.get("gated") for r in res["results"]):
+        legend.append("🔒 = gated (accept the license on huggingface.co + `johnny login`)")
+    if legend:
+        console.print(f"[dim]{' · '.join(legend)}[/]")
 
 
 @app.command(rich_help_panel=_P_MODELS)

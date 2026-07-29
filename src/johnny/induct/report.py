@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .. import config as C
-from ..registry import store
+from ..registry import normalize, store
 
 
 # arch-family → proven vLLM tool/reasoning parser + chat template, from this box's
@@ -107,8 +107,13 @@ def write_placement(model_id: str, audit: dict, placement: dict, hardware, local
     ident.setdefault("repo_id", model_id)
     if local_path:
         ident.setdefault("local_path", local_path)
-    ident.setdefault("arch", audit.get("arch"))
-    ident.setdefault("quant", audit.get("quant"))
+    # Fill-if-empty rather than setdefault: an entry seeded with explicit nulls
+    # (importer skeletons) must still pick these up on (re-)induction.
+    for k, v in (("arch", audit.get("arch")), ("quant", audit.get("quant")),
+                 ("params", audit.get("size_label"))):
+        if v and not ident.get(k):
+            ident[k] = v
+    ident.update(normalize.identity_gaps(model_id, m))
     cap = m["capabilities"]
     cap.setdefault("multimodal", audit.get("multimodal"))
     cap.setdefault("mtp_head", audit.get("mtp_head"))
