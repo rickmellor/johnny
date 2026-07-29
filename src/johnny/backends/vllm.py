@@ -29,8 +29,7 @@ class VllmDriver(Driver):
     def available(self) -> bool:
         if not which("docker"):
             return False
-        rc, _, _ = run(["docker", "info"], timeout=6)
-        return rc == 0
+        return probe.docker_available()  # memoized: resolve hits this 2x per call
 
     def capabilities(self) -> Capabilities:
         return Capabilities(

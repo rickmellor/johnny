@@ -8,9 +8,26 @@ occupancy land at P2/P3; this is the dependency-light stateless core.
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 
 from ..util import run
+
+# Short-TTL memo for the docker probes. One resolve walks 2 drivers × (available +
+# runtime_state), each hitting docker — that's 4× `docker info` (~100ms each) + 2×
+# `docker ps` per call, ~400ms of pure repetition. 2s is well under any state change
+# we act on, and one-shot CLI processes just get intra-call dedup.
+_PROBE_TTL_S = 2.0
+_memo: dict[str, tuple[float, object]] = {}
+
+
+def _memoized(key: str, fn):
+    hit = _memo.get(key)
+    if hit and (time.monotonic() - hit[0]) <= _PROBE_TTL_S:
+        return hit[1]
+    val = fn()
+    _memo[key] = (time.monotonic(), val)
+    return val
 
 # Images that look like an inference seat (best-effort filter for P0 status).
 INFER_IMAGE_HINTS = (
@@ -25,25 +42,32 @@ INFER_IMAGE_HINTS = (
 
 
 def docker_available() -> bool:
-    rc, _, _ = run(["docker", "info"], timeout=6)
-    return rc == 0
+    def _probe() -> bool:
+        rc, _, _ = run(["docker", "info"], timeout=6)
+        return rc == 0
+
+    return _memoized("docker_available", _probe)
 
 
 def docker_ps() -> list[dict]:
     """Running containers as a list of dicts (docker's --format json, one per line)."""
-    rc, out, _ = run(["docker", "ps", "--format", "{{json .}}"], timeout=10)
-    if rc != 0:
-        return []
-    rows: list[dict] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return rows
+
+    def _probe() -> list[dict]:
+        rc, out, _ = run(["docker", "ps", "--format", "{{json .}}"], timeout=10)
+        if rc != 0:
+            return []
+        rows: list[dict] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return rows
+
+    return _memoized("docker_ps", _probe)
 
 
 def host_ports(ports_field: str | None) -> list[int]:

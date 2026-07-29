@@ -61,5 +61,7 @@ def parse_prometheus(text: str) -> dict:
     return out
 
 
-def metrics_for_port(port: int) -> dict:
-    return parse_prometheus(fetch_metrics_text(port) or "")
+def metrics_for_port(port: int, timeout: float = 2.0) -> dict:
+    """Latency-sensitive callers (resolve) should pass a short timeout —
+    llama-server's /metrics can stall 2-3s on the first hit after idle."""
+    return parse_prometheus(fetch_metrics_text(port, timeout=timeout) or "")
