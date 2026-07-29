@@ -51,6 +51,25 @@ def assign_gpus(gpu_count: int, hardware, free: list[int]) -> list[int]:
     return []
 
 
+def fill_gpus_forced(gpu_count: int, hardware, seats, assigned: list[int]) -> list[int]:
+    """Top a short --force assignment up to gpu_count from the least-subscribed
+    busy GPUs. A short assignment must never ship: the driver only sets
+    *_VISIBLE_DEVICES when gpus is non-empty, so an unpinned container sees
+    every GPU and the runtime piles onto device 0."""
+    load = {g.index: 0 for g in hardware.gpus}
+    for s in seats:
+        for g in s.gpus or []:
+            if g in load:
+                load[g] += 1
+    picked = list(assigned)
+    for idx in sorted(load, key=lambda i: (load[i], i)):
+        if len(picked) >= gpu_count:
+            break
+        if idx not in picked:
+            picked.append(idx)
+    return sorted(picked)
+
+
 def allocate_port(cfg: dict, seats, role: str | None = None) -> int:
     net = cfg.get("network") or {}
     ports = net.get("ports") or {}

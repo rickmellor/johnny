@@ -27,11 +27,36 @@ def get_profile(name: str) -> dict | None:
 
 
 def role_to_model(role: str) -> str | None:
+    models = role_to_models(role)
+    return models[0] if models else None
+
+
+def role_to_models(role: str) -> list[str]:
+    """All models mapped to a role across profiles, file order, deduped. Resolve
+    prefers whichever candidate has a live seat (profiles define the vocabulary;
+    the running fleet decides the winner), so role lookups keep working across
+    profile swaps without SAINT knowing profiles exist.
+
+    A profile may also declare `role_aliases: {coder: chat}` — "this fleet has no
+    dedicated coder seat; its chat seat serves that role too". The alias resolves
+    within its own profile's seats only, one hop (aliases don't chain)."""
+    out: list[str] = []
+
+    def _add(model: str | None) -> None:
+        if model and model not in out:
+            out.append(model)
+
     for prof in (load().get("profiles") or {}).values():
-        for seat in prof.get("seats") or []:
+        seats = prof.get("seats") or []
+        for seat in seats:
             if seat.get("role") == role:
-                return seat.get("model")
-    return None
+                _add(seat.get("model"))
+        aliased = (prof.get("role_aliases") or {}).get(role)
+        if aliased:
+            for seat in seats:
+                if seat.get("role") == aliased:
+                    _add(seat.get("model"))
+    return out
 
 
 def all_profiles() -> dict:
@@ -121,7 +146,8 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
         errors.append("profile has no seats")
         return errors, warnings
 
-    seen: dict[str, set] = {"model": set(), "port": set(), "role": set()}
+    seen_ports: set = set()
+    role_models: dict[str, set] = {}
     gpu_need = 0
     for i, seat in enumerate(seats):
         who = seat.get("model") or f"seat[{i}]"
@@ -139,15 +165,23 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
                 errors.append(f"{who}: placement '{seat['placement']}' not found on model")
         if placement:
             gpu_need += int((placement.get("knobs") or {}).get("gpu_count") or 0)
-        # duplicates: model collides with launch.up's model-keyed idempotency;
-        # port/role must be unambiguous by design.
-        for field in ("model", "port", "role"):
-            v = seat.get(field)
-            if v is None:
-                continue
-            if v in seen[field]:
-                errors.append(f"{who}: duplicate {field} '{v}' in profile")
-            seen[field].add(v)
+        # A seat's identity is its port — duplicate ports are the only hard
+        # collision. Repeating a model (scale-out fleets like N× one model,
+        # one per GPU) is legitimate; launch.up's idempotency is port-aware.
+        port = seat.get("port")
+        if port is not None:
+            if port in seen_ports:
+                errors.append(f"{who}: duplicate port '{port}' in profile")
+            seen_ports.add(port)
+        role = seat.get("role")
+        if role:
+            models = role_models.setdefault(role, set())
+            # Same role on several seats of ONE model is scale-out; on several
+            # different models it makes within-profile resolve order-dependent.
+            if models and seat.get("model") not in models:
+                warnings.append(f"role '{role}' spans multiple models in this "
+                                "profile (resolve prefers whichever is live)")
+            models.add(seat.get("model"))
 
     if hardware is not None and gpu_need > len(getattr(hardware, "gpus", []) or []):
         warnings.append(f"placements want {gpu_need} GPUs but this box has "
@@ -167,9 +201,10 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
 
 def up_profile(name: str, wait: bool = False, cfg: dict | None = None) -> dict:
     """Bring up every seat in a profile, best-effort: one seat's failure is
-    recorded and the rest still launch. Idempotent — already-running models
-    return action=exists (launch.up is model-keyed). Pinned seats get an
-    indefinite pin so the reaper keeps them warm."""
+    recorded and the rest still launch. Idempotent per seat — a seat already
+    running on its port returns action=exists (launch.up keys on model+port,
+    so scale-out profiles launch every seat). Pinned seats get an indefinite
+    pin so the reaper keeps them warm."""
     from ..telemetry import collect
     from . import all_seats, launch, load_config
 
@@ -219,7 +254,9 @@ def down_profile(name: str, drain: bool = False, cfg: dict | None = None) -> dic
     for seat in prof.get("seats") or []:
         model = seat.get("model")
         entry = {"model": model, "role": seat.get("role")}
-        live = launch._find_seat(all_seats(cfg), model)
+        # Port-scoped like up: each profile seat stops its own container, not
+        # the first same-model sibling in the list.
+        live = launch._find_seat(all_seats(cfg), model, port=seat.get("port"))
         if not live:
             entry["action"] = "absent"
             results.append(entry)

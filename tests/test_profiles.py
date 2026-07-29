@@ -67,14 +67,31 @@ def test_validate_unknown_model_and_placement():
     assert any("placement 'wrong-id' not found" in e for e in errors)
 
 
-def test_validate_duplicates():
+def test_validate_duplicate_port_is_the_only_hard_collision():
     errors, _ = _validate({"seats": [
         _seat("qwen-27b-coder", "qwen-tp2", 8003, "coder"),
         _seat("qwen-27b-coder", "qwen-tp2", 8003, "coder"),
     ]})
-    joined = " ".join(errors)
-    for field in ("model", "port", "role"):
-        assert f"duplicate {field}" in joined
+    assert any("duplicate port '8003'" in e for e in errors)
+    assert not any("duplicate model" in e or "duplicate role" in e for e in errors)
+
+
+def test_validate_scaleout_profile_is_clean():
+    # N seats of one model+role on distinct ports (e.g. 12b-quad) is legitimate
+    errors, warnings = _validate({"seats": [
+        _seat("qwen-27b-coder", "qwen-tp2", 8000 + i, "coder") for i in range(4)
+    ]})
+    assert errors == []
+    assert warnings == []
+
+
+def test_validate_role_across_models_warns():
+    errors, warnings = _validate({"seats": [
+        _seat("qwen-27b-coder", "qwen-tp2", 8003, "chat"),
+        _seat("nomic-embed", "nomic-embed-cpu", 8001, "chat"),
+    ]})
+    assert errors == []
+    assert any("spans multiple models" in w for w in warnings)
 
 
 def test_validate_gpu_oversubscription_warns():
@@ -147,3 +164,33 @@ def test_boot_disable_never_stops_the_fleet():
     for cmd in boot.disable_commands("standard"):
         assert "--now" not in cmd
     assert any("--now" in c for c in boot.enable_commands("standard"))
+
+
+def test_role_to_models_prefers_definition_order_and_dedups(monkeypatch):
+    from johnny.engine import profiles
+
+    doc = {"profiles": {
+        "standard": {"seats": [{"role": "chat", "model": "gemma"}]},
+        "knowledge": {"seats": [{"role": "chat", "model": "ornith"},
+                                {"role": "chat", "model": "gemma"}]},
+    }}
+    monkeypatch.setattr(profiles, "load", lambda: doc)
+    assert profiles.role_to_models("chat") == ["gemma", "ornith"]
+    assert profiles.role_to_model("chat") == "gemma"
+    assert profiles.role_to_models("nope") == []
+
+
+def test_role_aliases_resolve_within_own_profile(monkeypatch):
+    from johnny.engine import profiles
+
+    doc = {"profiles": {
+        "standard": {"seats": [{"role": "coder", "model": "qwen"},
+                               {"role": "chat", "model": "gemma"}]},
+        "knowledge": {"seats": [{"role": "chat", "model": "ornith"}],
+                      "role_aliases": {"coder": "chat"}},
+    }}
+    monkeypatch.setattr(profiles, "load", lambda: doc)
+    # real coder seat first (file order), then knowledge's aliased chat seat
+    assert profiles.role_to_models("coder") == ["qwen", "ornith"]
+    # alias resolves against its OWN profile's seats, not standard's chat
+    assert "gemma" not in profiles.role_to_models("coder")

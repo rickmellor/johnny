@@ -24,12 +24,16 @@ def _find(seats, target):
     for s in seats:
         if s.name == target:
             return s, None
-    model_hint = profiles.role_to_model(target) or target
-    for s in seats:
-        labels = (s.extra or {}).get("labels", {})
-        if s.model == model_hint or labels.get("johnny.model") == model_hint:
-            return s, model_hint
-    return None, model_hint
+    # A role may map to different models in different profiles; the running fleet
+    # decides which one wins. Profile file order only breaks the no-seat tie (the
+    # absent estimate names the first-profile model, as before).
+    hints = profiles.role_to_models(target) or [target]
+    for hint in hints:
+        for s in seats:
+            labels = (s.extra or {}).get("labels", {})
+            if s.model == hint or labels.get("johnny.model") == hint:
+                return s, hint
+    return None, hints[0]
 
 
 def resolve(target: str, cfg: dict | None = None) -> dict:
@@ -49,7 +53,8 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
     queue_depth = None
     eta = None
     if state == "ready" and seat.port:
-        queue_depth = sources.metrics_for_port(seat.port).get("waiting")
+        # queue depth is advisory; never let a slow /metrics stall the hot path
+        queue_depth = sources.metrics_for_port(seat.port, timeout=0.3).get("waiting")
     elif state == "loading":
         eta = collect.cold_start_estimate(seat.model or model_hint or target)
     return {

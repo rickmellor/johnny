@@ -15,7 +15,7 @@ from ..runtime import probe
 from ..runtime.lock import mutation_lock
 from ..telemetry import collect
 from . import all_seats, driver_for, load_config
-from .placement import allocate_port, assign_gpus, free_gpus, pick_placement, role_for, viable
+from .placement import allocate_port, assign_gpus, fill_gpus_forced, free_gpus, pick_placement, role_for, viable
 from ..hardware import detect as hwdetect
 from ..registry import store
 
@@ -84,7 +84,12 @@ def _up_lmstudio(model_id: str, model: dict, placement: dict, cfg: dict) -> dict
             "model": model_id, "placement": placement.get("id"), "state": "loading", "backend": "lmstudio"}
 
 
-def _find_seat(seats, name_or_model: str):
+def _find_seat(seats, name_or_model: str, port: int | None = None):
+    """Match by exact seat name, else by model id. With `port`, only seats on
+    that port count — a fleet may run several seats of one model (scale-out
+    profiles), and they are distinct seats, not duplicates of each other."""
+    if port is not None:
+        seats = [s for s in seats if s.port == port]
     for s in seats:
         if s.name == name_or_model:
             return s
@@ -124,7 +129,10 @@ def up(
 
     with mutation_lock():
         seats = all_seats(cfg)
-        existing = _find_seat(seats, model_id)
+        # Idempotency is per-seat, not per-model: with an explicit port, only a
+        # same-model seat on THAT port is "already up" — another seat of the same
+        # model elsewhere must not swallow this launch (scale-out profiles).
+        existing = _find_seat(seats, model_id, port=port)
         if existing and not swap and not force:
             return {"action": "exists", "seat": existing.name, "port": existing.port, "state": existing.state, "model": model_id}
 
@@ -151,6 +159,10 @@ def up(
                 f"cannot place '{model_id}': {reason}. Pass --swap <seat> to free GPUs, or --force."
             )
         gpus = assign_gpus(gc, hardware, free)
+        if gc and len(gpus) < gc:
+            # Only reachable under --force (viable() blocks the placement
+            # otherwise) — pin busy GPUs rather than launch with no mask.
+            gpus = fill_gpus_forced(gc, hardware, seats, gpus)
         if port is None:
             port = allocate_port(cfg, seats, role=role_for(placement))
 
