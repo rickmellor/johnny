@@ -264,23 +264,32 @@ def _quant_from_names(names: list[str]) -> str | None:
 
 def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict:
     """Derivable fills for a model's identity — {field: value} for params/quant that are
-    currently empty. Sources, in trust order: the GGUF header (general.size_label; needs
-    the weights on disk under models_dir), then the naming conventions above across
-    local_path / model id / repo_id. Nothing is invented beyond an explicit token in a
-    name or header — an underivable field stays empty. Never overwrites a set value."""
+    currently empty. params: the GGUF header (general.size_label; needs the weights on
+    disk under models_dir), else the naming conventions above. quant: the naming
+    conventions first (a curated label, e.g. unsloth's UD- dynamic-quant names, wins
+    over anything derived), else the actual per-tensor quant mix read from the GGUF
+    tensor table across every shard (ground truth — a custom mix has no single true
+    quant, so this is the same "significant types by share" label `johnny status`
+    shows), else the header's file_type IF it's a string (rare; the int-enum form is
+    a single whole-file stamp and provably wrong for a mixed quant — see
+    backends.llamacpp.quant_mix_label). Nothing is invented beyond an explicit token
+    in a name/header or a measured tensor type — an underivable field stays empty.
+    Never overwrites a set value."""
     ident = m.get("identity") or {}
     names = [s for s in (ident.get("local_path"), model_id, ident.get("repo_id")) if s]
     need_params, need_quant = not ident.get("params"), not ident.get("quant")
 
     meta: dict = {}
+    shards: list[Path] = []
     lp = ident.get("local_path")
     if (need_params or need_quant) and models_dir and lp and str(lp).endswith(".gguf"):
         p = Path(models_dir).expanduser() / lp
         if p.exists():
             try:
-                from ..backends.llamacpp import _gguf_metadata
+                from ..backends.llamacpp import _gguf_metadata, gguf_shard_paths
 
                 meta = _gguf_metadata(p) or {}
+                shards = gguf_shard_paths(p)
             except Exception:
                 meta = {}
 
@@ -290,8 +299,16 @@ def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict
         if v:
             gaps["params"] = str(v)
     if need_quant:
-        header_quant = meta.get("quant") if isinstance(meta.get("quant"), str) else None
-        v = _quant_from_names(names) or header_quant
+        v = _quant_from_names(names)
+        if not v and shards:
+            try:
+                from ..backends.llamacpp import quant_mix, quant_mix_label
+
+                v = quant_mix_label(quant_mix(shards))
+            except Exception:
+                v = None
+        if not v:
+            v = meta.get("quant") if isinstance(meta.get("quant"), str) else None
         if v:
             gaps["quant"] = v
     return gaps

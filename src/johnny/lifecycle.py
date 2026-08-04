@@ -69,8 +69,28 @@ def _models_dir(cfg: dict | None = None) -> str | None:
     return (cfg.get("roots") or {}).get("models_dir")
 
 
+def _gguf_targets(p: Path) -> list[Path]:
+    """This path, expanded to every shard when it's a split GGUF (…-NNNNN-of-MMMMM.gguf)
+    — a vLLM repo's local_path is a directory, but llama.cpp's is one shard *file*, and
+    a plain rmtree()/single-file size read silently misses the rest of the split."""
+    from .backends.llamacpp import gguf_shard_paths
+
+    return gguf_shard_paths(p) if p.suffix == ".gguf" else [p]
+
+
+def path_size_bytes(path: str) -> int:
+    """Size on disk for a removal target: a directory (grid's glob scan), a single
+    file, or every shard of a split GGUF."""
+    p = Path(path)
+    if p.is_dir():
+        return grid.model_size_bytes(path)
+    return sum(t.stat().st_size for t in _gguf_targets(p) if t.exists())
+
+
 def delete_path(path: str, cfg: dict | None = None) -> bool:
-    """Delete a model dir — but only if it lives inside the configured models dir."""
+    """Delete a model's weights — a directory (vLLM repo), a single file, or every
+    shard of a split GGUF — but only inside the configured models dir. True iff
+    nothing of the target remains afterward."""
     import shutil
 
     md = _models_dir(cfg)
@@ -81,7 +101,11 @@ def delete_path(path: str, cfg: dict | None = None) -> bool:
         p.resolve().relative_to(Path(md).expanduser().resolve())
     except (ValueError, OSError):
         return False
-    shutil.rmtree(p, ignore_errors=True)
+    if p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+        return not p.exists()
+    for t in _gguf_targets(p):
+        t.unlink(missing_ok=True)
     return not p.exists()
 
 
@@ -107,7 +131,7 @@ def resolve_target(target: str, cfg: dict | None = None) -> dict | None:
             if cand.exists():
                 path = str(cand)
         return {"model_id": model_id, "local_path": local_path, "path": path,
-                "size_gb": round(grid.model_size_bytes(path) / 1e9, 1) if path else None}
+                "size_gb": round(path_size_bytes(path) / 1e9, 1) if path else None}
 
     if target in models:
         return _entry(target, (models[target].get("identity") or {}).get("local_path"))
@@ -119,7 +143,7 @@ def resolve_target(target: str, cfg: dict | None = None) -> dict | None:
         p = Path(md).expanduser() / target
     if p.exists():
         return {"model_id": None, "local_path": target, "path": str(p),
-                "size_gb": round(grid.model_size_bytes(str(p)) / 1e9, 1)}
+                "size_gb": round(path_size_bytes(str(p)) / 1e9, 1)}
     return None
 
 

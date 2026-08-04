@@ -47,7 +47,7 @@ class VllmDriver(Driver):
         out: list[ModelInfo] = []
         if not self.models_dir or not self.models_dir.exists():
             return out
-        seen: set[str] = set()
+        cands: list[str] = []
         for cfg in self.models_dir.rglob("config.json"):
             d = cfg.parent
             try:
@@ -57,11 +57,16 @@ class VllmDriver(Driver):
             # vendor/model layout; skip deep nesting (HF snapshots etc.)
             if len(rel.parts) > 3 or "snapshots" in rel.parts:
                 continue
-            key = str(rel)
-            if key in seen:
+            cands.append(str(rel))
+        # Shallowest first: a submodule's own config.json (e.g. sentence-transformers'
+        # 1_Pooling/config.json) inside an already-matched model dir isn't a second
+        # model — skip anything nested under a dir we've already accepted.
+        accepted: list[str] = []
+        for key in sorted(set(cands), key=lambda k: k.count("/")):
+            if any(key == a or key.startswith(a + "/") for a in accepted):
                 continue
-            seen.add(key)
-            out.append(ModelInfo(id=key, path=str(d), backend="vllm"))
+            accepted.append(key)
+            out.append(ModelInfo(id=key, path=str(self.models_dir / key), backend="vllm"))
         return sorted(out, key=lambda m: m.id)
 
     def runtime_state(self) -> list[SeatInfo]:

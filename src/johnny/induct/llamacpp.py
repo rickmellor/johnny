@@ -109,26 +109,23 @@ def gguf_ref(model_ref: str, cfg: dict) -> tuple[str, str] | None:
     return None
 
 
-def _shard_size_bytes(path: str) -> int:
-    """Sum this quant's shards (…-NNNNN-of-MMMMM.gguf); else the single file size."""
-    p = Path(path)
-    m = _SHARD_RE.match(p.name)
-    if not m:
-        return p.stat().st_size if p.exists() else 0
-    base, tot = m.group("base"), m.group("tot")
-    total = 0
-    for shard in p.parent.glob(f"{base}-*-of-{tot}.gguf"):
-        try:
-            total += shard.stat().st_size
-        except OSError:
-            pass
-    return total
-
-
 def audit(path: str) -> dict:
-    """GGUF audit via the llamacpp driver's header probe + shard size."""
+    """GGUF audit via the llamacpp driver's header probe + shard-aware size and
+    quant mix. `quant` is overridden with the tensor-mix label (ground truth across
+    every shard) whenever one is derivable — the header's own probe_model() quant
+    is a single whole-file file_type stamp, unreliable for a custom per-tensor mix
+    (see backends.llamacpp.quant_mix_label)."""
+    from ..backends.llamacpp import gguf_shard_paths, quant_mix, quant_mix_label
+
     info = get_driver("llamacpp").probe_model(path)
-    info["size_bytes"] = _shard_size_bytes(path)
+    shards = gguf_shard_paths(Path(path))
+    info["size_bytes"] = sum(s.stat().st_size for s in shards if s.exists())
+    mix = quant_mix(shards)
+    if mix:
+        info["quant_mix"] = mix
+        label = quant_mix_label(mix)
+        if label:
+            info["quant"] = label
     return info
 
 
@@ -337,11 +334,9 @@ def weight_split(gguf_path: str, override_tensor: str | None = None, n_cpu_moe=N
     """{'vram_gb', 'ram_gb'} weight placement for an offload config, from the
     GGUF tensor table across all shards. None when the file can't be parsed.
     Weights only — KV cache and compute buffers land on top of the VRAM side."""
-    from ..backends.llamacpp import gguf_tensors
+    from ..backends.llamacpp import gguf_shard_paths, gguf_tensors
 
-    p = Path(gguf_path)
-    m = _SHARD_RE.match(p.name)
-    shards = sorted(p.parent.glob(f"{m.group('base')}-*-of-{m.group('tot')}.gguf")) if m else [p]
+    shards = gguf_shard_paths(Path(gguf_path))
     tensors = [t for s in shards for t in gguf_tensors(s)]
     if not tensors:
         return None
@@ -394,7 +389,7 @@ def _write_report(run_dir: Path, model_id: str, a: dict, results: list[dict], wi
     run_dir.mkdir(parents=True, exist_ok=True)
     lines = [
         f"# TUNING_REPORT — {model_id} (llamacpp)", "",
-        f"- arch: {a.get('arch')}  quant: {a.get('quant') or a.get('file_type_id')}  "
+        f"- arch: {a.get('arch')}  quant: {a.get('quant') or a.get('file_type_name') or a.get('file_type_id')}  "
         f"size: {a.get('size_bytes', 0) / 1e9:.1f} GB  native_ctx: {a.get('native_context')}", "",
         "## Sweep (llama-bench, single-stream)", "",
         "| ngl | offload | mml | prefill tok/s | decode tok/s | ok |",
@@ -424,7 +419,7 @@ def plan(model_id: str, gguf_path: str, max_points: int | None = None, cfg: dict
     cfg = cfg if cfg is not None else load_config()
     hw = hwd.detect()
     a = audit(gguf_path)
-    audit_view = {"arch": a.get("arch"), "quant": a.get("quant") or a.get("file_type_id"),
+    audit_view = {"arch": a.get("arch"), "quant": a.get("quant") or a.get("file_type_name") or a.get("file_type_id"),
                   "size_gb": round(a.get("size_bytes", 0) / 1e9, 1), "native_ctx": a.get("native_context")}
     if device == "cpu":
         import os

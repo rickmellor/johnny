@@ -15,6 +15,7 @@ self-contained build), so `compose()` appends only server args after the image n
 from __future__ import annotations
 
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -262,11 +263,14 @@ def _gpus_from_inspect(name: str) -> list[int]:
 
 
 # GGUF value type ids -> struct reader (see ggml gguf spec).
-def _gguf_parse(path: Path, want_tensors: bool = False) -> tuple[int, dict, list[tuple[str, int]]]:
-    """(version, header KV, [(tensor name, ~bytes)]). Tensor sizes come from
-    offset deltas within the data section (infos are offset-ordered per spec),
-    so no ggml quant-type block-size table is needed; the ≤alignment padding
-    per tensor is noise at model scale."""
+def _gguf_parse(path: Path, want_tensors: bool = False, want_types: bool = False):
+    """(version, header KV, tensors). Tensor sizes come from offset deltas within
+    the data section (infos are offset-ordered per spec), so no ggml quant-type
+    block-size table is needed; the ≤alignment padding per tensor is noise at model
+    scale. `tensors` is [(name, bytes)] by default, or with want_types=True (implies
+    want_tensors) [(name, bytes, elem_count, ggml_type_id)] — the per-tensor dtype,
+    read from the info block instead of skipped."""
+    want_tensors = want_tensors or want_types
     with open(path, "rb") as f:
         magic = f.read(4)
         if magic != b"GGUF":
@@ -320,23 +324,35 @@ def _gguf_parse(path: Path, want_tensors: bool = False) -> tuple[int, dict, list
                 v = f"<array len={len(v)}>"
             kv[k] = v
 
-        tensors: list[tuple[str, int]] = []
+        tensors: list[tuple] = []
         if want_tensors:
             infos = []
             for _ in range(n_tensors):
                 name = rstr()
                 (nd,) = struct.unpack("<I", f.read(4))
-                f.read(8 * nd + 4)  # dims + ggml type — offsets carry the sizes
+                if want_types:
+                    dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
+                    (gtype,) = struct.unpack("<I", f.read(4))
+                else:
+                    f.read(8 * nd + 4)  # dims + ggml type — offsets carry the sizes
                 (off,) = struct.unpack("<Q", f.read(8))
-                infos.append((name, off))
+                if want_types:
+                    nelem = 1
+                    for d in dims:
+                        nelem *= d
+                    infos.append((name, off, nelem, gtype))
+                else:
+                    infos.append((name, off))
             align = kv.get("general.alignment") or 32
             data_start = f.tell()
             data_start += (-data_start) % align
             data_len = path.stat().st_size - data_start
             infos.sort(key=lambda x: x[1])
-            for i, (name, off) in enumerate(infos):
+            for i, info in enumerate(infos):
+                off = info[1]
                 nxt = infos[i + 1][1] if i + 1 < len(infos) else data_len
-                tensors.append((name, max(0, nxt - off)))
+                nbytes = max(0, nxt - off)
+                tensors.append((info[0], nbytes, *info[2:]) if want_types else (info[0], nbytes))
     return ver, kv, tensors
 
 
@@ -348,6 +364,88 @@ def gguf_tensors(path: Path) -> list[tuple[str, int]]:
         return []
 
 
+def gguf_tensor_types(path: Path) -> list[tuple[str, int, int, int]]:
+    """[(tensor name, ~bytes, elem count, ggml_type id)] for one GGUF file; [] on
+    any parse trouble. The ggml_type id is per-tensor on-disk dtype (see
+    _GGML_TENSOR_TYPE_MAP) — distinct from general.file_type below, which is a
+    single whole-file summary and unreliable for a custom per-tensor quant mix."""
+    try:
+        return _gguf_parse(path, want_types=True)[2]
+    except Exception:
+        return []
+
+
+_SHARD_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d+)-of-(?P<tot>\d+)\.gguf$")
+
+
+def gguf_shard_paths(path: Path) -> list[Path]:
+    """This GGUF's sibling shards (…-NNNNN-of-MMMMM.gguf), sorted; just [path] when
+    it isn't part of a split. Single source for the shard-glob convention every
+    multi-file GGUF reader (weight_split, quant_mix, size probes) needs."""
+    p = Path(path)
+    m = _SHARD_RE.match(p.name)
+    if not m:
+        return [p]
+    shards = sorted(p.parent.glob(f"{m.group('base')}-*-of-{m.group('tot')}.gguf"))
+    return shards or [p]
+
+
+# general.file_type enum → quant name, verified against llama.h `enum llama_ftype`
+# (ids 4-6 and 33-35 are removed/historical). "MOSTLY_" caveat applies: for custom
+# per-tensor mixes the stamp describes the majority type at best (Ornith Featherweight,
+# a 2.41 bpw mix, is stamped 7/Q8_0) — informational only, never a trusted identity fill.
+_GGUF_FILE_TYPE_MAP = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1",
+    10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M",
+    16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S",
+    22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M",
+    28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16",
+    36: "TQ1_0", 37: "TQ2_0", 38: "MXFP4_MOE", 39: "NVFP4", 40: "Q1_0",
+}
+
+# Per-tensor ggml_type enum → name, verified against ggml.h `enum ggml_type`. A
+# DIFFERENT numbering from _GGUF_FILE_TYPE_MAP above (that's general.file_type, a
+# single whole-file enum) — this is the actual on-disk dtype of one tensor block,
+# ground truth for a custom per-tensor quant mix that file_type can't represent.
+_GGML_TENSOR_TYPE_MAP = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
+    10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
+    16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S",
+    22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64",
+    29: "IQ1_M", 30: "BF16", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0",
+}
+
+
+def quant_mix(paths: Path | list[Path]) -> dict[str, dict[str, int]]:
+    """{type_name: {"elems": int, "bytes": int}} across one or more GGUF files
+    (shards of the same model — pass gguf_shard_paths(path) for a split). Unknown
+    type ids show as '?<id>'. {} when nothing parses."""
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    mix: dict[str, dict[str, int]] = {}
+    for p in paths:
+        for _name, nbytes, nelem, gtype in gguf_tensor_types(Path(p)):
+            d = mix.setdefault(_GGML_TENSOR_TYPE_MAP.get(gtype, f"?{gtype}"), {"elems": 0, "bytes": 0})
+            d["elems"] += nelem
+            d["bytes"] += nbytes
+    return mix
+
+
+def quant_mix_label(mix: dict[str, dict[str, int]], min_share: float = 0.10) -> str | None:
+    """Compact quant label from a quant_mix() result: types covering >=min_share of
+    total elements, joined '/' by descending share (e.g. Ornith Featherweight's
+    IQ2_XXS 65%/Q2_K 32.5%/Q8_0 2.4% attention → 'IQ2_XXS/Q2_K' at the 10% default —
+    the attention/norm sliver is real but not what the label is for). A single
+    dominant type collapses to itself, matching a uniformly-quantized file's existing
+    plain label (e.g. 'Q4_0'). None for an empty mix."""
+    total = sum(d["elems"] for d in mix.values())
+    if not total:
+        return None
+    sig = sorted((t for t, d in mix.items() if d["elems"] / total >= min_share),
+                 key=lambda t: -mix[t]["elems"])
+    return "/".join(sig) or None
+
+
 def _gguf_metadata(path: Path) -> dict:
     """Minimal GGUF header reader: returns arch/context/quant/experts/layers."""
     ver, kv, _ = _gguf_parse(path)
@@ -357,6 +455,13 @@ def _gguf_metadata(path: Path) -> dict:
     def g(suffix, default=None):
         return kv.get(f"{arch}.{suffix}", default) if arch else default
 
+    # quant: only a string file_type is authoritative enough to persist as identity.
+    # The int enum decodes to file_type_name — display-only ("mostly X", wrong for
+    # custom mixes) — so identity fills (registry normalize/induct) never see it.
+    file_type_raw = kv.get("general.file_type")
+    quant_str = file_type_raw if isinstance(file_type_raw, str) else None
+    ftype_name = _GGUF_FILE_TYPE_MAP.get(file_type_raw) if isinstance(file_type_raw, int) else None
+
     info: dict = {
         "arch": arch,
         "gguf_version": ver,
@@ -364,8 +469,9 @@ def _gguf_metadata(path: Path) -> dict:
         "n_layer": g("block_count"),
         "n_expert": g("expert_count"),
         "n_expert_used": g("expert_used_count"),
-        "quant": (kv.get("general.file_type") if isinstance(kv.get("general.file_type"), str) else None),
-        "file_type_id": kv.get("general.file_type"),
+        "quant": quant_str,
+        "file_type_id": file_type_raw,
+        "file_type_name": ftype_name,
         "mtp_head": bool(g("nextn_predict_layers") or 0),
         "multimodal": False,
         "size_label": kv.get("general.size_label"),

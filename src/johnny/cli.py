@@ -17,6 +17,7 @@ from __future__ import annotations
 import json as _json
 import sys as _sys
 import time
+import zlib
 
 import typer
 from rich.console import Console
@@ -56,12 +57,45 @@ def _seat_image(s) -> str:
     return (s.extra or {}).get("image") or "—"
 
 
+def _fmt_context(ctx: int) -> str:
+    """Format context window: 2048 → '2K', 32768 → '32K', 1048576 → '1M'."""
+    if ctx >= 1_048_576:
+        return f"{ctx // 1_048_576}M"
+    elif ctx >= 1024:
+        return f"{ctx // 1024}K"
+    return str(ctx)
+
+
+def _seat_spec() -> dict:
+    """model_id -> compact spec string (params · quant · context) from the registry."""
+    from .registry import store
+
+    spec_cache = {}
+    for mid, m in store.models(store.load()).items():
+        ident = m.get("identity") or {}
+        ctx = (m.get("capabilities") or {}).get("native_context")
+        parts = [str(v) for v in (ident.get("params"), ident.get("quant")) if v]
+        if ctx:
+            parts.append(_fmt_context(ctx))
+        spec_cache[mid] = " · ".join(parts) if parts else "—"
+    return spec_cache
+
+
 def _seats_as_dicts(seats) -> list[dict]:
-    return [
-        {"seat": s.name, "backend": s.backend, "port": s.port, "model": s.model,
-         "state": s.state, "gpus": s.gpus, "image": _seat_image(s)}
-        for s in seats
-    ]
+    from .registry import store
+
+    models = store.models(store.load())
+    out = []
+    for s in seats:
+        m = models.get(s.model) or {}
+        ident = m.get("identity") or {}
+        out.append(
+            {"seat": s.name, "backend": s.backend, "port": s.port, "model": s.model,
+             "state": s.state, "gpus": s.gpus, "image": _seat_image(s),
+             # raw registry fields, null when unknown — formatting is the table's job
+             "params": ident.get("params"), "quant": ident.get("quant"),
+             "native_context": (m.get("capabilities") or {}).get("native_context")})
+    return out
 
 
 def _render_status(json_output: bool = False) -> None:
@@ -77,13 +111,15 @@ def _render_status(json_output: bool = False) -> None:
         else:
             console.print("[dim]no inference seats running.[/] Start one with [bold]johnny up <model>[/].")
         return
+    spec_map = _seat_spec()
     table = Table(title="johnny — seats", title_style="bold")
     for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
-                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
-        table.add_column(col, style=style)
+                       ("MODEL", "cyan"), ("SPEC", "dim"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
+        table.add_column(col, style=style, no_wrap=(col == "SPEC"))
     for s in seats:
         gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
+                      spec_map.get(s.model, "—"),
                       f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
     console.print(table)
 
@@ -98,9 +134,11 @@ def status(
         try:
             from rich.live import Live
 
+            # Load the spec map once (registry rarely changes while watching).
+            spec_map = _seat_spec()
             with Live(console=console, refresh_per_second=4, screen=True) as live:
                 while True:
-                    table = _build_status_renderable()
+                    table = _build_status_renderable(spec_map)
                     live.update(table)
                     time.sleep(2)
         except KeyboardInterrupt:
@@ -109,17 +147,24 @@ def status(
         _render_status(json_output=json_output)
 
 
-def _build_status_renderable():
-    """A Rich renderable of current seats (used by --watch)."""
+def _build_status_renderable(spec_map=None):
+    """A Rich renderable of current seats (used by --watch).
+
+    `spec_map` is loaded once before the loop to avoid re-parsing the registry
+    YAML on every refresh tick (the registry rarely changes while watching)."""
     from . import engine
 
+    seats = engine.all_seats()
+    if spec_map is None:
+        spec_map = _seat_spec()
     table = Table(title="johnny — seats (live)", title_style="bold")
     for col, style in (("SEAT", "bold"), ("BACKEND", "dim"), ("PORT", None),
-                       ("MODEL", "cyan"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
-        table.add_column(col, style=style)
-    for s in engine.all_seats():
+                       ("MODEL", "cyan"), ("SPEC", "dim"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
+        table.add_column(col, style=style, no_wrap=(col == "SPEC"))
+    for s in seats:
         gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
+                      spec_map.get(s.model, "—"),
                       f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
     return table
 
@@ -488,6 +533,37 @@ registry_app = typer.Typer(add_completion=False, help="Inspect / seed / validate
 app.add_typer(registry_app, name="registry", rich_help_panel=_P_MODELS)
 
 
+def _print_quant_mix(ident: dict, backends: str) -> None:
+    """Below the arch/quant summary line, a per-tensor quant breakdown — only when
+    a GGUF model's weights are on disk AND more than one type is significant (a
+    plain single-quant GGUF already says everything in `quant=`). This is the same
+    ground truth registry normalize / induct derive identity.quant from, just shown
+    in full instead of collapsed to the compact label."""
+    lp = ident.get("local_path")
+    if "llamacpp" not in backends or not lp or not str(lp).endswith(".gguf"):
+        return
+    md = (C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir")
+    if not md:
+        return
+    from pathlib import Path
+
+    p = Path(md).expanduser() / lp
+    if not p.exists():
+        return
+    from .backends.llamacpp import gguf_shard_paths, quant_mix
+
+    mix = quant_mix(gguf_shard_paths(p))
+    total_elems = sum(d["elems"] for d in mix.values())
+    total_bytes = sum(d["bytes"] for d in mix.values())
+    if len(mix) <= 1 or not total_elems:
+        return
+    rows = sorted(mix.items(), key=lambda kv: -kv[1]["elems"])
+    parts = [f"{t} {100 * d['elems'] / total_elems:.1f}%·{d['bytes'] * 8 / d['elems']:.2f}bpw"
+             for t, d in rows]
+    console.print(f"  [dim]quant mix: {' · '.join(parts)}  "
+                  f"(overall {total_bytes * 8 / total_elems:.2f} bpw)[/]")
+
+
 def _ident_params(ident: dict) -> str:
     """identity.params as stored — a '284.33B'-style string or a raw count; '—' when unset."""
     p = (ident or {}).get("params")
@@ -501,7 +577,7 @@ def _registry_compact_table(models: dict) -> Table:
     t = Table(title=f"registry — {len(models)} model(s)", title_style="bold")
     for col in ("MODEL", "ARCH", "PARAMS", "QUANT", "CTX", "#PL", "BACKENDS", "PATH"):
         t.add_column(col, style="dim" if col == "PATH" else None)
-    for mid, m in sorted(models.items()):
+    for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()):
         ident = m.get("identity", {})
         pls = m.get("placements", [])
         backends = sorted({p.get("backend", "?") for p in pls})
@@ -552,6 +628,21 @@ def _fmt_toks(peak, single) -> str:
 
 def _status_cell(status: str) -> str:
     return f"[{_STATUS_STYLE.get(status, 'white')}]{status}[/]"
+
+
+# TOOL column palette — visually distinct, dark-terminal-safe; avoids green/yellow/red
+# (already claimed by STATUS) and dim/white/black. zlib.crc32 (not the builtin hash(),
+# which is PYTHONHASHSEED-randomized per process) gives a stable value -> color mapping
+# so the same runtime tag always renders the same color across separate `johnny` runs.
+_TOOL_PALETTE = ["cyan", "blue", "magenta", "bright_cyan", "bright_blue",
+                "bright_magenta", "purple", "turquoise2", "orchid", "deep_sky_blue1"]
+
+
+def _tool_cell(tool: str) -> str:
+    if not tool or tool == "—":
+        return "[dim]—[/]"
+    color = _TOOL_PALETTE[zlib.crc32(tool.encode()) % len(_TOOL_PALETTE)]
+    return f"[{color}]{tool}[/]"
 
 
 def _emit_table(renderable, wide: bool = False) -> None:
@@ -619,7 +710,7 @@ def _placements_table(rows, current, *, model_col: bool = False, pins: dict | No
     for col in ("GPUS", "MEM", "TP", "PRIORITY", "MML", "KV", "TOK/S"):
         t.add_column(col, no_wrap=True)
     t.add_column("STATUS", no_wrap=True)
-    t.add_column("TOOL", style="dim")
+    t.add_column("TOOL", no_wrap=True)
 
     prev = None
     for mid, p in rows:
@@ -637,7 +728,7 @@ def _placements_table(rows, current, *, model_col: bool = False, pins: dict | No
             _mem_cell(p),
             v["tp"], v["priority"], str(v["mml"] or "—"), v["kv"] or "—",
             _fmt_toks(v["peak"], v["single"]),
-            _status_cell(v["status"]), v["tool"],
+            _status_cell(v["status"]), _tool_cell(v["tool"]),
         ]
         t.add_row(*cells)
     return t
@@ -675,6 +766,7 @@ def registry_show(
         console.print(f"[bold]{model}[/]  [dim]path: {ident.get('local_path') or ident.get('repo_id') or '—'}[/]")
         console.print(f"  arch={ident.get('arch')} params={ident.get('params') or '—'} quant={ident.get('quant')} "
                       f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
+        _print_quant_mix(ident, backends)
         pins = _running_pins()
         _emit_table(_placements_table([(model, p) for p in pls], _current_runtimes(),
                                       pins=pins, identities={model: ident}), wide)
@@ -700,13 +792,13 @@ def registry_show(
     # Default: one scannable table across every model's placements (sparse MODEL column).
     console.print(f"[bold]registry — {len(models)} model(s)[/]  "
                   f"[dim]load: `johnny up <model> --placement <id>`  ·  -c for the terse index[/]")
-    rows = [(mid, p) for mid, m in sorted(models.items()) for p in (m.get("placements") or [])]
+    rows = [(mid, p) for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()) for p in (m.get("placements") or [])]
     pins = _running_pins()
     identities = {mid: (m.get("identity") or {}) for mid, m in models.items()}
     _emit_table(_placements_table(rows, _current_runtimes(), model_col=True, pins=pins, identities=identities), wide)
     if pins:
         console.print("[dim]\\[i,j] = live GPU pins (running now)[/]")
-    empty = [mid for mid, m in sorted(models.items()) if not (m.get("placements") or [])]
+    empty = [mid for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()) if not (m.get("placements") or [])]
     if empty:
         console.print(f"[dim]no placements: {', '.join(empty)} — `johnny induct <model>`[/]")
 
@@ -804,14 +896,14 @@ def registry_normalize(
     models_dir = (C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir")
 
     plan = []
-    for mid, m in sorted(models.items()):
+    for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()):
         for p in m.get("placements") or []:
             changes = N.normalization_changes(p)
             if changes:
                 plan.append({"model": mid, "placement": p.get("id"),
                              "status": N.placement_status(p, current), "changes": changes})
     ident_plan = []
-    for mid, m in sorted(models.items()):
+    for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()):
         fills = N.identity_gaps(mid, m, models_dir)
         if fills:
             ident_plan.append({"model": mid, "fills": fills})
@@ -998,7 +1090,7 @@ def _pick_placement_interactive(json_output: bool) -> tuple[str, str]:
     current = _current_runtimes()
     pins = _running_pins()
     items = [{"model": mid, "p": p, "current": current, "pins": pins}
-             for mid, m in sorted(models.items())
+             for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower())
              for p in (m.get("placements") or [])]
     if not items:
         err.print("[yellow]no placements in the registry[/] — run `johnny induct <model>` first.")
