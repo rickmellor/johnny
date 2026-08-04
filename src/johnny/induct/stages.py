@@ -150,7 +150,7 @@ def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], c
         env = {"NCCL_PROTO": "Simple", "HIP_FORCE_DEV_KERNARG": "1", "SAFETENSORS_FAST_GPU": "1"}
     return {
         "container_name": TUNING_CONTAINER,
-        "image": docker.get("vllm_image"),
+        "image": C.resolve_image(cfg, device="gpu", model_id=model_id),
         "served_model_name": model_id,
         "model_path": f"/models/{Path(local_path).relative_to(Path(roots['models_dir']).expanduser())}"
         if roots.get("models_dir") and str(local_path).startswith(str(Path(roots["models_dir"]).expanduser()))
@@ -180,7 +180,7 @@ def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], c
 def _cpu_tuning_spec(model_id: str, local_path: str, point: dict, cfg: dict) -> dict:
     roots = cfg.get("roots") or {}
     docker = cfg.get("docker") or {}
-    cpu_image = docker.get("cpu_image") or "vllm/vllm-openai-cpu:v0.20.2"
+    cpu_image = C.resolve_image(cfg, device="cpu", model_id=model_id)
     md = roots.get("models_dir")
     model_path = (
         f"/models/{Path(local_path).relative_to(Path(md).expanduser())}"
@@ -292,7 +292,7 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
     models reuse bench.sh (/v1/completions).
     """
     is_cpu = point.get("device") == "cpu"
-    drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu"))
+    drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu", model_id=model_id))
     spec = _cpu_tuning_spec(model_id, local_path, point, cfg) if is_cpu \
         else _tuning_spec(model_id, local_path, point, gpus, cfg, hardware)
 

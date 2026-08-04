@@ -107,7 +107,7 @@ def plan(model_ref: str, max_points: int | None = None, cfg: dict | None = None,
     a = stages.audit(path)
     rp = _resolve_plan(model_id, path, a, hw, cfg, device, embeddings, max_points, tp,
                        kv_dtypes=kv_dtypes, mml_override=mml_override)
-    image = C.resolve_image(cfg, device=rp["device"])
+    image = C.resolve_image(cfg, device=rp["device"], model_id=model_id)
     arch_ok, arch_why = stages.arch_supported(a.get("arch"), image)
     return {
         "model_id": model_id,
@@ -173,7 +173,7 @@ def run(
     _p(f"device={rp['device']} · embeddings={rp['embeddings']} · {len(rp['viable'])} viable, {len(rp['pruned'])} pruned")
 
     # Arch pre-flight: refuse to launch seats the image's vLLM can't even register.
-    image = C.resolve_image(cfg, device=rp["device"])
+    image = C.resolve_image(cfg, device=rp["device"], model_id=model_id)
     ok, why = stages.arch_supported(a.get("arch"), image)
     if not ok:
         _p(f"abort: {why}")
@@ -232,7 +232,11 @@ def run(
 
     placements, winner_pid = [], None
     if winner:
-        rtv = ((cfg.get("docker") or {}).get("vllm_image", "") or "").split(":")[-1] or "unknown"
+        # `image` is the resolved arch-preflight image above (line ~176) — a placement's
+        # own pin when one exists, else the global default. rtv/the placement's `image`
+        # field must both reflect what was ACTUALLY launched, not re-read the global
+        # config fresh (that silently drops a per-placement pin's tag on every re-tune).
+        rtv = (image or "").split(":")[-1] or "unknown"
         chosen = (select(results, winner) if select else None) or [winner]
         md = (cfg.get("roots") or {}).get("models_dir")
         try:
@@ -242,7 +246,7 @@ def run(
         for r in chosen:
             # Only the winner carries the use-case tag: a manually kept seat isn't the
             # "<use-case> winner", and the tag would skew launch-time auto-pick.
-            placement = report.to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None)
+            placement = report.to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None, image=image)
             report.write_placement(model_id, a, placement, hw, local_path=lp)
             placements.append(placement)
             if r is winner:

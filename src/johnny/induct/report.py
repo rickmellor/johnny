@@ -41,7 +41,8 @@ def _point_sig(point: dict) -> str:
     )
 
 
-def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_version: str, use_case: str | None) -> dict:
+def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_version: str, use_case: str | None,
+                 image: str | None = None) -> dict:
     point = winner["point"]
     vkey = {"hardware_fingerprint": hardware.fingerprint, "backend": "vllm", "runtime_version": runtime_version}
     perf = {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")}
@@ -55,7 +56,7 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
         return {
             "id": f"induct-cpu-{point.get('cpuset')}",
             "backend": "vllm",
-            "image": None,
+            "image": image,
             "use_case": use_case,
             "knobs": {
                 "gpu_count": 0, "tensor_parallel_size": None,
@@ -75,7 +76,7 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
     return {
         "id": f"induct-{_point_sig(point)}",
         "backend": "vllm",
-        "image": None,
+        "image": image,
         "use_case": use_case,
         "knobs": {
             "gpu_count": point["tp"],

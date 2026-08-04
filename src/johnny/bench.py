@@ -180,7 +180,8 @@ def _run_perf(port: int, container: str | None, model_id: str, point: dict, cfg:
     result: dict = {}
     if container:  # KV readback is best-effort — startup lines scroll off long-lived seats
         try:
-            drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if point.get("device") == "cpu" else "gpu"))
+            drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if point.get("device") == "cpu" else "gpu",
+                                                   model_id=model_id))
             result.update({k: v for k, v in stages._parse_kv_cache(
                 drv.logs(container, tail=2000) or "").items() if v is not None})
         except Exception:
@@ -275,7 +276,7 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
             gpus = assign_gpus(point["tp"], hw, free_gpus(hw, all_seats(cfg)))
             if len(gpus) < point["tp"]:
                 return {"error": f"insufficient free GPUs for tp={point['tp']} — down a seat first"}
-        drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu"))
+        drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu", model_id=model_id))
         spec = stages._cpu_tuning_spec(model_id, path, point, cfg) if is_cpu \
             else stages._tuning_spec(model_id, path, point, gpus, cfg, hw)
         # Bench what production runs: carry the placement's parsers/template into the seat.

@@ -142,11 +142,31 @@ def _default_vllm_image(vendor: str | None) -> str:
     return DEFAULT_VLLM_IMAGE_AMD
 
 
-def resolve_image(cfg: dict, *, device: str = "gpu", backend: str = "vllm") -> str | None:
+def resolve_image(cfg: dict, *, device: str = "gpu", backend: str = "vllm",
+                  model_id: str | None = None) -> str | None:
     """Effective docker image for a launch. Defaults the vLLM CPU image when the config
     omits `docker.cpu_image` (configs from before it existed), so `--device cpu` just works
-    instead of launching with a null image."""
+    instead of launching with a null image.
+
+    model_id: when given, an already-registered placement's own `image` pin wins over
+    the global default — the same per-placement override `johnny up` already honors
+    per-seat (engine/launch.py: `placement.get("image") or resolve_image(...)`). Without
+    this, tune/bench/induct always launched against the global default even when
+    re-tuning a model whose arch that image doesn't register (e.g. it needs a newer/
+    older build than the box is pinned to) — the sweep just failed instead of reusing
+    the image that's already known to work. Global default when the model is new or
+    has no placement carrying its own pin."""
     docker = (cfg or {}).get("docker") or {}
+    if model_id:
+        try:
+            from .registry import store
+
+            m = (store.load().get("models") or {}).get(model_id) or {}
+            for p in m.get("placements") or []:
+                if p.get("backend") == backend and p.get("image"):
+                    return p["image"]
+        except Exception:
+            pass
     if backend == "llamacpp":
         return docker.get("llamacpp_image")
     if device == "cpu":
