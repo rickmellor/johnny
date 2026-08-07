@@ -28,18 +28,39 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     roots = cfg.get("roots") or {}
     docker = cfg.get("docker") or {}
     ident = model.get("identity") or {}
+    extra = placement.get("extra") or {}
     local_path = ident.get("local_path")
     backend = placement.get("backend") or "vllm"
+    # llama.cpp placements may override the identity weights with a specific shard
+    # (extra.gguf_file, relative to the same roots); that's the file that actually
+    # gets loaded, so it's what path resolution (incl. NAS convention) applies to.
+    weights_rel = (extra.get("gguf_file") if backend == "llamacpp" else None) or local_path
+    nas_dir_needed = None
+    if weights_rel:
+        resolved = C.resolve_weights_path(weights_rel, cfg)
+        if resolved:
+            model_path = resolved.container_path
+            if resolved.root == "nas_dir":
+                nas_dir_needed = roots.get("nas_dir")
+        else:
+            # Not found under either configured root (e.g. a root is transiently
+            # unmounted) — fall back to the pre-existing blind /models/<rel>
+            # behavior rather than failing the launch outright; docker will surface
+            # a clear "file not found" if it's genuinely missing.
+            model_path = f"/models/{weights_rel}"
+    else:
+        model_path = None
     # A CPU/pooling placement must launch on the CPU image, not the GPU one.
-    device = "cpu" if (placement.get("extra") or {}).get("device") == "cpu" else "gpu"
+    device = "cpu" if extra.get("device") == "cpu" else "gpu"
     image = placement.get("image") or C.resolve_image(cfg, device=device, backend=backend)
     visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
     return {
         "container_name": f"johnny-{model_id}-{port}",
         "image": image,
         "served_model_name": model_id,
-        "model_path": f"/models/{local_path}" if local_path else None,
+        "model_path": model_path,
         "models_dir": roots.get("models_dir"),
+        "nas_dir": nas_dir_needed,
         "vllm_cache": roots.get("vllm_cache"),
         "port": port,
         "bind_address": (cfg.get("network") or {}).get("bind_address", "127.0.0.1"),
@@ -47,7 +68,7 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
         "visible_env": visible_env,
         "shm_size": docker.get("shm_size", "16g"),
         "knobs": placement.get("knobs") or {},
-        "extra": placement.get("extra") or {},
+        "extra": extra,
         "env": placement.get("env") or {},
         "labels": {
             "johnny.managed": "1",

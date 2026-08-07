@@ -34,6 +34,9 @@ def validate(reg: dict) -> list[str]:
         ident = m.get("identity") or {}
         if not (ident.get("repo_id") or ident.get("local_path")):
             errors.append(f"{where}.identity: needs repo_id or local_path")
+        ru = ident.get("recommended_use")
+        if ru is not None and not isinstance(ru, str):
+            errors.append(f"{where}.identity.recommended_use: not a string")
         placements = m.get("placements")
         if not isinstance(placements, list):
             errors.append(f"{where}.placements: not a list")

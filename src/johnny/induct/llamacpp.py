@@ -254,13 +254,44 @@ def _parse_llama_bench(out: str) -> tuple[float | None, float | None]:
     return pp, tg
 
 
+_BENCH_ENTRYPOINT_CACHE: dict[str, tuple[str, list[str], str]] = {}
+
+
+def _bench_entrypoint(image: str) -> tuple[str, list[str], str]:
+    """(entrypoint, prefix_args, fa_off_value) for this image's llama-bench convention.
+
+    Two conventions coexist on this box: older custom builds (`johnny-llamacpp-
+    qwen35:gfx1201`, `-dsv4`, etc.) ship a standalone `/opt/llamacpp/bin/llama-bench`
+    binary with boolean `-fa <0|1>`. The stock `ghcr.io/ggml-org/llama.cpp:server-
+    vulkan` image (`johnny-llamacpp-vulkan:latest`) restructured its CLI into a single
+    `/app/llama <subcommand>` entrypoint — no standalone llama-bench — with a
+    tri-state `-fa <on|off|auto>`. Hardcoding the old path/flag broke real sweeps for
+    any model on the new image. Detected via a throwaway `docker run --entrypoint
+    /bin/sh` probe, cached per image for the process lifetime."""
+    if image in _BENCH_ENTRYPOINT_CACHE:
+        return _BENCH_ENTRYPOINT_CACHE[image]
+    from ..util import run
+
+    rc, out, _ = run(
+        ["docker", "run", "--rm", "--entrypoint", "/bin/sh", image,
+         "-c", "test -x /opt/llamacpp/bin/llama-bench && echo legacy || echo restructured"],
+        timeout=60,
+    )
+    if rc == 0 and "legacy" in (out or ""):
+        result = ("/opt/llamacpp/bin/llama-bench", [], "0")
+    else:
+        result = ("/app/llama", ["bench"], "off")
+    _BENCH_ENTRYPOINT_CACHE[image] = result
+    return result
+
+
 def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
     """Speed-bench one config via llama-bench (loads the GGUF directly — no server).
     Returns clean single-stream prefill/decode t/s; supports -ncmoe/-ot offload points."""
     from ..util import run
 
-    docker = cfg.get("docker") or {}
-    image = docker.get("llamacpp_image")
+    image = C.resolve_image(cfg, backend="llamacpp", model_id=model_id)
+    entrypoint, bench_prefix, fa_off = _bench_entrypoint(image)
     md = (cfg.get("roots") or {}).get("models_dir")
     cpath = (
         f"/models/{Path(gguf_path).relative_to(Path(md).expanduser())}"
@@ -275,8 +306,8 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
         argv = [
             "docker", "run", "--rm", "--name", TUNING_CONTAINER, "--ipc=host",
             "-v", f"{md}:/models:ro",
-            "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
-            "-m", cpath, "-ngl", "0", "-fa", "0",
+            "--entrypoint", entrypoint, image, *bench_prefix,
+            "-m", cpath, "-ngl", "0", "-fa", fa_off,
             "-t", str(point.get("threads") or os.cpu_count() or 8),
             "-p", "512", "-n", "128", "-r", "2",
         ]
@@ -288,8 +319,8 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
             "--security-opt", "seccomp=unconfined", "--ipc=host",
             "-v", f"{md}:/models:ro",
             "-e", f"{visible_env}={','.join(str(g) for g in gpus)}",
-            "--entrypoint", "/opt/llamacpp/bin/llama-bench", image,
-            "-m", cpath, "-ngl", str(point.get("n_gpu_layers", 999)), "-fa", "0",
+            "--entrypoint", entrypoint, image, *bench_prefix,
+            "-m", cpath, "-ngl", str(point.get("n_gpu_layers", 999)), "-fa", fa_off,
             "-p", "512", "-n", "128", "-r", "2",
         ]
         if point.get("n_cpu_moe"):
@@ -356,7 +387,7 @@ def to_placement(model_id: str, winner: dict, audit_info: dict, hardware, runtim
         "id": f"induct-{_point_sig(p)}",
         **({"mem": mem} if mem else {}),
         "backend": "llamacpp",
-        "image": (load_config().get("docker") or {}).get("llamacpp_image"),
+        "image": C.resolve_image(load_config(), backend="llamacpp", model_id=model_id),
         "use_case": use_case,
         "knobs": {
             "gpu_count": p.get("gpu_count"),

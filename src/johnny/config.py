@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import platformdirs
 import yaml
@@ -114,6 +115,12 @@ def autodiscover() -> dict:
     vc = _first_existing([home / "vllm" / "vllm-cache"])
     if vc:
         roots["vllm_cache"] = vc
+    # The permanent NAS store (read-only mount into a launched container, see
+    # resolve_weights_path below) — optional like vllm_cache/launchers_dir: only
+    # recorded if something is actually mounted there on this box.
+    nas = os.environ.get("JOHNNY_NAS_DIR") or _first_existing([Path("/mnt/ug-models")])
+    if nas:
+        roots["nas_dir"] = nas
     roots["results_dir"] = str(paths.runs_dir)
     ld = _first_existing([home / "vllm" / "launchers"])
     if ld:
@@ -134,6 +141,61 @@ def autodiscover() -> dict:
         "roots": roots,
         "backends": backends,
     }
+
+
+class ResolvedWeights(NamedTuple):
+    """A registry-relative weights path resolved against the box's configured
+    roots. `container_path` is the path as it will actually appear *inside* the
+    launched container (mount prefix baked in) — the thing callers building a
+    launch spec actually need, not just a host-side absolute path. `root` is
+    which `roots.*` key served it ("models_dir" or "nas_dir"), so a caller can
+    tell whether the NAS mount needs to be attached to this launch at all."""
+
+    host_path: str
+    container_path: str
+    root: str
+
+
+# roots.models_dir mounts read-write at /models (existing behavior); roots.nas_dir
+# mounts read-only at /nas (this feature) — see backends/llamacpp.py, backends/vllm.py.
+_ROOT_MOUNTS = (("models_dir", "/models"), ("nas_dir", "/nas"))
+
+
+def resolve_weights_path(rel_path: str, cfg: dict) -> ResolvedWeights | None:
+    """Resolve a registry path (`identity.local_path` or a llama.cpp placement's
+    `extra.gguf_file`) against `roots.models_dir` (local, disposable) and
+    `roots.nas_dir` (permanent NAS store, mounted read-only).
+
+    Convention: a leading `nas:` prefix (e.g. `nas:vendor/Model/file.gguf`) is an
+    explicit, unambiguous request to resolve under `roots.nas_dir` — use this for
+    any registry entry that intentionally references a NAS-only file, so the
+    registry.yaml itself documents *why* a plain `johnny.models_dir` copy doesn't
+    exist. Without the prefix, resolution is existence-based (mirrors the cascade
+    `bench._local_path` already used before this): try `models_dir` first (the
+    common case — most weights are the local copy), then fall back to `nas_dir` so
+    a file that quietly only exists on the NAS still loads instead of failing with
+    a confusing "not found" against a path that's technically valid, just on the
+    other root.
+
+    Returns None if `rel_path` can't be found under either configured root (or
+    the indicated one, when `nas:`-prefixed) — callers should fall back to their
+    own pre-existing default behavior rather than treat this as fatal, since a
+    root can be transiently unmounted (e.g. the NAS autofs mount hasn't fired
+    yet) without the file actually being gone.
+    """
+    roots = cfg.get("roots") or {}
+    forced_nas = rel_path.startswith("nas:")
+    clean = rel_path[len("nas:") :] if forced_nas else rel_path
+
+    order = [("nas_dir", "/nas")] if forced_nas else list(_ROOT_MOUNTS)
+    for root_key, prefix in order:
+        root = roots.get(root_key)
+        if not root:
+            continue
+        p = Path(root).expanduser() / clean
+        if p.exists():
+            return ResolvedWeights(str(p), f"{prefix}/{clean}", root_key)
+    return None
 
 
 def _default_vllm_image(vendor: str | None) -> str:

@@ -152,6 +152,12 @@ class LlamaCppDriver(Driver):
         args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
         if spec.get("models_dir"):
             args += ["-v", f"{spec['models_dir']}:/models:ro"]
+        if spec.get("nas_dir"):
+            # Second, read-only mount for weights that resolved onto roots.nas_dir
+            # (engine.launch.build_spec / config.resolve_weights_path) — only attached
+            # when this launch's weights actually came from there, so a launch that
+            # never references the NAS doesn't pay for (or expose) the extra mount.
+            args += ["-v", f"{spec['nas_dir']}:/nas:ro"]
         args += ["-p", f"{spec.get('bind_address', '127.0.0.1')}:{spec['port']}:{_CONTAINER_PORT}"]
         if gpus:
             args += ["-e", f"{spec.get('visible_env', 'CUDA_VISIBLE_DEVICES')}={','.join(str(g) for g in gpus)}"]
@@ -162,10 +168,11 @@ class LlamaCppDriver(Driver):
 
         args += [spec["image"]]  # ENTRYPOINT = llama-server
 
-        # model file: extra.gguf_file (relative to /models) overrides the identity path.
-        gguf = extra.get("gguf_file")
-        model_path = f"/models/{gguf}" if gguf else spec.get("model_path")
-        args += ["-m", model_path]
+        # model file: engine.launch.build_spec already resolved extra.gguf_file (if
+        # any) as an override over the identity path, and resolved which root/mount
+        # (/models or /nas) it actually lives under — spec["model_path"] is the final,
+        # already-container-relative path. Don't re-derive it here.
+        args += ["-m", spec.get("model_path")]
         args += ["--host", "0.0.0.0", "--port", str(_CONTAINER_PORT)]
         args += ["--alias", spec["served_model_name"]]
         args += ["-ngl", str(knobs.get("n_gpu_layers", 999))]

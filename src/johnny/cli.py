@@ -589,6 +589,39 @@ def _registry_compact_table(models: dict) -> Table:
     return t
 
 
+def _backup_registry_file():
+    """Timestamped copy of registry.yaml before a hand-rolled mutation outside the normal
+    induction/import write paths (house convention — same pattern as `registry normalize
+    --apply`). Returns the backup Path, or None if there's no registry file yet to copy."""
+    import shutil
+    from datetime import datetime
+
+    p = C.get_paths().registry_file
+    if not p.exists():
+        return None
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = p.with_name(f"{p.name}.bak-{ts}")
+    shutil.copy2(p, backup)
+    return backup
+
+
+def _resolve_model(models: dict, query: str) -> str:
+    """Exact model id, else the unique case-insensitive substring match — same resolution
+    style as `registry delete`. Exits (candidates listed) on zero or multiple hits."""
+    if query in models:
+        return query
+    hits = [mid for mid in models if query.lower() in mid.lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        err.print(f"[red]no model[/] matching '{query}' in the registry.")
+        raise typer.Exit(code=1)
+    err.print(f"[red]'{query}' is ambiguous[/] — matches {len(hits)}:")
+    for mid in hits:
+        console.print(f"  • {mid}")
+    raise typer.Exit(code=1)
+
+
 def _current_runtimes() -> dict:
     """Backend -> current launch image, for staleness checks (loaded once per command)."""
     from .registry import normalize as N
@@ -665,6 +698,20 @@ def _print_worklist(worklist: list[dict]) -> None:
         console.print(f"  {_status_cell(w['status'])}  [cyan]{w['model']}[/] / [bold]{w['placement']}[/]")
 
 
+def _print_ctxsafe_worklist(worklist: list[dict]) -> None:
+    """Large-context placements that have never had `ctxsafe` run — see the 2026-08-06
+    incident in AGENTS.md § Context safety: a configured max_model_len alone is not
+    proof a real deep prefill survives it."""
+    if not worklist:
+        return
+    console.print(f"\n[bold]needs `johnny bench <target> --suite ctxsafe`[/] — {len(worklist)} "
+                 "large-context placement(s) never had their configured max_model_len "
+                 "empirically verified safe:")
+    for w in worklist:
+        console.print(f"  [yellow]untested[/]  [cyan]{w['model']}[/] / [bold]{w['placement']}[/] "
+                      f"(max_model_len={w['max_model_len']:,})")
+
+
 def _mem_cell(p: dict) -> str:
     """Weight placement: '111G+111G' = VRAM + CPU-RAM offload (yellow), '111G' =
     all-GPU. Recorded at induction for llamacpp placements; '—' when unknown."""
@@ -686,50 +733,172 @@ def _gpus_cell(gcount, pins) -> str:
     return base
 
 
-def _placements_table(rows, current, *, model_col: bool = False, pins: dict | None = None,
-                      identities: dict | None = None, title: str = "") -> Table:
-    """The standardized per-placement view: weights dtype + KV-cache dtype, GPUs the seat
-    takes, TP/parallelism, tuning priority, context, measured tok/s, honest status, and the
-    runtime it was tuned on.
+# --------------------------------------------------------------------------- columns
+# `registry show`'s column selector. Each key maps to a (HEADER, description) pair — the
+# description only surfaces in `--columns list`. _DEFAULT_COLUMNS is the terse, "what do I
+# need to know at a glance" set; _ALL_COLUMNS is everything (== --wide's column set, and
+# roughly the table's original fixed shape plus SOURCE + the new USE column tacked on).
+_COLUMN_SPECS: dict[str, tuple[str, str]] = {
+    "model":  ("MODEL", "registry model id"),
+    "params": ("PARAMS", "parameter count"),
+    "id":     ("ID", "placement id — for `up --placement`, `registry delete`"),
+    "backend": ("BACKEND", "vllm | llamacpp"),
+    "quant":  ("DTYPE", "weights quant/dtype"),
+    "gpus":   ("GPUS", "GPU card count (+ live pins when the seat is running)"),
+    "mem":    ("MEM", "VRAM(+CPU-RAM offload) footprint"),
+    "tp":     ("TP", "tensor-parallel size"),
+    "priority": ("PRIORITY", "sweep winner-pick basis — throughput/latency/context "
+                             "(`induct --use-case`); NOT the same as the USE column"),
+    "context": ("CONTEXT", "configured/native context window"),
+    "kv":     ("KV", "KV-cache dtype"),
+    "speed":  ("TOK/S", "measured peak/single-stream tok/s"),
+    "status": ("STATUS", "validated | unmeasured | stale | incomplete | unverified"),
+    "tool":   ("TOOL", "runtime image tag the placement was tuned on"),
+    "source": ("SOURCE", "imported | induction | manual"),
+    "recommended_use": ("USE", "free-text 'what's this good for' (`registry set-use`)"),
+}
+_DEFAULT_COLUMNS = ["model", "params", "quant", "context", "speed", "recommended_use"]
+_ALL_COLUMNS = ["model", "params", "id", "backend", "quant", "gpus", "mem", "tp",
+                "priority", "context", "kv", "speed", "status", "tool", "source",
+                "recommended_use"]
+_NO_WRAP_COLUMNS = {"model", "params", "id", "backend", "quant", "gpus", "mem", "tp",
+                    "priority", "context", "kv", "speed", "status", "tool", "source",
+                    "recommended_use"}
+# Every column truncates with '…' instead of wrapping (uneven multi-line rows are hard to
+# scan) — min_width is a floor so short columns can't be squeezed to nothing when a wide
+# variable-length column is also present at a narrow terminal; max_width is a ceiling only
+# on the columns whose content length actually varies a lot (model names, recommended_use),
+# generous enough to rarely truncate when they're one of just a few columns shown, but
+# bounded so they don't monopolize width away from everything else in the default view.
+_MIN_WIDTH_COLUMNS = {"model": 12, "params": 6, "quant": 6, "context": 8, "speed": 8}
+_MAX_WIDTH_COLUMNS = {"model": 36, "recommended_use": 72}
+_COLUMN_ALIASES = {
+    "ctx": "context", "dtype": "quant", "tok_s": "speed", "toks": "speed",
+    "tokspeed": "speed", "use": "recommended_use", "rec": "recommended_use",
+    "recommend": "recommended_use", "recommended": "recommended_use",
+}
+
+
+def _parse_columns(spec: str | None, wide: bool) -> list[str]:
+    """--columns parsing. None -> the default set (or every column under --wide); 'all' ->
+    every column explicitly; else a comma-separated key list (aliases resolved, unknown keys
+    rejected with a pointer to `--columns list`)."""
+    if not spec:
+        return list(_ALL_COLUMNS if wide else _DEFAULT_COLUMNS)
+    if spec.strip().lower() == "all":
+        return list(_ALL_COLUMNS)
+    cols, unknown = [], []
+    for raw in spec.split(","):
+        k = raw.strip().lower()
+        if not k:
+            continue
+        k = _COLUMN_ALIASES.get(k, k)
+        (cols if k in _COLUMN_SPECS else unknown).append(k)
+    if unknown:
+        raise ValueError(f"unknown column(s): {', '.join(unknown)} — "
+                         f"`johnny registry show --columns list` for the full set")
+    return cols
+
+
+def _print_column_help() -> None:
+    t = Table(title="registry show --columns", title_style="bold")
+    t.add_column("KEY", style="cyan")
+    t.add_column("HEADER")
+    t.add_column("MEANING")
+    for key in _ALL_COLUMNS:
+        header, desc = _COLUMN_SPECS[key]
+        t.add_row(key, header, desc)
+    console.print(t)
+    console.print(f"[dim]default: {','.join(_DEFAULT_COLUMNS)}[/]")
+    console.print(f"[dim]all (= --wide): {','.join(_ALL_COLUMNS)}[/]")
+    console.print("[dim]aliases: ctx→context, dtype→quant, tok_s/toks→speed, use/rec→recommended_use[/]")
+
+
+def _context_cell(mml, native, verified_safe=None) -> str:
+    """'configured/native' context window (e.g. '32K/128K'); collapses to one value when
+    they agree or only one is known, '—' when neither is. When a `ctxsafe` probe has run
+    (see bench.py) and found the empirically verified-safe depth BELOW the configured
+    max_model_len, that's appended in red — the exact silent gap (config says one thing,
+    a real deep prefill crashes the seat) that caused the 2026-08-06 Ornith incident."""
+    if not mml and not native:
+        return "[dim]—[/]"
+    if mml and native and mml == native:
+        base = _fmt_context(native)
+    else:
+        base = f"{_fmt_context(mml) if mml else '—'}/{_fmt_context(native) if native else '—'}"
+    if verified_safe and mml and verified_safe < mml:
+        base += f" [red](safe:{_fmt_context(verified_safe)})[/]"
+    return base
+
+
+def _column_cell(key: str, mid: str, p: dict, v: dict, identities: dict, caps: dict, pins: dict) -> str:
+    ident = identities.get(mid) or {}
+    if key == "model":
+        return mid  # sparse-blanked by the caller for repeat rows
+    if key == "params":
+        return _ident_params(ident)
+    if key == "id":
+        return v["id"]
+    if key == "backend":
+        return v["backend"]
+    if key == "quant":
+        return v["dtype"] or ident.get("quant") or "—"
+    if key == "gpus":
+        return _gpus_cell(v["gpus"], pins.get((mid, v["id"])))
+    if key == "mem":
+        return _mem_cell(p)
+    if key == "tp":
+        return v["tp"] or "—"
+    if key == "priority":
+        return v["priority"]
+    if key == "context":
+        vsafe = ((p.get("quality") or {}).get("ctxsafe") or {}).get("verified_safe_tokens")
+        return _context_cell(v["mml"], (caps.get(mid) or {}).get("native_context"), vsafe)
+    if key == "kv":
+        return v["kv"] or "—"
+    if key == "speed":
+        return _fmt_toks(v["peak"], v["single"])
+    if key == "status":
+        return _status_cell(v["status"])
+    if key == "tool":
+        return _tool_cell(v["tool"])
+    if key == "source":
+        return v["source"]
+    if key == "recommended_use":
+        return ident.get("recommended_use") or "[dim]—[/]"
+    return "—"
+
+
+def _placements_table(rows, current, *, columns: list[str] | None = None, pins: dict | None = None,
+                      identities: dict | None = None, caps: dict | None = None, title: str = "") -> Table:
+    """The standardized per-placement view — column set driven by `columns` (see
+    _DEFAULT_COLUMNS / _ALL_COLUMNS / `registry show --columns`).
 
     `rows` is an iterable of (model_id, placement) so the all-models view can render one
     scannable table (sparse MODEL column) rather than a header per model. `pins` maps
     (model, placement) -> live GPU indices for running seats; `identities` maps model -> its
-    identity block (for the dtype fallback when a placement doesn't override quant). Numeric
-    columns are no_wrap so they never collapse to '…' on a narrow terminal."""
+    identity block (dtype fallback + recommended_use); `caps` maps model -> its capabilities
+    block (native_context, for the CONTEXT column). Most columns are no_wrap so they never
+    collapse to '…' on a narrow terminal — MODEL/BACKEND/USE are left free to wrap instead."""
     from .registry import normalize as N
 
-    pins, identities = pins or {}, identities or {}
+    columns = columns or _DEFAULT_COLUMNS
+    pins, identities, caps = pins or {}, identities or {}, caps or {}
     t = Table(title=title or None, title_style="dim", title_justify="left", pad_edge=False)
-    if model_col:
-        t.add_column("MODEL", style="bold")
-        t.add_column("PARAMS", no_wrap=True)
-    t.add_column("ID", style="cyan")
-    t.add_column("BACKEND", style="dim")
-    t.add_column("DTYPE", no_wrap=True)
-    for col in ("GPUS", "MEM", "TP", "PRIORITY", "MML", "KV", "TOK/S"):
-        t.add_column(col, no_wrap=True)
-    t.add_column("STATUS", no_wrap=True)
-    t.add_column("TOOL", no_wrap=True)
+    for key in columns:
+        header, _desc = _COLUMN_SPECS.get(key, (key.upper(), ""))
+        style = "bold" if key == "model" else ("cyan" if key == "id" else None)
+        t.add_column(header, style=style, no_wrap=key in _NO_WRAP_COLUMNS,
+                     min_width=_MIN_WIDTH_COLUMNS.get(key), max_width=_MAX_WIDTH_COLUMNS.get(key),
+                     overflow="ellipsis" if key in _NO_WRAP_COLUMNS else None)
 
     prev = None
     for mid, p in rows:
         v = N.placement_view(p, current)
-        dtype = v["dtype"] or (identities.get(mid, {}) or {}).get("quant") or "—"
-        cells = []
-        if model_col:
-            first = mid != prev
-            cells.append(mid if first else "")
-            cells.append(_ident_params(identities.get(mid, {})) if first else "")
-            prev = mid
-        cells += [
-            v["id"], v["backend"], dtype,
-            _gpus_cell(v["gpus"], pins.get((mid, v["id"]))),
-            _mem_cell(p),
-            v["tp"], v["priority"], str(v["mml"] or "—"), v["kv"] or "—",
-            _fmt_toks(v["peak"], v["single"]),
-            _status_cell(v["status"]), _tool_cell(v["tool"]),
-        ]
+        first = mid != prev
+        prev = mid
+        cells = [(mid if first else "") if key == "model"
+                else _column_cell(key, mid, p, v, identities, caps, pins) for key in columns]
         t.add_row(*cells)
     return t
 
@@ -738,17 +907,32 @@ def _placements_table(rows, current, *, model_col: bool = False, pins: dict | No
 def registry_show(
     model: str = typer.Argument(None, help="Model id to detail; omit to list all."),
     compact: bool = typer.Option(False, "--compact", "-c", help="Terse one-row-per-model index (omit placements)."),
-    wide: bool = typer.Option(False, "--wide", "-w", help="Render the full table even if wider than the terminal (no column collapsing; pipe to `less -S` to scroll)."),
+    wide: bool = typer.Option(False, "--wide", "-w", help="Render at full width (no column collapsing; pipe to `less -S` to scroll), and — unless --columns overrides it — show every column. Shorthand for `--columns all`."),
+    columns: str = typer.Option(None, "--columns", help="Comma-separated columns to show, or 'all' for every column, or 'list' to print the full set with descriptions and exit. Available: "
+                                + ", ".join(_ALL_COLUMNS) + f". Default: {', '.join(_DEFAULT_COLUMNS)}."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """List registry models with their placements (or detail one model).
 
     Placements are what you load (`up --placement <id>`) and prune
     (`registry delete <model> <id>`), so they're shown by default; -c for the index.
-    By default the table scales to your terminal (columns may collapse to '…'); -w
-    prints it at full width instead.
+    By default a terse column set scales to your terminal; --columns picks exactly which
+    columns to show (`--columns list` prints the full set); --wide is shorthand for every
+    column at full, uncollapsed width.
     """
     from .registry import store
+
+    if columns and columns.strip().lower() in ("list", "help", "?"):
+        _print_column_help()
+        return
+    if compact and columns:
+        err.print("[red]--columns[/] doesn't apply with --compact (a fixed one-row-per-model table) — drop one or the other.")
+        raise typer.Exit(code=1)
+    try:
+        cols = _parse_columns(columns, wide)
+    except ValueError as e:
+        err.print(f"[red]{e}[/]")
+        raise typer.Exit(code=1)
 
     reg = store.load()
     models = store.models(reg)
@@ -756,6 +940,12 @@ def registry_show(
         m = models.get(model)
         if not m:
             err.print(f"[red]no model[/] '{model}' in the registry")
+            stray_key = _COLUMN_ALIASES.get(model.strip().lower(), model.strip().lower())
+            if stray_key in _COLUMN_SPECS:
+                err.print(f"[dim]'{model}' looks like a --columns value that got split by your shell — "
+                          f"a space after a comma in an unquoted --columns list breaks into separate "
+                          f"arguments. Try: --columns {model.strip().lower()}... (no space) or quote the "
+                          f"whole list: --columns \"...\"[/]")
             raise typer.Exit(code=1)
         if json_output:
             console.print(_json.dumps(m, indent=2))
@@ -766,10 +956,13 @@ def registry_show(
         console.print(f"[bold]{model}[/]  [dim]path: {ident.get('local_path') or ident.get('repo_id') or '—'}[/]")
         console.print(f"  arch={ident.get('arch')} params={ident.get('params') or '—'} quant={ident.get('quant')} "
                       f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
+        if ident.get("recommended_use"):
+            console.print(f"  [dim]use:[/] {ident['recommended_use']}")
         _print_quant_mix(ident, backends)
         pins = _running_pins()
-        _emit_table(_placements_table([(model, p) for p in pls], _current_runtimes(),
-                                      pins=pins, identities={model: ident}), wide)
+        _emit_table(_placements_table([(model, p) for p in pls], _current_runtimes(), columns=cols,
+                                      pins=pins, identities={model: ident},
+                                      caps={model: m.get("capabilities") or {}}), wide)
         if any((model, p.get("id")) in pins for p in pls):
             console.print("[dim]\\[i,j] = live GPU pins (running now)[/]")
         return
@@ -791,16 +984,72 @@ def registry_show(
 
     # Default: one scannable table across every model's placements (sparse MODEL column).
     console.print(f"[bold]registry — {len(models)} model(s)[/]  "
-                  f"[dim]load: `johnny up <model> --placement <id>`  ·  -c for the terse index[/]")
+                  f"[dim]load: `johnny up <model> --placement <id>`  ·  -c for the terse index  ·  "
+                  f"--columns list for column choices[/]")
     rows = [(mid, p) for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()) for p in (m.get("placements") or [])]
     pins = _running_pins()
     identities = {mid: (m.get("identity") or {}) for mid, m in models.items()}
-    _emit_table(_placements_table(rows, _current_runtimes(), model_col=True, pins=pins, identities=identities), wide)
+    caps = {mid: (m.get("capabilities") or {}) for mid, m in models.items()}
+    _emit_table(_placements_table(rows, _current_runtimes(), columns=cols, pins=pins,
+                                  identities=identities, caps=caps), wide)
     if pins:
         console.print("[dim]\\[i,j] = live GPU pins (running now)[/]")
     empty = [mid for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()) if not (m.get("placements") or [])]
     if empty:
         console.print(f"[dim]no placements: {', '.join(empty)} — `johnny induct <model>`[/]")
+
+
+@registry_app.command("set-use")
+def registry_set_use(
+    model: str = typer.Argument(..., help="Registry model id (exact or unique substring)."),
+    text: str = typer.Argument(None, help="Free-text 'what is this model good for' (e.g. \"coding — top pick\", \"general flagship / reasoning\"). Omit with --clear to remove it."),
+    clear: bool = typer.Option(False, "--clear", help="Clear identity.recommended_use instead of setting it."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Set (or clear) a model's `identity.recommended_use` — the free-text "what's this good
+    for" summary shown as the USE column in `registry show` (and by `registry show <model>`).
+
+    This is deliberately separate from `induct`/`tune --use-case`, which is a narrow
+    throughput/latency/context knob that only decides which sweep candidate wins — it says
+    nothing about what the model is actually good at. `recommended_use` is a broader, human
+    call (coding, long-context, general reasoning, speed-critical, multimodal, ...), and it's
+    normally best set or refined *after* real benchmark evidence rather than guessed up
+    front — e.g. run `johnny bench <model> --suite humaneval` first, then:
+
+      johnny registry set-use qwen-27b-coder "coding — top pick (92% HumanEval pass@1)"
+      johnny registry set-use qwen-27b-coder --clear
+
+    It can also be set at induction time via `induct --recommended-use`, for the cases
+    where you already know the answer going in.
+    """
+    from .registry import store
+
+    reg = store.load()
+    mid = _resolve_model(store.models(reg), model)
+    m = store.get(reg, mid)
+    ident = m.setdefault("identity", {})
+
+    if clear:
+        had = ident.pop("recommended_use", None)
+        if had is None:
+            console.print(f"[dim]{mid} had no recommended_use set — nothing to clear.[/]")
+            return
+    else:
+        if not text or not text.strip():
+            err.print("[red]missing text[/] — pass a description, or --clear to remove it.")
+            raise typer.Exit(code=1)
+        ident["recommended_use"] = text.strip()
+
+    backup = _backup_registry_file()
+    store.save(reg)
+    if json_output:
+        console.print(_json.dumps({"model": mid, "recommended_use": ident.get("recommended_use")}, indent=2))
+        return
+    tail = f"  [dim](backup {backup.name})[/]" if backup else ""
+    if clear:
+        console.print(f"[green]✓ cleared[/] recommended_use on [bold]{mid}[/]{tail}")
+    else:
+        console.print(f"[green]✓ set[/] [bold]{mid}[/] recommended_use → {ident['recommended_use']!r}{tail}")
 
 
 @registry_app.command("import")
@@ -846,19 +1095,24 @@ def registry_import(
 
 @registry_app.command("validate")
 def registry_validate(json_output: bool = typer.Option(False, "--json", help="Machine-readable output.")) -> None:
-    """Validate the registry against the schema, and report the re-tune worklist.
+    """Validate the registry against the schema, and report the re-tune + ctxsafe worklists.
 
-    Two distinct things: schema *errors* (structural — fix with `registry normalize` or by
-    editing) and the *worklist* of placements that are structurally fine but lack
-    trustworthy numbers (unmeasured / incomplete / stale) — those need `johnny tune`.
+    Three distinct things: schema *errors* (structural — fix with `registry normalize` or by
+    editing), the *retune worklist* of placements that are structurally fine but lack
+    trustworthy numbers (unmeasured / incomplete / stale — those need `johnny tune`), and the
+    *ctxsafe worklist* of large-context placements whose configured max_model_len was never
+    empirically verified safe against a real deep prefill (`johnny bench --suite ctxsafe`) —
+    see AGENTS.md § Context safety for why a configured number alone isn't proof.
     """
     from .registry import normalize as N, schema, store
 
     reg = store.load()
     errors = schema.validate(reg)
     worklist = N.retune_worklist(reg, _current_runtimes())
+    ctxsafe_worklist = N.ctxsafe_worklist(reg)
     if json_output:
-        console.print(_json.dumps({"valid": not errors, "errors": errors, "worklist": worklist}, indent=2))
+        console.print(_json.dumps({"valid": not errors, "errors": errors, "worklist": worklist,
+                                   "ctxsafe_worklist": ctxsafe_worklist}, indent=2))
         raise typer.Exit(code=1 if errors else 0)
     if not errors:
         console.print("[green]✓ registry is valid[/]")
@@ -866,6 +1120,7 @@ def registry_validate(json_output: bool = typer.Option(False, "--json", help="Ma
         for e in errors:
             err.print(f"[red]✗[/] {e}")
     _print_worklist(worklist)
+    _print_ctxsafe_worklist(ctxsafe_worklist)
     if errors:
         raise typer.Exit(code=1)
 
@@ -893,7 +1148,7 @@ def registry_normalize(
     reg = store.load()
     current = _current_runtimes()
     models = store.models(reg)
-    models_dir = (C.load_yaml(C.get_paths().config_file) or {}).get("roots", {}).get("models_dir")
+    run_cfg = C.load_yaml(C.get_paths().config_file) or {}
 
     plan = []
     for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()):
@@ -904,7 +1159,7 @@ def registry_normalize(
                              "status": N.placement_status(p, current), "changes": changes})
     ident_plan = []
     for mid, m in sorted(models.items(), key=lambda kv: kv[0].lower()):
-        fills = N.identity_gaps(mid, m, models_dir)
+        fills = N.identity_gaps(mid, m, run_cfg)
         if fills:
             ident_plan.append({"model": mid, "fills": fills})
     total = sum(len(x["changes"]) for x in plan) + sum(len(x["fills"]) for x in ident_plan)
@@ -1505,10 +1760,15 @@ def _pick_seats(results, winner, use_case, state) -> list | None:
 
 
 def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes,
-                json_output, kv=None, sweep_kv=False, mml=None) -> None:
+                json_output, kv=None, sweep_kv=False, mml=None, recommended_use=None) -> None:
     """Shared induction implementation for `induct` and `tune`. A plain function so neither
     command invokes the other: calling a Typer command directly passes its unfilled options
-    as raw OptionInfo sentinels (the `--tp <OptionInfo>` bug), never the real defaults."""
+    as raw OptionInfo sentinels (the `--tp <OptionInfo>` bug), never the real defaults.
+
+    `use_case` here is the narrow sweep winner-pick tiebreaker (throughput/latency/context —
+    see `_render_sweep_results`/`_pick_seats`); `recommended_use`, when passed, is the
+    broader free-text "what's this good for" note — unrelated field, written to
+    identity.recommended_use once a placement is actually won (never on --plan or on error)."""
     from .induct import pipeline
 
     kv_dtypes = _kv_dtypes(kv, sweep_kv)
@@ -1558,6 +1818,21 @@ def _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, ma
                            kv_dtypes=kv_dtypes, mml_override=mml, select=picker)
     except Exception as e:
         _emit_err(e, json_output)
+    if recommended_use and not res.get("error"):
+        from .registry import store as _store
+
+        reg2 = _store.load()
+        m2 = _store.get(reg2, res.get("model_id") or model)
+        if m2 is not None:
+            m2.setdefault("identity", {})["recommended_use"] = recommended_use
+            _backup_registry_file()
+            _store.save(reg2)
+            if not json_output:
+                console.print(f"  [dim]recommended_use set on {res.get('model_id') or model}: "
+                              f"{recommended_use!r}[/]")
+        elif not json_output:
+            console.print(f"[yellow]couldn't resolve a registry model id to set recommended_use on "
+                          f"(tried '{res.get('model_id') or model}') — use `registry set-use` once it's written.[/]")
     if json_output:
         console.print(_json.dumps(res, indent=2, default=str))
         return
@@ -1602,12 +1877,13 @@ def induct(
     plan: bool = typer.Option(False, "--plan", help="Dry preview: viable placements + candidate grid, no launches."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
+    recommended_use: str = typer.Option(None, "--recommended-use", help="Free-text 'what is this model good for' (coding, long-context, general reasoning, speed-critical, multimodal, ...) written to identity.recommended_use once a placement is won — unrelated to --use-case (that's only a sweep winner-pick tiebreaker). Often clearer *after* real bench evidence than up front; see `johnny registry set-use` to set/update it later."),
     yes: bool = typer.Option(False, "--yes", help="Skip prompts (pre-sweep confirmation + end-of-sweep seat picker; writes the winner only)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Auto-tune a model into an optimal placement (tuning by default; GPU or CPU)."""
     _run_induct(model, use_case, device, tp, embeddings, bench, plan, resume, max_points, yes,
-                json_output, kv, sweep_kv, mml)
+                json_output, kv, sweep_kv, mml, recommended_use)
 
 
 @app.command(rich_help_panel=_P_MODELS)
@@ -1621,22 +1897,24 @@ def tune(
     mml: int = typer.Option(None, "--mml", help="Force max_model_len (capped at the VRAM ceiling for the KV dtype)."),
     resume: bool = typer.Option(False, "--resume", help="Continue a previous run, skipping done points."),
     max_points: int = typer.Option(None, "--max-points", help="Cap candidate points (bounded runs)."),
+    recommended_use: str = typer.Option(None, "--recommended-use", help="Free-text 'what is this model good for' — see `johnny induct --help` for the full explanation. Best set/refreshed after real bench evidence; `johnny registry set-use` does the same thing without a re-tune."),
     yes: bool = typer.Option(False, "--yes", help="Skip prompts (pre-sweep confirmation + end-of-sweep seat picker; writes the winner only)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Re-tune an existing model (induction, tuning-only). A focused alias for `induct`
     with tuning-only behavior; see `johnny induct --help` for the full option set."""
     _run_induct(model, use_case, device, tp, None, False, False, resume, max_points, yes,
-                json_output, kv, sweep_kv, mml)
+                json_output, kv, sweep_kv, mml, recommended_use)
 
 
 @app.command(rich_help_panel=_P_MODELS)
 def bench(
     target: str = typer.Argument(None, help="Model id or placement id (exact or unique substring). Omit to pick from the registry."),
-    suite: str = typer.Option("perf,arc", "--suite", help="Comma-separated suites: perf (throughput/single-stream bench — refreshes the placement's perf numbers) · arc (ARC-Challenge CoT accuracy; needs the optional eval deps: `pipx inject johnny-fleet openai datasets`). Planned: humaneval, needle."),
-    limit: int = typer.Option(None, "--limit", help="arc: only the first N questions — a quick smoke. The full set is 1172 CoT questions (an hour-ish on a mid-size seat)."),
-    concurrency: int = typer.Option(8, "--concurrency", help="arc: parallel requests against the seat."),
-    thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="arc: leave model thinking on. Default off — reasoning models score ~0 when the answer drowns in an unclosed think block."),
+    suite: str = typer.Option("perf,arc", "--suite", help="Comma-separated suites: perf (throughput/single-stream bench — refreshes the placement's perf numbers) · arc (ARC-Challenge CoT accuracy; needs the optional eval deps: `pipx inject johnny-fleet openai datasets`) · icl (in-context-learning pattern-completion probe; needs `openai`) · needle (positional-recall/long-context probe against a bundled code corpus; needs `openai`) · depth (prefill/decode throughput + latency vs. context depth via llama-benchy; needs `llama-benchy`) · humaneval (real HumanEval pass@1 via lm-eval + a chat-aware re-scorer; needs `pipx inject johnny-fleet 'lm-eval[api]'`) · automationbench (real agentic tool-use eval via Zapier's public AutomationBench — 600 tasks over simulated SaaS tools, self-bootstraps a vendored `uv`-managed checkout; needs `uv` on PATH; see `--domains`) · ctxsafe (empirical context-safety probe — walks real needle-in-haystack requests at progressively deeper depths up to max_model_len against a dedicated disposable seat, live rocm-smi VRAM polling, real crash detection; writes quality.ctxsafe with the verified-safe depth vs. configured max_model_len vs. trained native_context — see AGENTS.md's Context safety section; needs `openai`, ideally `tiktoken`)."),
+    limit: int = typer.Option(None, "--limit", help="arc/humaneval: only the first N questions/problems — a quick smoke. Full sets are 1172 CoT questions (arc, an hour-ish on a mid-size seat) / 164 problems (humaneval). automationbench: only the first N tasks (across --domains, dataset order) — full public set is 600 (100/domain). ctxsafe: cap the deepest depth tested (tokens) — for placements whose max_model_len is too large to sweep to in one run."),
+    concurrency: int = typer.Option(8, "--concurrency", help="arc/humaneval: parallel requests against the seat. automationbench: max concurrent tasks (--max-concurrent)."),
+    domains: str = typer.Option("all", "--domains", help="automationbench: comma-separated domains (sales/marketing/operations/support/finance/hr) or 'all'."),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="arc/icl/needle/humaneval: leave model thinking on. Default off — reasoning models score ~0 (or truncate mid-answer) when the answer drowns in an unclosed think block."),
     yes: bool = typer.Option(False, "--yes", help="Skip the temp-seat launch confirmation."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
@@ -1709,13 +1987,18 @@ def bench(
                       "launched (and stopped after).[/]")
         if "arc" in suites and not limit:
             console.print("[dim]full ARC-Challenge is 1172 CoT questions — `--limit 100` is a quick smoke.[/]")
+        if "humaneval" in suites and not limit:
+            console.print("[dim]full HumanEval is 164 problems — `--limit 20` is a quick smoke.[/]")
+        if "automationbench" in suites and domains == "all" and not limit:
+            console.print("[dim]full AutomationBench (all domains) is 600 tasks — `--domains sales` "
+                          "or `--limit 20` is a quick smoke.[/]")
         if not typer.confirm(f"Bench {model_id} · {pid} ({', '.join(suites)})?"):
             raise typer.Exit(code=1)
 
     prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
         res = B.run(model_id, placement, suites, cfg=cfg, limit=limit, concurrency=concurrency,
-                    thinking=thinking, progress=prog)
+                    thinking=thinking, automationbench_domains=domains, progress=prog)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -1727,7 +2010,31 @@ def bench(
     failed = False
     for s in suites:
         r = (res.get("results") or {}).get(s) or {}
-        if not r.get("ok"):
+        if s == "ctxsafe" and r.get("tested_depths") is not None:
+            # Always render the three-way gap (trained native_context vs configured
+            # max_model_len vs empirically verified-safe) — that gap is exactly what
+            # caused the 2026-08-06 incident this suite exists to catch. A crash is a
+            # real finding, not just a suite error, so it's shown even though ok=False.
+            native, mml = r.get("native_context"), r.get("configured_max_model_len")
+            safe, crash = r.get("verified_safe_tokens"), r.get("crashed_at")
+            gap = f"native_context={native:,}" if native else "native_context=?"
+            gap += f" · configured max_model_len={mml:,}" if mml else ""
+            if crash is not None:
+                failed = True
+                safe_part = f"verified_safe={safe:,} tok" if safe else "no depth verified safe"
+                console.print(f"[red]✗ ctxsafe — CRASHED at {crash:,} tok[/] ({safe_part}) · {gap} "
+                              f"· VRAM peak {r.get('vram_peak_gb')}GB")
+                console.print("  [red]placement is UNSAFE at its configured max_model_len[/] — "
+                              "lower max_model_len (see AGENTS.md § Context safety) or re-tune.")
+            elif safe:
+                note = " [yellow](capped by --limit — not the full configured cap)[/]" if r.get("limited") else ""
+                shortfall = f" [yellow](< configured {mml:,})[/]" if mml and safe < mml else ""
+                console.print(f"[green]✓ ctxsafe[/] verified_safe={safe:,} tok{shortfall} · {gap}"
+                              f" · VRAM peak {r.get('vram_peak_gb')}GB{note}")
+            else:
+                failed = True
+                console.print(f"[red]✗ ctxsafe[/] — {r.get('error')} · {gap}")
+        elif not r.get("ok"):
             failed = True
             console.print(f"[red]✗ {s}[/] — {r.get('error')}")
         elif s == "perf":
@@ -1738,6 +2045,28 @@ def bench(
             console.print(f"[green]✓ arc[/] ARC-Challenge {r.get('accuracy_pct')}% "
                           f"({r.get('correct')}/{r.get('total')}"
                           + (f", first {r['limit']}" if r.get("limit") else "") + ")")
+        elif s == "icl":
+            total = (r.get("pass") or 0) + (r.get("fail") or 0)
+            console.print(f"[green]✓ icl[/] {r.get('pass')}/{total}"
+                          + (f", first {r['limit']}" if r.get("limit") else ""))
+        elif s == "needle":
+            total = (r.get("pass") or 0) + (r.get("fail") or 0)
+            console.print(f"[green]✓ needle[/] {r.get('pass')}/{total}")
+        elif s == "depth":
+            pts = ", ".join(f"d={p['depth']} pp={p['pp_tok_s']}/tg={p['tg_tok_s']} tok/s"
+                            for p in (r.get("points") or []))
+            console.print(f"[green]✓ depth[/] {pts}")
+        elif s == "humaneval":
+            console.print(f"[green]✓ humaneval[/] pass@1 {r.get('pass_at_1_pct')}% "
+                          f"({r.get('passed')}/{r.get('total')}"
+                          + (f", first {r['limit']}" if r.get("limit") else "") + ")")
+        elif s == "automationbench":
+            console.print(f"[green]✓ automationbench[/] pass rate {r.get('pass_rate_pct')}% "
+                          f"({r.get('passed')}/{r.get('total')}, avg partial credit {r.get('avg_score_pct')}%)"
+                          f" · domains={r.get('domains_run')}"
+                          + (f" · aborted={r['aborted']}" if r.get("aborted") else ""))
+            for dm in (r.get("domains") or []):
+                console.print(f"    {dm['domain']}: {dm['passed']}/{dm['total']} ({dm.get('pass_rate_pct')}%)")
     if res.get("registry_updated"):
         console.print(f"  [dim]scores recorded on [bold]{pid}[/bold] in the registry[/]")
     console.print(f"  report: {res['report']}")

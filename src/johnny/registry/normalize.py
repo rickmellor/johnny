@@ -18,7 +18,7 @@ Entry points:
 - placement_view(p, current)  -> flat dict for the fixed-column table / picker line
 - retune_worklist(reg, current) -> placements that need real numbers (`johnny tune`)
 - current_runtimes(cfg)       -> {backend: current launch image} for staleness checks
-- identity_gaps(mid, m, models_dir) -> derivable identity fills (params / quant)
+- identity_gaps(mid, m, cfg) -> derivable identity fills (params / quant)
 """
 
 from __future__ import annotations
@@ -262,10 +262,10 @@ def _quant_from_names(names: list[str]) -> str | None:
     return None
 
 
-def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict:
+def identity_gaps(model_id: str, m: dict, cfg: dict | None = None) -> dict:
     """Derivable fills for a model's identity — {field: value} for params/quant that are
-    currently empty. params: the GGUF header (general.size_label; needs the weights on
-    disk under models_dir), else the naming conventions above. quant: the naming
+    currently empty. params: the GGUF header (general.size_label; needs the weights
+    resolvable on disk — see below), else the naming conventions above. quant: the naming
     conventions first (a curated label, e.g. unsloth's UD- dynamic-quant names, wins
     over anything derived), else the actual per-tensor quant mix read from the GGUF
     tensor table across every shard (ground truth — a custom mix has no single true
@@ -274,7 +274,12 @@ def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict
     a single whole-file stamp and provably wrong for a mixed quant — see
     backends.llamacpp.quant_mix_label). Nothing is invented beyond an explicit token
     in a name/header or a measured tensor type — an underivable field stays empty.
-    Never overwrites a set value."""
+    Never overwrites a set value.
+
+    `cfg` is the loaded johnny config (roots.models_dir / roots.nas_dir) — resolution
+    goes through config.resolve_weights_path, same as bench._local_path and
+    engine.launch.build_spec, so a `nas:`-prefixed local_path (a NAS-only model, no
+    local copy) still gets its GGUF header read instead of silently finding nothing."""
     ident = m.get("identity") or {}
     names = [s for s in (ident.get("local_path"), model_id, ident.get("repo_id")) if s]
     need_params, need_quant = not ident.get("params"), not ident.get("quant")
@@ -282,9 +287,12 @@ def identity_gaps(model_id: str, m: dict, models_dir: str | None = None) -> dict
     meta: dict = {}
     shards: list[Path] = []
     lp = ident.get("local_path")
-    if (need_params or need_quant) and models_dir and lp and str(lp).endswith(".gguf"):
-        p = Path(models_dir).expanduser() / lp
-        if p.exists():
+    if (need_params or need_quant) and cfg and lp and str(lp).endswith(".gguf"):
+        from .. import config as C
+
+        resolved = C.resolve_weights_path(lp, cfg)
+        p = Path(resolved.host_path) if resolved else None
+        if p and p.exists():
             try:
                 from ..backends.llamacpp import _gguf_metadata, gguf_shard_paths
 
@@ -322,4 +330,31 @@ def retune_worklist(reg: dict, current: dict | None = None) -> list[dict]:
             st = placement_status(p, current)
             if st in NEEDS_RETUNE:
                 out.append({"model": mid, "placement": p.get("id"), "status": st})
+    return out
+
+
+# A configured max_model_len at or above this is "large enough that a silent VRAM-vs-
+# depth gap is worth catching before it bites" — the 2026-08-06 Ornith incident (see
+# AGENTS.md § Context safety) crashed at real depths of 47K-59K tokens on placements
+# nominally configured for 262144/409600, so this threshold is deliberately well below
+# "huge": a 32K seat splitting 4 ways per llama.cpp's --parallel is already the kind of
+# per-slot depth that mattered there.
+CTXSAFE_THRESHOLD_TOKENS = 32768
+
+
+def ctxsafe_worklist(reg: dict, threshold: int = CTXSAFE_THRESHOLD_TOKENS) -> list[dict]:
+    """Placements with a large configured max_model_len that have never had a `ctxsafe`
+    probe run (`johnny bench <target> --suite ctxsafe`) — the config's own number was
+    never empirically checked against a real deep prefill. Ordered by model. This is
+    additive to `retune_worklist`: a placement can have great perf/quality numbers and
+    still never have had its context safety verified."""
+    out: list[dict] = []
+    for mid, m in sorted((reg.get("models") or {}).items()):
+        for p in m.get("placements") or []:
+            mml = (p.get("knobs") or {}).get("max_model_len")
+            if not mml or mml < threshold:
+                continue
+            cs = (p.get("quality") or {}).get("ctxsafe")
+            if not cs:
+                out.append({"model": mid, "placement": p.get("id"), "max_model_len": mml})
     return out

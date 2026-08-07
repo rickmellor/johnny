@@ -211,6 +211,14 @@ class VllmDriver(Driver):
         args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
         if spec.get("models_dir"):
             args += ["-v", f"{spec['models_dir']}:/models"]
+        if spec.get("nas_dir"):
+            # Second, read-only mount for weights that resolved onto roots.nas_dir
+            # (engine.launch.build_spec / config.resolve_weights_path). Nothing in
+            # the vLLM path exercises this today (no vLLM placement references NAS-
+            # only weights yet), but build_spec computes it uniformly across
+            # backends, so honor it here too for consistency — conditional, same as
+            # llamacpp's mount, so a launch that never needs it doesn't get it.
+            args += ["-v", f"{spec['nas_dir']}:/nas:ro"]
         if spec.get("vllm_cache"):
             args += ["-v", f"{spec['vllm_cache']}:/root/.cache/vllm"]
         args += ["-p", f"{spec.get('bind_address', '127.0.0.1')}:{spec['port']}:8000"]

@@ -20,8 +20,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Quality-eval suites for `johnny bench` (arc; humaneval/needle when they land).
-bench = ["openai>=1.0", "datasets>=2.14"]
+# Quality/perf-eval suites for `johnny bench` (arc, icl, needle need openai(+datasets);
+# depth needs llama-benchy — a backend-agnostic prefill/decode-vs-context-depth +
+# latency bench, github.com/eugr/llama-benchy; humaneval needs lm-eval[api] — the
+# [api] extra pulls in tenacity, required by lm-eval's local-chat-completions
+# connector; evaluate/datasets ride along as lm-eval's own base deps).
+bench = ["openai>=1.0", "datasets>=2.14", "llama-benchy>=0.4", "lm-eval[api]>=0.4"]
 
 [project.scripts]
 johnny = "johnny.cli:main"
