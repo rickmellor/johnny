@@ -940,6 +940,12 @@ def registry_show(
         err.print(f"[red]{e}[/]")
         raise typer.Exit(code=1)
 
+    # Single-model detail: the reader is inspecting THIS model's placements, so default
+    # to the columns that distinguish them (id for `up --placement`, tp/gpus/status) and
+    # drop the redundant MODEL column. An explicit --columns/--wide still wins.
+    if model and not columns and not wide:
+        cols = ["id", "backend", "tp", "gpus", "quant", "context", "speed", "status"]
+
     reg = store.load()
     models = store.models(reg)
     if model:
