@@ -283,11 +283,16 @@ def identity_gaps(model_id: str, m: dict, cfg: dict | None = None) -> dict:
     ident = m.get("identity") or {}
     names = [s for s in (ident.get("local_path"), model_id, ident.get("repo_id")) if s]
     need_params, need_quant = not ident.get("params"), not ident.get("quant")
+    # params_total: exact total parameter count summed from the GGUF tensor tables —
+    # distinct from `params`, which keeps the header's label verbatim (MoE shorthand
+    # like '384x14B' reads as a small model when it's really ~1T).
+    need_total = not ident.get("params_total")
+    need_active = not ident.get("params_active")
 
     meta: dict = {}
     shards: list[Path] = []
     lp = ident.get("local_path")
-    if (need_params or need_quant) and cfg and lp and str(lp).endswith(".gguf"):
+    if (need_params or need_quant or need_total or need_active) and cfg and lp and str(lp).endswith(".gguf"):
         from .. import config as C
 
         resolved = C.resolve_weights_path(lp, cfg)
@@ -306,6 +311,24 @@ def identity_gaps(model_id: str, m: dict, cfg: dict | None = None) -> dict:
         v = meta.get("size_label") or _params_from_names(names)
         if v:
             gaps["params"] = str(v)
+    if need_total and shards:
+        try:
+            from ..backends.llamacpp import params_total_label, quant_mix
+
+            v = params_total_label(quant_mix(shards))
+            if v:
+                gaps["params_total"] = v
+        except Exception:
+            pass
+    if need_active and shards:
+        try:
+            from ..backends.llamacpp import params_active_label
+
+            v = params_active_label(shards, meta.get("n_expert"), meta.get("n_expert_used"))
+            if v:
+                gaps["params_active"] = v
+        except Exception:
+            pass
     if need_quant:
         v = _quant_from_names(names)
         if not v and shards:

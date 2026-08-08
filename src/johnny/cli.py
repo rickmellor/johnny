@@ -565,7 +565,13 @@ def _print_quant_mix(ident: dict, backends: str) -> None:
 
 
 def _ident_params(ident: dict) -> str:
-    """identity.params as stored — a '284.33B'-style string or a raw count; '—' when unset."""
+    """identity.params for tables — prefers the derived exact total (params_total,
+    e.g. '1.03T') over the stored label, which for MoE headers is expert shorthand
+    ('384x14B' is a ~1T model); '—' when neither is set. The detail view shows both."""
+    total = (ident or {}).get("params_total")
+    if total:
+        active = (ident or {}).get("params_active")
+        return f"{total}-A{active}" if active else str(total)
     p = (ident or {}).get("params")
     if not p:
         return "[dim]—[/]"
@@ -954,7 +960,14 @@ def registry_show(
         pls = m.get("placements", [])
         backends = ", ".join(sorted({p.get("backend", "?") for p in pls})) or "—"
         console.print(f"[bold]{model}[/]  [dim]path: {ident.get('local_path') or ident.get('repo_id') or '—'}[/]")
-        console.print(f"  arch={ident.get('arch')} params={ident.get('params') or '—'} quant={ident.get('quant')} "
+        _ptotal, _pactive = ident.get("params_total"), ident.get("params_active")
+        if _ptotal:
+            _params = f"{_ptotal} total" + (f" · {_pactive} active/token" if _pactive else "")
+            if ident.get("params"):
+                _params += f" (header: {ident['params']})"
+        else:
+            _params = ident.get("params") or "—"
+        console.print(f"  arch={ident.get('arch')} params={_params} quant={ident.get('quant')} "
                       f"ctx={m.get('capabilities',{}).get('native_context')} backend={backends}")
         if ident.get("recommended_use"):
             console.print(f"  [dim]use:[/] {ident['recommended_use']}")

@@ -432,7 +432,9 @@ def _run_humaneval(port: int, model_id: str, run_dir: Path, cfg: dict, limit: in
         return {"ok": False, "error": "humaneval_chat_score.py unavailable (not bundled, "
                 "no scripts.humaneval_score override)"}
     lmeval_out = run_dir / "humaneval_lmeval"
-    gen_kwargs = ["max_gen_toks=2048", "until=[]"]  # default max_gen_toks=1024 + raw-completion
+    # Thinking-on models (or ones like Kimi-K2.7 whose template has no off switch) spend
+    # most of the budget inside the think block — give them room or they truncate to 0.
+    gen_kwargs = [f"max_gen_toks={10240 if thinking else 2048}", "until=[]"]  # default max_gen_toks=1024 + raw-completion
     # stop sequences (\nclass, \ndef, ...) truncate real chat answers mid-function; see script docstring.
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models emit an unclosed
         # <think> block that eats the whole generation budget and leaves content empty/truncated.
@@ -443,7 +445,10 @@ def _run_humaneval(port: int, model_id: str, run_dir: Path, cfg: dict, limit: in
     cmd = [sys.executable, "-m", "lm_eval", "run",
            "--model", "local-chat-completions",
            "--model_args", f"base_url=http://127.0.0.1:{port}/v1/chat/completions,model={model_id},"
-                            f"num_concurrent={concurrency},max_retries=3,tokenized_requests=False",
+                            f"num_concurrent={concurrency},max_retries=3,tokenized_requests=False,"
+                            # single-digit-tok/s CPU-MoE seats + thinking need far more than
+                            # lm-eval's 300s default per request; env-tunable like perf's timeout.
+                            f"timeout={os.environ.get('JOHNNY_BENCH_REQUEST_TIMEOUT', 3600 if thinking else 600)}",
            "--tasks", "humaneval", "--apply_chat_template", "--log_samples",
            "--output_path", str(lmeval_out), "--confirm_run_unsafe_code",
            "--gen_kwargs", *gen_kwargs]
@@ -777,7 +782,10 @@ def _run_perf(port: int, container: str | None, model_id: str, point: dict, cfg:
             return {"ok": False, "error": f"{script_key} script unavailable "
                     f"(not bundled and no scripts.{script_key} override)"}
         progress(f"perf: {script_key} sweep (concurrency ramp + single-stream)…")
-        rc, out, errout = _run(["bash", script, str(port), model_id], timeout=1200)
+        # Default 20 min fits normal seats; CPU-MoE giants (single-digit tok/s)
+        # need longer — override per-run, e.g. JOHNNY_BENCH_PERF_TIMEOUT=7200.
+        perf_timeout = float(os.environ.get("JOHNNY_BENCH_PERF_TIMEOUT", 1200))
+        rc, out, errout = _run(["bash", script, str(port), model_id], timeout=perf_timeout)
         parsed = stages._parse_bench(out)
         if parsed.get("peak_tok_s") is None:
             parsed["error"] = (errout or out)[-300:]

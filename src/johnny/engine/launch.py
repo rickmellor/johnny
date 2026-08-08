@@ -36,7 +36,17 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     # gets loaded, so it's what path resolution (incl. NAS convention) applies to.
     weights_rel = (extra.get("gguf_file") if backend == "llamacpp" else None) or local_path
     nas_dir_needed = None
-    if weights_rel:
+    weights_dir_needed = None
+    if weights_rel and weights_rel.startswith("/"):
+        # Absolute path: weights live outside both configured roots (e.g. an
+        # oversized quant on a disk models_dir can't hold). Mount the parent dir
+        # read-only at /weights instead of resolving against the roots.
+        from pathlib import Path as _P
+
+        _p = _P(weights_rel)
+        weights_dir_needed = str(_p.parent)
+        model_path = f"/weights/{_p.name}"
+    elif weights_rel:
         resolved = C.resolve_weights_path(weights_rel, cfg)
         if resolved:
             model_path = resolved.container_path
@@ -61,6 +71,7 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
         "model_path": model_path,
         "models_dir": roots.get("models_dir"),
         "nas_dir": nas_dir_needed,
+        "weights_dir": weights_dir_needed,
         "vllm_cache": roots.get("vllm_cache"),
         "port": port,
         "bind_address": (cfg.get("network") or {}).get("bind_address", "127.0.0.1"),

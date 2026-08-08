@@ -158,6 +158,9 @@ class LlamaCppDriver(Driver):
             # when this launch's weights actually came from there, so a launch that
             # never references the NAS doesn't pay for (or expose) the extra mount.
             args += ["-v", f"{spec['nas_dir']}:/nas:ro"]
+        if spec.get("weights_dir"):
+            # Absolute-path weights (outside both roots) — see engine.launch.build_spec.
+            args += ["-v", f"{spec['weights_dir']}:/weights:ro"]
         args += ["-p", f"{spec.get('bind_address', '127.0.0.1')}:{spec['port']}:{_CONTAINER_PORT}"]
         if gpus:
             args += ["-e", f"{spec.get('visible_env', 'CUDA_VISIBLE_DEVICES')}={','.join(str(g) for g in gpus)}"]
@@ -175,7 +178,13 @@ class LlamaCppDriver(Driver):
         args += ["-m", spec.get("model_path")]
         args += ["--host", "0.0.0.0", "--port", str(_CONTAINER_PORT)]
         args += ["--alias", spec["served_model_name"]]
-        args += ["-ngl", str(knobs.get("n_gpu_layers", 999))]
+        # n_gpu_layers: absent -> 999 (historical default); explicit null -> omit the
+        # flag entirely so llama-server's --fit can auto-place layers/experts (fit
+        # aborts layer adjustment when -ngl is user-set — needed for CPU-MoE models
+        # whose even layer split would overfill one GPU, e.g. Kimi-K2.7 1T).
+        ngl = knobs.get("n_gpu_layers", 999)
+        if ngl is not None:
+            args += ["-ngl", str(ngl)]
         if knobs.get("threads"):  # CPU placement: serve at the tuned thread count
             args += ["-t", str(knobs["threads"])]
         # Flash-attn: DeepSeek-V4 head-dim-512 kernel is unstable on RDNA4 -> default off.
@@ -451,6 +460,47 @@ def quant_mix_label(mix: dict[str, dict[str, int]], min_share: float = 0.10) -> 
     sig = sorted((t for t, d in mix.items() if d["elems"] / total >= min_share),
                  key=lambda t: -mix[t]["elems"])
     return "/".join(sig) or None
+
+
+def _fmt_param_count(n: int) -> str:
+    if n >= 1e12:
+        return f"{n / 1e12:.2f}T"
+    if n >= 10e9:
+        return f"{n / 1e9:.0f}B"
+    if n >= 999.5e6:  # a "1B" model is ~0.9999e9 — don't render it as '1000M'
+        return f"{n / 1e9:.1f}B"
+    return f"{n / 1e6:.0f}M"
+
+
+def params_total_label(mix: dict[str, dict[str, int]]) -> str | None:
+    """Human-readable TOTAL parameter count from a quant_mix() result — the sum of
+    tensor element counts across all shards (ground truth, unlike size_label's
+    MoE shorthand: Kimi-K2.7's '384x14B' header is a ~1T model). '1.03T', '397B',
+    '3.8B'; None for an empty mix."""
+    total = sum(d["elems"] for d in mix.values())
+    return _fmt_param_count(total) if total else None
+
+
+def params_active_label(paths: Path | list[Path], n_expert: int | None,
+                        n_expert_used: int | None) -> str | None:
+    """Human-readable ACTIVE-per-token parameter count: non-expert tensors (backbone,
+    attention, shared experts) count in full; routed-expert tensors ('*_exps.*')
+    count at the router's used/total ratio. None for dense models (no expert counts,
+    or all experts used) — a dense model's active IS its total, no suffix needed."""
+    if not n_expert or not n_expert_used or n_expert_used >= n_expert:
+        return None
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    total = exps = 0
+    for p in paths:
+        for name, _nbytes, nelem, _gtype in gguf_tensor_types(Path(p)):
+            total += nelem
+            if "_exps." in name:
+                exps += nelem
+    if not total or not exps:
+        return None
+    active = (total - exps) + int(exps * n_expert_used / n_expert)
+    return _fmt_param_count(active)
 
 
 def _gguf_metadata(path: Path) -> dict:
