@@ -126,6 +126,12 @@ def _is_stale(p: dict, current: dict | None) -> bool:
     img = p.get("image")
     if not cur or not img:
         return False
+    # A placement pinned to a *different image repo* than the config default is a
+    # deliberate per-placement pin (launches honor it — e.g. the vulkan build for
+    # DeepSeek-family archs), not a leftover of an old default. Only a same-repo,
+    # different-tag image means the runtime moved on underneath the measurement.
+    if img.rsplit(":", 1)[0] != cur.rsplit(":", 1)[0]:
+        return False
     return _tag(img) != _tag(cur)
 
 
