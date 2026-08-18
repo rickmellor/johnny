@@ -19,6 +19,27 @@ _ARCH_PARSERS = (
     ("Qwen3", {"tool_call_parser": "qwen3_xml", "reasoning_parser": "qwen3"}),
 )
 
+# arch-family → launch flags a seat needs to BOOT at all on this box (substring
+# match). Qwen3.5-family dense hybrids (GDN/linear attention): the FULL-cudagraph
+# variant of the GDN kernel needs 65,792 B of shared memory vs gfx1201's 65,536 B
+# hardware limit (Triton OutOfResources at capture warmup, 2026-08-17). PIECEWISE
+# keeps attention out of the captured graph and serves correctly. Unlike
+# _ARCH_PARSERS these are load-bearing, so tuning seats get them too
+# (stages._tuning_spec), not just won placements. The MoE family key differs
+# ("Qwen3_5Moe…") and deliberately doesn't match.
+_ARCH_LAUNCH_EXTRA = (
+    ("Qwen3_5For", {"compilation_config": {"cudagraph_mode": "PIECEWISE"}}),
+)
+
+
+def derive_launch_extra(arch: str | None) -> dict:
+    """Launch-critical extra{} entries inferred from the arch family, or {}."""
+    a = arch or ""
+    for key, extra in _ARCH_LAUNCH_EXTRA:
+        if key in a:
+            return {k: (dict(v) if isinstance(v, dict) else v) for k, v in extra.items()}
+    return {}
+
 
 def derive_parsers(arch: str | None) -> dict:
     """Tool/reasoning parser + chat template inferred from the arch family, or {}."""
@@ -42,7 +63,7 @@ def _point_sig(point: dict) -> str:
 
 
 def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_version: str, use_case: str | None,
-                 image: str | None = None) -> dict:
+                 image: str | None = None, env: dict | None = None) -> dict:
     point = winner["point"]
     vkey = {"hardware_fingerprint": hardware.fingerprint, "backend": "vllm", "runtime_version": runtime_version}
     perf = {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")}
@@ -89,8 +110,8 @@ def to_placement(model_id: str, winner: dict, audit: dict, hardware, runtime_ver
             "kv_cache_dtype": point.get("kv_cache_dtype", "auto"),
             "mtp": point.get("mtp") or {"enabled": False},
         },
-        "extra": derive_parsers(audit.get("arch")),
-        "env": {},
+        "extra": {**derive_parsers(audit.get("arch")), **derive_launch_extra(audit.get("arch"))},
+        "env": dict(env or {}),
         "perf": {"peak_tok_s": winner.get("peak_tok_s"), "single_stream_tok_s": winner.get("single_tok_s")},
         "validation_key": {"hardware_fingerprint": hardware.fingerprint, "backend": "vllm", "runtime_version": runtime_version},
         "validated_at": None,

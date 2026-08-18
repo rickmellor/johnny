@@ -14,7 +14,7 @@ from pathlib import Path
 from .. import config as C
 from ..backends.vllm import VllmDriver
 from ..runtime import probe
-from . import grid
+from . import grid, report
 
 TUNING_CONTAINER = "vllm-johnny-tuning"
 TUNING_PORT = 9000
@@ -141,16 +141,42 @@ def hardware_fit(audit_info: dict, hardware, free_count: int) -> tuple[list, lis
     )
 
 
-def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
+def multi_gpu_env(gpu_count: int, image: str | None) -> dict:
+    """Correctness env for multi-GPU vLLM launches on this box (single-GPU gets none).
+
+    RCCL multi-GPU is broken on gfx1201 in vLLM-ROCm images newer than v0.20.x —
+    `ncclCommInitRank` dies with HIP 'invalid argument' before the model loads,
+    and with init patched the first collective can still deadlock (0.21 / 0.23 /
+    0.25.1 all reproduce; vllm#40980 / ROCm rocm-systems#5480, no upstream fix as
+    of 2026-08-17). NCCL_P2P_DISABLE=1 + RCCL_NET=Socket is the field-proven pair
+    (host-bounce transport, no GPU P2P DMA), gated off the older images, which
+    init P2P fine and keep its bandwidth. An unparseable/custom tag (e.g. the
+    `:qwen38` release tag) gets the workaround: a broken launch costs more than
+    slower all-reduce.
+
+    Placements won from a sweep must carry this same env (report.to_placement) —
+    a seat has to serve under the conditions it was tuned under.
+    """
+    if gpu_count <= 1:
+        return {}
+    env = {"NCCL_PROTO": "Simple", "HIP_FORCE_DEV_KERNARG": "1", "SAFETENSORS_FAST_GPU": "1"}
+    m = re.search(r":v?(\d+)\.(\d+)", image or "")
+    if not m or (int(m.group(1)), int(m.group(2))) >= (0, 21):
+        env["NCCL_P2P_DISABLE"] = "1"
+        env["RCCL_NET"] = "Socket"
+    return env
+
+
+def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], cfg: dict, hardware,
+                 arch: str | None = None) -> dict:
     roots = cfg.get("roots") or {}
     docker = cfg.get("docker") or {}
     visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
-    env = {}
-    if gpus and len(gpus) > 1:  # multi-GPU correctness on this box
-        env = {"NCCL_PROTO": "Simple", "HIP_FORCE_DEV_KERNARG": "1", "SAFETENSORS_FAST_GPU": "1"}
+    image = C.resolve_image(cfg, device="gpu", model_id=model_id)
+    env = multi_gpu_env(len(gpus or []), image)
     return {
         "container_name": TUNING_CONTAINER,
-        "image": C.resolve_image(cfg, device="gpu", model_id=model_id),
+        "image": image,
         "served_model_name": model_id,
         "model_path": f"/models/{Path(local_path).relative_to(Path(roots['models_dir']).expanduser())}"
         if roots.get("models_dir") and str(local_path).startswith(str(Path(roots["models_dir"]).expanduser()))
@@ -171,7 +197,7 @@ def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], c
             "kv_cache_dtype": point.get("kv_cache_dtype", "auto"),
             "mtp": point.get("mtp") or {"enabled": False},
         },
-        "extra": {},
+        "extra": report.derive_launch_extra(arch),
         "env": env,
         "labels": {"johnny.tuning": "1", "johnny.model": model_id},
     }
@@ -285,7 +311,8 @@ def _parse_bench(out: str) -> dict:
     return {"peak_tok_s": peak, "single_tok_s": single}
 
 
-def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg: dict, hardware) -> dict:
+def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg: dict, hardware,
+               arch: str | None = None) -> dict:
     """Launch a tuning seat for one config point (GPU or CPU), bench it, tear it down.
 
     Bench selection: embeddings models use the embeddings throughput probe; generative
@@ -294,13 +321,16 @@ def tune_point(model_id: str, local_path: str, point: dict, gpus: list[int], cfg
     is_cpu = point.get("device") == "cpu"
     drv = VllmDriver(image=C.resolve_image(cfg, device="cpu" if is_cpu else "gpu", model_id=model_id))
     spec = _cpu_tuning_spec(model_id, local_path, point, cfg) if is_cpu \
-        else _tuning_spec(model_id, local_path, point, gpus, cfg, hardware)
+        else _tuning_spec(model_id, local_path, point, gpus, cfg, hardware, arch=arch)
 
     result = {"point": point, "ok": False}
     try:
         drv.launch(spec)
         # CPU loads (and big models) can be slow; give CPU a longer ready window.
-        ready, why = _wait_ready(drv, TUNING_CONTAINER, TUNING_PORT, timeout=900 if is_cpu else 600)
+        # GPU window sized for the slowest legit ready path seen on this box: Qwen3.8-27B
+        # dense (30.9GB fp8, TP2) takes ~9.5 min — 5.5 load + torch.compile + graph capture
+        # (2026-08-17). 600s was killing healthy seats mid-capture.
+        ready, why = _wait_ready(drv, TUNING_CONTAINER, TUNING_PORT, timeout=900 if is_cpu else 1200)
         if not ready:
             # Surface the real reason (dead container / vLLM error), not a bare timeout.
             logtail = _diagnose(drv, TUNING_CONTAINER)

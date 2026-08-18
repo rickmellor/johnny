@@ -212,7 +212,7 @@ def run(
             _p(f"[{i}/{len(points)}] {sig}: launching on GPU {gpus} + benching…")
             collect.add_pin(stages.TUNING_CONTAINER)  # reaper-safe for the run
             try:
-                r = stages.tune_point(model_id, path, point, gpus, cfg, hw)
+                r = stages.tune_point(model_id, path, point, gpus, cfg, hw, arch=a.get("arch"))
             finally:
                 collect.remove_pin(stages.TUNING_CONTAINER)
         if r.get("ok"):
@@ -246,7 +246,8 @@ def run(
         for r in chosen:
             # Only the winner carries the use-case tag: a manually kept seat isn't the
             # "<use-case> winner", and the tag would skew launch-time auto-pick.
-            placement = report.to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None, image=image)
+            placement = report.to_placement(model_id, r, a, hw, rtv, use_case if r is winner else None, image=image,
+                                            env=stages.multi_gpu_env(int(r["point"].get("tp") or 0), image))
             report.write_placement(model_id, a, placement, hw, local_path=lp)
             placements.append(placement)
             if r is winner:
