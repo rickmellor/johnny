@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--max-tokens",  type=int, default=512)
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--limit",       type=int, default=None, help="Subset for testing")
+    ap.add_argument("--timeout",     type=float, default=60,
+                    help="Per-request timeout (s). Thinking models on slow seats need "
+                         "minutes, not the 60s that fits direct answers.")
     ap.add_argument("--out",         default="~/vllm-bench-results/arc_scored.jsonl")
     ap.add_argument("--disable-thinking", action="store_true",
                     help="Pass chat_template_kwargs={enable_thinking: false} to suppress "
@@ -105,7 +108,7 @@ def main():
         docs = docs[:args.limit]
     print(f"Evaluating {len(docs)} questions  concurrency={args.concurrency}  max_tokens={args.max_tokens}", flush=True)
 
-    client = OpenAI(base_url=args.base_url, api_key="EMPTY", timeout=60)
+    client = OpenAI(base_url=args.base_url, api_key="EMPTY", timeout=args.timeout)
     out_path = Path(args.out).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 

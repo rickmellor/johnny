@@ -242,6 +242,13 @@ def _run_arc(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
         cmd += ["--limit", str(limit)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
+    else:
+        # Thinking needs generation budget AND per-request time, not just the longer
+        # wall timeout: at the 512-token default a reasoning model clips mid-think and
+        # the answer never emits (Qwen3.8: 18% ARC, below the 25% MCQ floor), and at
+        # arc_eval's old 60s client timeout most contended thinking requests died as
+        # "Request timed out" (31% — timeouts, not wrong answers). 2026-08-17/18.
+        cmd += ["--max-tokens", "2048", "--timeout", "600"]
     rc, out = _stream_run(cmd, _ARC_TIMEOUT, progress)
     scores = parse_arc_output(out)
     if not scores:
@@ -272,6 +279,12 @@ def _run_icl(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
         cmd += ["--limit", str(limit)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
+    else:
+        # Same thinking-budget rule as ARC: the 800-token default clips a long thinker
+        # mid-reasoning and the answer never emits (Ornith-397B: 16/16 cases at exactly
+        # the cap, extracted=None, 2026-08-18). Time to match: 4096 tok at ~20 t/s
+        # needs minutes, not icl_eval's 60s default client timeout.
+        cmd += ["--max-tokens", "4096", "--timeout", "600"]
     rc, out = _stream_run(cmd, _ICL_TIMEOUT, progress)
     try:
         data = json.loads(out_path.read_text())
@@ -957,7 +970,9 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
             port, container = stages.TUNING_PORT, stages.TUNING_CONTAINER
         _p(f"launching temp seat from {pid} on " + ("CPU" if is_cpu else f"GPU {gpus}") + "…")
         drv.launch(spec)
-        ready, why = stages._wait_ready(drv, container, port, timeout=900 if is_cpu else 600)
+        # Same slow-ready path as induction's tune_point: Qwen3.8-27B dense takes ~9.5 min
+        # to serve (load + compile + capture) — 600s killed healthy seats (2026-08-17).
+        ready, why = stages._wait_ready(drv, container, port, timeout=900 if is_cpu else 1200)
         if not ready:
             tail = stages._diagnose(drv, container)
             drv.stop(container)
