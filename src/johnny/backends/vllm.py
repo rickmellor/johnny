@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..runtime import probe
 from ..util import run, which
-from .base import Capabilities, Driver, ModelInfo, SeatInfo
+from .base import Capabilities, Driver, ModelInfo, SeatInfo, gpu_group_args
 
 
 _ARCH_CACHE: dict[str, set] = {}  # image -> registered archs (per-process)
@@ -207,7 +207,7 @@ class VllmDriver(Driver):
             if extra.get("cpuset"):
                 args += ["--cpuset-cpus", str(extra["cpuset"])]
         else:
-            args += ["--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render"]
+            args += ["--device=/dev/kfd", "--device=/dev/dri", *gpu_group_args()]
         args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
         if spec.get("models_dir"):
             args += ["-v", f"{spec['models_dir']}:/models"]
@@ -258,6 +258,8 @@ class VllmDriver(Driver):
             args += ["--enable-auto-tool-choice", "--tool-call-parser", extra["tool_call_parser"]]
         if extra.get("reasoning_parser"):
             args += ["--reasoning-parser", extra["reasoning_parser"]]
+        if extra.get("compilation_config"):
+            args += ["--compilation-config", json.dumps(extra["compilation_config"])]
         if extra.get("chat_template"):
             args += ["--chat-template", extra["chat_template"]]
         if pooling:

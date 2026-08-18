@@ -21,7 +21,7 @@ from pathlib import Path
 
 from ..runtime import probe
 from ..util import run, which
-from .base import Capabilities, Driver, ModelInfo, SeatInfo
+from .base import Capabilities, Driver, ModelInfo, SeatInfo, gpu_group_args
 
 # llama-server always listens on this port inside the container; we publish host:port -> here.
 _CONTAINER_PORT = 8080
@@ -148,7 +148,7 @@ class LlamaCppDriver(Driver):
         for k, v in (spec.get("labels") or {}).items():
             args += ["--label", f"{k}={v}"]
         if gpus:
-            args += ["--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render"]
+            args += ["--device=/dev/kfd", "--device=/dev/dri", *gpu_group_args()]
         args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
         if spec.get("models_dir"):
             args += ["-v", f"{spec['models_dir']}:/models:ro"]

@@ -82,3 +82,21 @@ class Driver:
 
     def logs(self, seat: str, follow: bool = False):  # pragma: no cover
         raise NotImplementedError("logs land at P3")
+
+
+def gpu_group_args() -> list[str]:
+    """--group-add flags for GPU device access, as numeric GIDs resolved from the host.
+
+    By-name `--group-add=render` fails on images whose /etc/group lacks the group
+    (upstream ggml-org llama.cpp server images dropped it, ~Aug 2026: "Unable to
+    find group render"); numeric GIDs grant the same access regardless of the
+    container's group file. Falls back to the name if the host lacks the group."""
+    import grp
+
+    args = []
+    for name in ("video", "render"):
+        try:
+            args.append(f"--group-add={grp.getgrnam(name).gr_gid}")
+        except KeyError:
+            args.append(f"--group-add={name}")
+    return args

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .. import config as C
 from ..backends import get_driver
+from ..backends.base import gpu_group_args
 from ..engine import all_seats, load_config
 from ..engine.placement import assign_gpus, free_gpus
 from ..hardware import detect as hwd
@@ -315,7 +316,7 @@ def tune_point(model_id: str, gguf_path: str, point: dict, gpus: list[int], cfg:
         visible_env = "HIP_VISIBLE_DEVICES" if (hardware and hardware.vendor == "amd") else "CUDA_VISIBLE_DEVICES"
         argv = [
             "docker", "run", "--rm", "--name", TUNING_CONTAINER,
-            "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--group-add=render",
+            "--device=/dev/kfd", "--device=/dev/dri", *gpu_group_args(),
             "--security-opt", "seccomp=unconfined", "--ipc=host",
             "-v", f"{md}:/models:ro",
             "-e", f"{visible_env}={','.join(str(g) for g in gpus)}",
