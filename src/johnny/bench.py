@@ -285,7 +285,15 @@ def _run_icl(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
         # the cap, extracted=None, 2026-08-18). Time to match: 4096 tok at ~20 t/s
         # needs minutes, not icl_eval's 60s default client timeout.
         cmd += ["--max-tokens", "4096", "--timeout", "600"]
-    rc, out = _stream_run(cmd, _ICL_TIMEOUT, progress)
+    # Same stale-export hazard automationbench already fixed: a run killed before its
+    # write leaves the PREVIOUS run's file in place, and it scores as fresh (bit the
+    # Ornith icl rerun 2026-08-18: 7 streamed PASSes recorded as the old file's 0/16).
+    out_path.unlink(missing_ok=True)
+    # Thinking wall: 16 cases can legitimately take minutes each (up to the 600s
+    # per-request timeout) — the 20-min wall killed a healthy run at case 12.
+    rc, out = _stream_run(cmd, 3 * 3600 if thinking else _ICL_TIMEOUT, progress)
+    if rc != 0:
+        return {"ok": False, "error": f"icl_eval exited rc={rc} before writing results — {out[-300:]}"}
     try:
         data = json.loads(out_path.read_text())
     except (OSError, ValueError) as e:
@@ -335,7 +343,10 @@ def _run_needle(port: int, model_id: str, run_dir: Path, cfg: dict, thinking: bo
            "--model", model_id, "--out", str(out_path)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
-    rc, out = _stream_run(cmd, _NEEDLE_TIMEOUT, progress)
+    out_path.unlink(missing_ok=True)  # never score a prior run's file (see _run_icl)
+    rc, out = _stream_run(cmd, 2 * 3600 if thinking else _NEEDLE_TIMEOUT, progress)
+    if rc != 0:
+        return {"ok": False, "error": f"code_needle exited rc={rc} before writing results — {out[-300:]}"}
     try:
         data = json.loads(out_path.read_text())
     except (OSError, ValueError) as e:
