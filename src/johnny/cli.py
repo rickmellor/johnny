@@ -2472,8 +2472,8 @@ def profile_show(
     _render_profile_seats(prof.get("seats") or [])
     _report_validation(errors, warnings)
     if saint:
-        console.print("\n[dim]# SAINT config.toml suggestions — static fallbacks matching the profile ports.")
-        console.print("# The live path stays `johnny resolve <role>` via each backend's johnny_role.[/]")
+        console.print("\n[dim]# SAINT config.toml suggestions — static fallbacks matching the profile ports.[/]")
+        console.print("[dim]# The live path stays `johnny resolve <role>` via each backend's johnny_role.[/]")
         for s in prof.get("seats") or []:
             console.print(f"""
 \\[backends.local-{s.get('role')}]
