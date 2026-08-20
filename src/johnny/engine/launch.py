@@ -139,7 +139,10 @@ def up(
     swap: str | None = None,
     force: bool = False,
     wait: bool = False,
-    wait_timeout: float = 600.0,
+    # 1200s, not 600: slow-ready seats are real (Qwen3.8 INT4 TP1 takes ~10 min of
+    # load + GDN autotune before /v1/models answers) and a wait that silently expires
+    # at 600s looks exactly like success to a script (2026-08-19 incident).
+    wait_timeout: float = 1200.0,
 ) -> dict:
     cfg = load_config()
     hardware = hwdetect.detect()
@@ -215,6 +218,7 @@ def up(
             result["endpoint"] = f"http://{spec['bind_address']}:{port}/v1"
         else:
             result["state"] = "loading"
+            result["wait_timed_out"] = wait_timeout
             result["eta_s"] = collect.cold_start_estimate(model_id, placement.get("id"))
     return result
 
