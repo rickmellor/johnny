@@ -343,6 +343,13 @@ def _run_needle(port: int, model_id: str, run_dir: Path, cfg: dict, thinking: bo
            "--model", model_id, "--out", str(out_path)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
+    else:
+        # Same thinking-budget rule as arc/icl: at the 800-token default a reasoning
+        # model burns the whole budget in-think over the 30K corpus and the answer
+        # never emits — Qwen3.8 "scored" 1/16 with 15 zero-output targets (2026-08-18),
+        # which read as a recall failure until the transcripts showed empty content.
+        # 4096 + a patient per-request timeout gives the answer room to exist.
+        cmd += ["--max-tokens", "4096", "--timeout", "600"]
     out_path.unlink(missing_ok=True)  # never score a prior run's file (see _run_icl)
     rc, out = _stream_run(cmd, 2 * 3600 if thinking else _NEEDLE_TIMEOUT, progress)
     if rc != 0:
