@@ -29,6 +29,15 @@ def _memoized(key: str, fn):
     _memo[key] = (time.monotonic(), val)
     return val
 
+
+def invalidate() -> None:
+    """Drop every memoized probe. Called at mutation boundaries (see
+    runtime.lock.mutation_lock): a launch/stop changes exactly the state the memo
+    caches, and within the TTL a same-process follow-up (e.g. the next seat of a
+    `profile up`) would otherwise plan against the pre-mutation container list —
+    two TP2 seats landing on GPUs 0,1 (2026-08-22 incident)."""
+    _memo.clear()
+
 # Images that look like an inference seat (best-effort filter for P0 status).
 INFER_IMAGE_HINTS = (
     "vllm",

@@ -4,6 +4,12 @@ State reads are lock-free (derived from docker), but two concurrent `up`s could
 both decide the same GPUs/ports are free and collide. A single flock on the config
 dir serializes mutations. POSIX-only (fcntl); on non-POSIX the lock is a no-op
 (the vLLM backend is Linux-only anyway, and LM Studio/Ollama manage their own).
+
+The lock is also the probe-memo boundary: the short-TTL docker memo
+(runtime.probe) is dropped on acquire (a sibling process may have mutated since
+we last looked) and on release (we just mutated; the next decision in this
+process must re-probe). Without the release-side drop, `profile up` planned seat
+N+1 against the container list from before seat N launched.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import contextlib
 import time
 
 from .. import config as C
+from . import probe
 
 try:
     import fcntl
@@ -27,7 +34,11 @@ def mutation_lock(timeout: float = 30.0):
     paths.config_dir.mkdir(parents=True, exist_ok=True)
     lockfile = paths.config_dir / ".johnny.lock"
     if not _HAVE_FCNTL:
-        yield
+        probe.invalidate()
+        try:
+            yield
+        finally:
+            probe.invalidate()
         return
     f = open(lockfile, "w")
     deadline = time.time() + timeout
@@ -40,8 +51,10 @@ def mutation_lock(timeout: float = 30.0):
                 if time.time() > deadline:
                     raise TimeoutError("another johnny mutation holds the lock")
                 time.sleep(0.2)
+        probe.invalidate()
         yield
     finally:
+        probe.invalidate()
         try:
             fcntl.flock(f, fcntl.LOCK_UN)
         finally:
