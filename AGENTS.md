@@ -31,8 +31,14 @@ job. Keep that split when adding features.
 ## This box / runtime pins
 
 - 4× AMD R9700 (gfx1201, 32 GB each), ROCm.
-- vLLM-ROCm is **pinned to v0.20.2** — 0.21+ breaks multi-GPU here (hangs,
-  NCCL/HIP failures). Smoke-test TP=2 before any image bump.
+- vLLM-ROCm default is **v0.27.1** (bumped 2026-08-23 after a per-seat validation; see
+  the NOVA MegaPlan `20260823-vllm-rocm-0-27-1-fleet-validation…`). Images ≥0.21 still
+  need the gfx1201 RCCL workaround env (`multi_gpu_env`: NCCL_P2P_DISABLE=1 +
+  RCCL_NET=Socket + NCCL_PROTO=Simple — RCCL PR #2187 is the upstream fix to watch);
+  measured cost on TP2 is ~nil for dense models. **Gemma-4 is pinned per-placement to
+  v0.20.2**: 0.27.0/0.27.1 can't load it (transformers 5.15 per-layer `head_dim`,
+  vllm#52768) and the nightly that can is 13–15 % slower here — re-test at 0.28.
+  Smoke-test TP=2 + `johnny bench perf` before any further image bump.
 - llama.cpp seats use the local `johnny-llamacpp-*:gfx1201` images.
 - DeepSeek-family archs need `-fa off` on RDNA4 (head-dim-512 kernel
   unstable); induction handles this by arch name.

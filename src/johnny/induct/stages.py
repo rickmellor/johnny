@@ -156,6 +156,14 @@ def multi_gpu_env(gpu_count: int, image: str | None) -> dict:
 
     Placements won from a sweep must carry this same env (report.to_placement) —
     a seat has to serve under the conditions it was tuned under.
+
+    2026-08-23 validation on v0.27.1 (TP2, this box): the workaround's measured cost is
+    ~nil for dense models (qwen-27b-coder 900/30.4 vs 924/30.3 tok/s on 0.20.2) and
+    RCCL_NET=Socket vs SHM made no difference on gemma-4-26B (MoE) either. Gemma-4 can't
+    load on 0.27.0/0.27.1 at all (transformers 5.15 per-layer head_dim, vllm#52768) —
+    it stays pinned per-placement to v0.20.2 until 0.28. Upstream fix for the RCCL
+    bugs: ROCm/rccl PR #2187 (gfx12 LL-protocol selection) — when an image carries it,
+    gate this env off again.
     """
     if gpu_count <= 1:
         return {}

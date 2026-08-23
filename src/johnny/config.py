@@ -33,9 +33,9 @@ REGISTRY_SCHEMA_VERSION = 1
 PROFILES_SCHEMA_VERSION = 1
 
 # Vendor-appropriate default vLLM images (config can override).
-DEFAULT_VLLM_IMAGE_AMD = "vllm/vllm-openai-rocm:v0.20.2"
+DEFAULT_VLLM_IMAGE_AMD = "vllm/vllm-openai-rocm:v0.27.1"
 DEFAULT_VLLM_IMAGE_NVIDIA = "vllm/vllm-openai:latest"
-DEFAULT_VLLM_CPU_IMAGE = "vllm/vllm-openai-cpu:v0.20.2"
+DEFAULT_VLLM_CPU_IMAGE = "vllm/vllm-openai-cpu:v0.27.1"
 
 # llama.cpp server image (GGUF backend). Self-contained builds ship llama-server as
 # the ENTRYPOINT; no vendor split (the same image targets the box's GPU arch).
