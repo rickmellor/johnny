@@ -40,6 +40,18 @@ job. Keep that split when adding features.
   vllm#52768) and the nightly that can is 13–15 % slower here — re-test at 0.28.
   Smoke-test TP=2 + `johnny bench perf` before any further image bump.
 - llama.cpp seats use the local `johnny-llamacpp-*:gfx1201` images.
+- **No desktop on the compute GPUs (2026-08-23).** The box boots to `multi-user.target`
+  (`sudo systemctl start gdm` if a GUI is ever needed). Reason: GPU3 (`0000:03:00.0`) was
+  the display GPU; a long Triton kernel there (int4-KV prefill) tripped the gfx-ring
+  watchdog 232× (`ring gfx_0.0.0 timeout → reset → "device wedged, but recovered"`) and
+  afterwards every multi-GPU seat decoded at ~½ speed until reboot. Single-GPU, PCIe, VRAM
+  and CPU all measured normal — the cross-GPU (host-bounce RCCL) path was what degraded.
+  If you ever see amdgpu ring resets in `journalctl -k`, expect to reboot.
+- **RDNA4 kernel tuning + 4-bit KV (2026-08-23)** — measured and parked; see
+  `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md`. Tuned block-FP8 / MoE
+  Triton configs live in `johnny-vllm-rocm:<tag>-gfx1201` images (+2–4 % on the Qwen
+  seats, ~0 on gemma); `int4_per_token_head` / `turboquant_4bit_nc` KV are not usable
+  here (dequant-in-the-hot-loop → 3–7× slower, engine death ≥200K, TQ crashes). bf16 KV.
 - DeepSeek-family archs need `-fa off` on RDNA4 (head-dim-512 kernel
   unstable); induction handles this by arch name.
 
