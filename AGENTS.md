@@ -46,7 +46,12 @@ job. Keep that split when adding features.
   watchdog 232× (`ring gfx_0.0.0 timeout → reset → "device wedged, but recovered"`) and
   afterwards every multi-GPU seat decoded at ~½ speed until reboot. Single-GPU, PCIe, VRAM
   and CPU all measured normal — the cross-GPU (host-bounce RCCL) path was what degraded.
-  If you ever see amdgpu ring resets in `journalctl -k`, expect to reboot.
+  If you ever see amdgpu ring resets in `journalctl -k`, treat that GPU as suspect.
+- **Qwen3.5-family (GDN) warm-up:** Qwen3.6/3.8 seats decode at ~½ speed for their first
+  ~10–15 busy minutes per process while the FLA/GDN Triton decode kernels autotune, then
+  flip to full speed. Warm them up before benching (a sweep finishing inside the window
+  under-measures ~2×); gemma seats are unaffected. See
+  `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md` §E.
 - **RDNA4 kernel tuning + 4-bit KV (2026-08-23)** — measured and parked; see
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md`. Tuned block-FP8 / MoE
   Triton configs live in `johnny-vllm-rocm:<tag>-gfx1201` images (+2–4 % on the Qwen
