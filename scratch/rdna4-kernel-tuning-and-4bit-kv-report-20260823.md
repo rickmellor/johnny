@@ -146,3 +146,21 @@ Operational guidance:
    0.27.1), extending vLLM's GDN warm-up to the decode autotuner (upstreamable fix), persisting Triton
    autotune choices.
 3. The gemma numbers in this report are unaffected (no GDN).
+
+### §E addendum — the exact trigger (validated 2026-08-23 14:15)
+
+The warm-up is **not time-based**. A TP4 Qwen3.8 seat stayed at 14.2 tok/s-per-stream through **18 minutes**
+of continuous 4-stream short-prompt load — then a **single 32K-token prefill** (37 s) flipped it within one
+minute: 14.2 → 24.4 → 33.7/stream, settling at **40.8 single / 142 conc4** (= the rated numbers). So:
+
+**Rule: a freshly launched Qwen3.5-family seat decodes at ~½ speed until it serves its first deep prefill.
+One long prompt (≈32K tokens; threshold not bisected) permanently flips the process to full speed.**
+
+This reconciles every observation: all historically "fast" processes had served deep probes or johnny
+benches (long prompts) first; all "slow" ones had seen only short prompts. Likely mechanism: the first deep
+prefill exercises the GDN chunked-prefill/compile-range bucket whose initialization also fixes the decode
+path's kernel/graph selection — worth an upstream issue with this reproducer.
+
+**Operational fix for johnny:** after `up` of a GDN-arch model (Qwen3.5/3.6/3.8 family), fire one ~32K-token
+throwaway prompt as a warm-up step (~40 s) before marking the seat ready / benching it. Until that exists,
+do it by hand — `scratch/kvexp/deepprobe.py <url> <model> 33000 1` or any long paste.
