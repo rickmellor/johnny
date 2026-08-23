@@ -106,3 +106,43 @@ already gives 262K@4.5× with bf16 (1.18 M-token pool) because only 16 of its 64
 - Images: `johnny-vllm-rocm:{v0.27.1,nightly0822,v0.20.2}-gfx1201` (tuned configs). Tuning sources + JSONs in
   `scratch/tune/` (this commit), raw logs in the session scratchpad `tune/`, `kvexp/`.
 - Not changed: `docker.vllm_image` (still stock v0.27.1); gemma pin (0.20.2); no profile switched to tuned images.
+
+---
+
+## E. CORRECTION (2026-08-23 afternoon) — the "half-speed multi-GPU" diagnosis in §C was wrong
+
+The reboot did **not** restore TP speed, which falsified the driver-state theory. A day of controlled
+elimination (stock vs tuned image · fresh vs cached torch.compile/AOT · GPU pairs · CPU pinning ·
+fabric/soc clocks forced to max · THP/khugepaged · RCCL transport · first-request patterns) found the
+real cause:
+
+**The slowdown is specific to Qwen3.5-family models (hybrid GDN linear attention) and is a per-process
+warm-up, not a degradation.** A freshly launched Qwen3.6/3.8 seat decodes at ~½ speed (TP4 ~15 tok/s,
+TP2 ~14–17) for roughly its first **10–15 minutes of busy time** while the FLA/GDN Triton kernels
+autotune lazily, then flips to full speed **mid-process** (observed live: coder 15.0 → 30.7 in one
+process; single-stream flips after aggregate). Evidence:
+- gemma-26B TP2 (no GDN): **107.9 tok/s single / 1943 peak at 1 minute of age** — instantly at baseline.
+- gemma-12B TP1 (no GDN): instantly at baseline. All "slow" observations were GDN models.
+- Every historical "fast" Qwen number (39.1 TP4, 30.4/32.0 coder, 29.8 TP2) was taken ≥10 min of load
+  into the process; every "slow" one earlier.
+- johnny's registry already recorded the phenomenon for the AWQ TP1 seat on 2026-08-19: *"~10 min to
+  true readiness (slow load + GDN autotune)"* — it applies to the FP8 TP2/TP4 seats too.
+- vLLM's own `mamba/gdn/qwen_gdn_linear_attn.py` warms up the GDN **prefill** autotuner at startup
+  (to avoid autotune-OOM) but has no equivalent for the **decode** kernels.
+
+Consequences: §C's "232 GPU ring resets degraded the cross-GPU path" is wrong as a *performance* claim —
+the resets were real (and console boot remains the right call) but the half-speed readings before AND
+after the reboot were simply un-warmed GDN seats. The pre/post-reboot TP4 comparison in §D is likewise
+an un-warmed number, and **the overnight A/B numbers for Qwen seats are only valid where both sides were
+equally warmed** (the tuned-vs-stock coder A/B at 918/31.5 vs 900/30.4 was; treat any Qwen number taken
+<10 busy-minutes into a seat's life as the warm-up floor, not the seat's speed).
+
+Operational guidance:
+1. **Qwen3.5-family seats need a warm-up period** (~10–15 busy minutes) after every launch before
+   they reach rated speed. johnny ideas: a post-`up` warm-up phase for GDN-arch models, or bench only
+   after warm-up (its perf sweep can under-measure them — e.g. a sweep that finished inside the window
+   read single 12.8–14.6 on a seat whose warmed speed is 30.7).
+2. Candidate mitigations to test: `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE` (decode-kernel path knob in
+   0.27.1), extending vLLM's GDN warm-up to the decode autotuner (upstreamable fix), persisting Triton
+   autotune choices.
+3. The gemma numbers in this report are unaffected (no GDN).
