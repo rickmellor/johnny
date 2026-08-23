@@ -1,0 +1,27 @@
+{
+ "cfg": "bf16",
+ "placement": "kvexp-gemma-bf16-tuned",
+ "kv_cache_dtype": "auto",
+ "max_model_len": 110832,
+ "kv_pool": "GPU KV cache size: 308,826 tokens",
+ "max_concurrency": "Maximum concurrency for 110,832 tokens per request: 2.79x",
+ "backend": "Using TRITON_ATTN backend",
+ "humaneval": "humaneval pass@1 95.12% (156/164)",
+ "arc200": "arc ARC-Challenge 95.0% (190/200",
+ "needle": "\u2713 needle 15/16",
+ "johnny_perf": "perf peak 1769.4 \u00b7 single 81.4 tok/s",
+ "deepprobe": {
+  "summary": true,
+  "single_ok": 4,
+  "single_n": 4,
+  "conc_ok": 4,
+  "conc_n": 4,
+  "conc_wall_s": 452.0,
+  "errors": 0
+ },
+ "perfprobe": {
+  "single_tok_s": 86.9,
+  "conc4_agg_tok_s": 276.3,
+  "conc4_per_stream": 69.1
+ }
+}

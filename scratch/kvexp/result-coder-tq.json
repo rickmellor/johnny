@@ -1,0 +1,23 @@
+{
+ "cfg": "tq",
+ "placement": "kvexp-coder-tq4-mml262144",
+ "kv_cache_dtype": "turboquant_4bit_nc",
+ "max_model_len": 262144,
+ "kv_pool": "GPU KV cache size: 1,250,882 tokens",
+ "max_concurrency": "Maximum concurrency for 262,144 tokens per request: 4.77x",
+ "backend": "Overriding with TURBOQUANT",
+ "humaneval": "humaneval pass@1 95.12% (156/164)",
+ "arc200": "arc ARC-Challenge 85.0% (170/200",
+ "needle": "\u2713 needle 15/16",
+ "johnny_perf": "perf peak 918.4 \u00b7 single 31.5 tok/s",
+ "deepprobe": {
+  "summary": true,
+  "single_ok": 0,
+  "single_n": 6,
+  "conc_ok": 0,
+  "conc_n": 4,
+  "conc_wall_s": 0.0,
+  "errors": 5
+ },
+ "perfprobe": "n/a (Expecting value: line 1 column 1 (char 0))"
+}

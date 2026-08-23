@@ -1,0 +1,27 @@
+{
+ "cfg": "bf16",
+ "placement": "kvexp-coder-bf16-tuned",
+ "kv_cache_dtype": "auto",
+ "max_model_len": 95417,
+ "kv_pool": "GPU KV cache size: 239,287 tokens",
+ "max_concurrency": "Maximum concurrency for 95,417 tokens per request: 2.51x",
+ "backend": "Overriding with ROCM_ATTN",
+ "humaneval": "humaneval pass@1 95.73% (157/164)",
+ "arc200": "arc ARC-Challenge 85.0% (170/200",
+ "needle": "\u2713 needle 16/16",
+ "johnny_perf": "perf peak 918.4 \u00b7 single 31.5 tok/s",
+ "deepprobe": {
+  "summary": true,
+  "single_ok": 4,
+  "single_n": 4,
+  "conc_ok": 4,
+  "conc_n": 4,
+  "conc_wall_s": 299.4,
+  "errors": 0
+ },
+ "perfprobe": {
+  "single_tok_s": 32.0,
+  "conc4_agg_tok_s": 118.7,
+  "conc4_per_stream": 29.7
+ }
+}

@@ -1,0 +1,23 @@
+{
+ "cfg": "int4",
+ "placement": "kvexp-gemma-int4-mml262144",
+ "kv_cache_dtype": "int4_per_token_head",
+ "max_model_len": 262144,
+ "kv_pool": "GPU KV cache size: 2,089,286 tokens",
+ "max_concurrency": "Maximum concurrency for 262,144 tokens per request: 7.97x",
+ "backend": "Using TRITON_ATTN backend",
+ "humaneval": "humaneval pass@1 95.12% (156/164)",
+ "arc200": "arc ARC-Challenge 93.5% (187/200",
+ "needle": "\u2713 needle 15/16",
+ "johnny_perf": "perf peak 1769.4 \u00b7 single 81.4 tok/s",
+ "deepprobe": {
+  "summary": true,
+  "single_ok": 4,
+  "single_n": 6,
+  "conc_ok": 0,
+  "conc_n": 4,
+  "conc_wall_s": 0.0,
+  "errors": 5
+ },
+ "perfprobe": "n/a (Expecting value: line 1 column 1 (char 0))"
+}
