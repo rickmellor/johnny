@@ -1420,6 +1420,9 @@ def up(
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
     force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
     wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
+    warmup: bool = typer.Option(True, "--warmup/--no-warmup",
+                                help="GDN models (Qwen3.5-family) decode at ~half speed until their first deep "
+                                     "prefill; with --wait, fire one ~32K warm-up prompt once serving (default on)."),
     profile: str = typer.Option(None, "--profile", help="Bring up a whole named profile instead "
                                 "(alias for `johnny profile up`)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
@@ -1435,14 +1438,14 @@ def up(
     if profile is not None:
         if model is not None:
             _emit_err(ValueError("--profile brings up a fleet; don't pass a model too"), json_output)
-        profile_up(profile, wait=wait, json_output=json_output)
+        profile_up(profile, wait=wait, warmup=warmup, json_output=json_output)
         return
 
     if model is None:
         model, placement = _pick_placement_interactive(json_output)
 
     try:
-        res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait)
+        res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait, warmup=warmup)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -1455,6 +1458,12 @@ def up(
     )
     if res.get("endpoint"):
         console.print(f"  endpoint: {res['endpoint']}")
+    w = res.get("warmup")
+    if w is not None:
+        if w.get("ok"):
+            console.print(f"  [dim]GDN warm-up: {w.get('prompt_tokens') or '?'}-token prefill in {w.get('seconds')}s — decode at rated speed[/]")
+        else:
+            console.print(f"  [yellow]⚠ GDN warm-up failed ({w.get('error', '')[:80]}) — seat decodes at ~half speed until its first deep prompt[/]")
     if st == "loading":
         console.print(f"  [dim]loading — poll `johnny resolve {res['model']}` or tail `johnny logs {res['seat']}`[/]")
     if res.get("wait_timed_out"):
@@ -2514,6 +2523,9 @@ def profile_rm(
 def profile_up(
     name: str = typer.Argument(..., help="Profile name."),
     wait: bool = typer.Option(False, "--wait", help="Block until each seat is serving (serial)."),
+    warmup: bool = typer.Option(True, "--warmup/--no-warmup",
+                                help="GDN seats (Qwen3.5-family) are waited-for and warmed with one ~32K prefill "
+                                     "so they come up at rated decode speed (default on; see engine/warmup.py)."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Bring up every seat in a profile (idempotent: running seats are skipped).
@@ -2524,7 +2536,7 @@ def profile_up(
     from .engine import launch, profiles
 
     try:
-        res = profiles.up_profile(name, wait=wait)
+        res = profiles.up_profile(name, wait=wait, warmup=warmup)
     except launch.PlacementError as e:
         _emit_err(e, json_output)
     if json_output:

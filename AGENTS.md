@@ -51,8 +51,9 @@ job. Keep that split when adding features.
   seat decodes at ~½ speed **until it serves its first deep prefill**; one ~32K-token
   prompt flips the process to full speed permanently (validated: 18 min of short-prompt
   load stayed at 14 tok/s/stream; one 32K prefill → 40.8 single / 142 c4 within a minute).
-  Fire a long throwaway prompt after `up` before benching/relying on a GDN seat (johnny
-  TODO: automate as a post-up warm-up step). gemma seats are unaffected. See
+  **Automated (2026-08-23): `johnny up --wait` and `johnny profile up` warm GDN seats by
+  default** (`engine/warmup.py`; `--no-warmup` skips; profile up waits for GDN seats even
+  without `--wait` so the fleet comes up at rated speed). gemma seats are unaffected. See
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md` §E.
 - **RDNA4 kernel tuning + 4-bit KV (2026-08-23)** — measured and parked; see
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md`. Tuned block-FP8 / MoE

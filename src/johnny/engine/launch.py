@@ -16,6 +16,7 @@ from ..runtime.lock import mutation_lock
 from ..telemetry import collect
 from . import all_seats, driver_for, load_config
 from .placement import allocate_port, assign_gpus, fill_gpus_forced, free_gpus, pick_placement, role_for, viable
+from . import warmup as warmup_mod
 from ..hardware import detect as hwdetect
 from ..registry import store
 
@@ -143,6 +144,7 @@ def up(
     # load + GDN autotune before /v1/models answers) and a wait that silently expires
     # at 600s looks exactly like success to a script (2026-08-19 incident).
     wait_timeout: float = 1200.0,
+    warmup: bool = True,
 ) -> dict:
     cfg = load_config()
     hardware = hwdetect.detect()
@@ -216,6 +218,12 @@ def up(
             collect.record_load_event(seat.name, model_id, placement.get("id", ""), started, collect.now())
             result["state"] = "ready"
             result["endpoint"] = f"http://{spec['bind_address']}:{port}/v1"
+            if warmup and warmup_mod.needs_gdn_warmup(model, placement):
+                # GDN models decode at ~half speed until their first deep prefill
+                # (see engine/warmup.py) — fire one before calling the seat warm.
+                result["warmup"] = warmup_mod.gdn_warmup(
+                    port, spec["served_model_name"],
+                    (placement.get("knobs") or {}).get("max_model_len"))
         else:
             result["state"] = "loading"
             result["wait_timed_out"] = wait_timeout

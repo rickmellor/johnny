@@ -199,7 +199,7 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
     return errors, warnings
 
 
-def up_profile(name: str, wait: bool = False, cfg: dict | None = None) -> dict:
+def up_profile(name: str, wait: bool = False, cfg: dict | None = None, warmup: bool = True) -> dict:
     """Bring up every seat in a profile, best-effort: one seat's failure is
     recorded and the rest still launch. Idempotent per seat — a seat already
     running on its port returns action=exists (launch.up keys on model+port,
@@ -227,9 +227,17 @@ def up_profile(name: str, wait: bool = False, cfg: dict | None = None) -> dict:
             entry.update({"action": "error", "error": f"port {seat.get('port')} held by {holder.name}"})
             results.append(entry)
             continue
+        # GDN-arch seats (Qwen3.5-family) decode at ~half speed until their first
+        # deep prefill (engine/warmup.py) — for those, wait + warm by default even
+        # when the profile itself is brought up async, so the fleet comes up at
+        # rated speed. --no-warmup restores the old fire-and-forget behavior.
+        from ..registry import store as _store
+        _model = _store.get(_store.load(), model) or {}
+        _needs_warm = warmup and launch.warmup_mod.needs_gdn_warmup(_model)
         try:
             r = launch.up(model, placement_id=seat.get("placement"),
-                          port=seat.get("port"), wait=wait)
+                          port=seat.get("port"), wait=wait or _needs_warm,
+                          warmup=warmup)
         except launch.PlacementError as e:
             entry.update({"action": "error", "error": str(e)})
             results.append(entry)
