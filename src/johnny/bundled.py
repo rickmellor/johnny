@@ -20,6 +20,7 @@ _BUNDLED = {
     "probe_mtp": "probe-mtp-availability.sh",
     "audit_models": "audit-models.py",
     "arc_eval": "arc_eval.py",
+    "planbench_eval": "planbench_eval.py",
     "humaneval_score": "humaneval_chat_score.py",
     "code_needle": "code_needle.py",
     "build_corpus": "build_corpus.py",

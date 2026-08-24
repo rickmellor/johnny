@@ -76,7 +76,7 @@ from .induct import stages
 from .registry import store
 from .telemetry import collect
 
-SUITES = ("perf", "arc", "icl", "needle", "depth", "humaneval", "ctxsafe", "automationbench")
+SUITES = ("perf", "arc", "icl", "needle", "depth", "humaneval", "ctxsafe", "automationbench", "planbench")
 PLANNED: dict[str, str] = {}
 _ARC_TIMEOUT = 4 * 3600  # full ARC-Challenge with CoT can run for a while
 _ICL_TIMEOUT = 20 * 60  # 16 short single-turn cases — should be minutes, not hours
@@ -253,6 +253,45 @@ def _run_arc(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
     scores = parse_arc_output(out)
     if not scores:
         return {"ok": False, "error": f"arc_eval produced no score (rc={rc}): {out[-300:]}"}
+    scores.update({"ok": True, "limit": limit, "samples": str(out_path)})
+    return scores
+
+
+def _run_planbench(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | None,
+                   concurrency: int, thinking: bool, progress) -> dict:
+    """PlanBench task_1 plan generation — isolates PLANNING from tool loops and long context.
+
+    Short one-shot PDDL (Blocksworld) problems: no tools, no exploration, ~1-2K context, so a
+    weak score here is a planning limit rather than an agentic-loop or context-pressure artifact
+    (the ambiguity automationbench alone can't resolve). Scored as exact action-sequence match
+    against the reference plan — a strict LOWER BOUND, since a different-but-valid plan scores 0
+    (upstream PlanBench uses the VAL validator to accept those); `plan_prefix_pct` gives partial
+    credit for a correct leading prefix. Comparable across models on identical instances, which
+    is what it's for.
+    """
+    from .bundled import resolve_script
+
+    missing = arc_deps_missing()          # same deps: openai + datasets
+    if missing:
+        return {"ok": False, "error": f"missing eval deps: {', '.join(missing)} — "
+                "`pipx inject johnny-fleet openai datasets` (or pip install 'johnny-fleet[bench]')"}
+    script = resolve_script("planbench_eval", cfg)
+    if not script:
+        return {"ok": False, "error": "planbench_eval.py unavailable (not bundled, no scripts.planbench_eval override)"}
+    out_path = run_dir / "planbench_results.json"
+    out_path.unlink(missing_ok=True)      # never score a prior run's file (see _run_icl)
+    cmd = [sys.executable, script, "--base-url", f"http://127.0.0.1:{port}/v1",
+           "--model", model_id, "--concurrency", str(concurrency), "--out", str(out_path),
+           "--limit", str(limit or 100)]
+    if not thinking:
+        cmd += ["--disable-thinking"]
+    else:
+        cmd += ["--max-tokens", "4096", "--timeout", "900"]
+    rc, out = _stream_run(cmd, _ARC_TIMEOUT, progress)
+    m = re.search(r"PLANBENCH_JSON (\{.*\})", out)
+    if not m:
+        return {"ok": False, "error": f"planbench_eval produced no score (rc={rc}): {out[-300:]}"}
+    scores = json.loads(m.group(1))
     scores.update({"ok": True, "limit": limit, "samples": str(out_path)})
     return scores
 
@@ -904,6 +943,8 @@ def write_report(run_dir: Path, model_id: str, placement_id: str, results: dict)
         elif suite == "humaneval":
             lines.append(f"HumanEval pass@1 {r.get('pass_at_1_pct')}% ({r.get('passed')}/{r.get('total')}"
                          + (f", limit={r['limit']}" if r.get("limit") else "") + ")")
+        elif suite == "planbench":
+            console.print(f"[green]✓[/] planbench exact-plan {r.get('exact_pct')}% ({r.get('exact')}/{r.get('total')}) · prefix {r.get('plan_prefix_pct')}%")
         elif suite == "automationbench":
             lines.append(f"AutomationBench pass rate {r.get('pass_rate_pct')}% "
                          f"({r.get('passed')}/{r.get('total')}, avg partial credit {r.get('avg_score_pct')}%) "
@@ -1010,6 +1051,11 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
                     results["arc"] = {"ok": False, "error": "embeddings model — ARC needs a generative seat"}
                 else:
                     results["arc"] = _run_arc(port, model_id, run_dir, cfg, limit, concurrency, thinking, _p)
+            elif s == "planbench":
+                if point.get("embeddings"):
+                    results["planbench"] = {"ok": False, "error": "embeddings model — PlanBench needs a generative seat"}
+                else:
+                    results["planbench"] = _run_planbench(port, model_id, run_dir, cfg, limit, concurrency, thinking, _p)
             elif s == "icl":
                 if point.get("embeddings"):
                     results["icl"] = {"ok": False, "error": "embeddings model — ICL needs a generative seat"}
