@@ -189,3 +189,43 @@ escalation profile.**
   for simplicity + the 262 K window. Not worth it as the default.
 - Qwen3.8's real, proven value is the **TP4 262 K seat**: one `johnny profile up qwen38-tp4` away (now
   auto-warmed), serving chat+coder via role_aliases when a task needs more than ~95–110 K of context.
+
+---
+
+## G. `reasoning_effort` revalidation — §F's verdict was measured against a hobbled Qwen3.8 (2026-08-24)
+
+Qwen3.8's chat template carries a **reasoning-effort dial** whose default is **`xhigh`** ("think carefully…
+validate key assumptions, consider plausible alternatives"). Every §F number for Qwen3.8 was therefore taken
+in max-deliberation mode, while qwen-27b-coder ran in its normal mode — an unfair comparison. Levers:
+
+- per request: `chat_template_kwargs: {"reasoning_effort": "low"|"medium"|"xhigh"}` (or `{"enable_thinking": false}`)
+- per seat: `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'` (vLLM ≥0.27; request-level wins)
+- `--reasoning-parser qwen3` only *splits* the thinking into `reasoning_content`; it does not gate it.
+
+Re-run of AutomationBench, **30 tasks, full runs** (placements `effort-{low,medium}-{tp2,tp4}` carrying the
+server-side flag; all seats auto-warmed by the new GDN warm-up):
+
+| seat / effort | conc | pass rate | avg partial credit |
+|---|---|---|---|
+| **Qwen3.8 TP4 · low** | 4 | **40.0 %** (12/30) | **61.2 %** |
+| Qwen3.8 TP2 · medium | 2 | 30.0 % (9/30) | 61.0 % |
+| Qwen3.8 TP4 · medium | 4 | 30.0 % (9/30) | 52.7 % |
+| Qwen3.8 TP2 · low | 2 | 23.3 % (7/30) | 55.4 % |
+| qwen-27b-coder (§F baseline) | 4 | 16.7 % | 39.5 % |
+| Qwen3.8 TP2 · xhigh default (§F) | 4 | 14.3 % | 46.8 % |
+
+**Findings**
+1. **The `xhigh` default was the problem.** Every non-default configuration beats it, and the best beats it
+   by ~2.8× on pass rate. §F's "Qwen3.8 gains nothing and is 30 % slower" is **withdrawn** — it measured the
+   default, not the model.
+2. **Qwen3.8 at low/medium beats qwen-27b-coder on agentic work** by 7–23 points of pass rate and 13–22
+   points of partial credit, on the same 30-task prefix and harness.
+3. Low-vs-medium is **not** cleanly separable at n=30: low wins on TP4 (40 vs 30), medium wins on TP2
+   (30 vs 23.3), and the two TP4 runs bracket each other. Treat 30–40 % as the band and both settings as
+   "much better than xhigh"; a larger sample is needed to rank them.
+4. Neither effort setting reintroduced the concurrency wedge (conc 2 and 4 both clean).
+
+**Revised daily-driver recommendation (supersedes §F):** the coder role is now genuinely contestable by
+Qwen3.8 **with `reasoning_effort` pinned** — and the TP4 seat that wins here is the same seat that carries
+262 K context. Remaining gap before switching the default: gemma still owns chat (ARC 95.0, ~100 tok/s),
+and HumanEval/ARC for the effort-pinned configs have not been re-measured (only agentic work was).
