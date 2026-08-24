@@ -164,3 +164,28 @@ path's kernel/graph selection — worth an upstream issue with this reproducer.
 **Operational fix for johnny:** after `up` of a GDN-arch model (Qwen3.5/3.6/3.8 family), fire one ~32K-token
 throwaway prompt as a warm-up step (~40 s) before marking the seat ready / benching it. Until that exists,
 do it by hand — `scratch/kvexp/deepprobe.py <url> <model> 33000 1` or any long paste.
+---
+
+## F. Daily-driver decision — coder vs Qwen3.8 vs gemma (2026-08-23 evening)
+
+Head-to-head completed (both TP2 seats on v0.27.1, auto-warmed by the new GDN warm-up, AutomationBench
+at concurrency 4 / 60 tasks, 3 h cap — coder finished ~48, Qwen3.8 ~34 of the same ordered prefix):
+
+| | qwen-27b-coder (Qwen3.6) TP2 | Qwen3.8-27B-FP8 TP2 | Qwen3.8 TP4 @262K | gemma-4-26B TP2 (0.20.2) |
+|---|---|---|---|---|
+| HumanEval | **95.73 %** | **95.73 %** (tie) | same model | 95.12 % |
+| ARC-200 (think-off) | 85.0 % | 80.0 % | same model | **95.0 %** |
+| needle | **16/16** | 15/16 | 255K-verified | 15/16 |
+| AutomationBench (agentic) | reward 0.395 · pass 16.7 % (~48 tasks) | reward 0.468 · pass 14.3 % (~34 tasks) | not run (same model) | not run |
+| agentic throughput | **~48 tasks / 3 h** | ~34 tasks / 3 h (−30 %) | — | — |
+| decode (warmed) | 30.4–30.8 single · 900 peak | 29.8–30.2 single · 577 peak | **40.8 single · 142 c4** | **94.9–107.9 single · ~2000 peak** |
+| context | 95 K (ctxsafe-verified) | 95 K (90 K verified) | **262 K @ 4.5×** (255 K verified) | 110 K @ 2.8× |
+
+**Verdict: keep `daily` (gemma chat + coder) as the daily driver; keep `qwen38-tp4` as the long-context
+escalation profile.**
+- Swapping the coder for Qwen3.8 TP2 buys nothing: HumanEval ties, ARC is 5 pts lower, AutomationBench is
+  a wash on quality (higher partial credit, lower strict pass) and **30 % slower through agentic work**.
+- Going Qwen3.8-only (TP4) costs the chat role 2.5× decode speed (40.8 vs ~100 gemma) and 10 pts of ARC,
+  for simplicity + the 262 K window. Not worth it as the default.
+- Qwen3.8's real, proven value is the **TP4 262 K seat**: one `johnny profile up qwen38-tp4` away (now
+  auto-warmed), serving chat+coder via role_aliases when a task needs more than ~95–110 K of context.
