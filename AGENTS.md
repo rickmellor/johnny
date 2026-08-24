@@ -55,6 +55,11 @@ job. Keep that split when adding features.
   default** (`engine/warmup.py`; `--no-warmup` skips; profile up waits for GDN seats even
   without `--wait` so the fleet comes up at rated speed). gemma seats are unaffected. See
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md` §E.
+- **Qwen3.8 `reasoning_effort` (2026-08-24):** its chat template defaults to **`xhigh`**, which badly
+  hurts agentic throughput/quality. Pin it per-seat with
+  `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'` (or `low`) — AutomationBench pass rate
+  goes 14.3 % (xhigh) → 30–40 % (low/medium), vs qwen-27b-coder's 16.7 %. Per-request
+  `chat_template_kwargs` overrides. Placements `effort-{low,medium}-{tp2,tp4}` carry it. Report §G.
 - **RDNA4 kernel tuning + 4-bit KV (2026-08-23)** — measured and parked; see
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md`. Tuned block-FP8 / MoE
   Triton configs live in `johnny-vllm-rocm:<tag>-gfx1201` images (+2–4 % on the Qwen
