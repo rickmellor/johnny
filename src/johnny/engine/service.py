@@ -36,6 +36,32 @@ def _find(seats, target):
     return None, hints[0]
 
 
+def seat_guidance(target: str, model: str | None = None) -> str | None:
+    """Optional agent-guidance hint declared on a profile seat, e.g. `guidance: roadmap`.
+
+    Some seats execute delegated work well but plan it poorly — gemma-4-26B measured
+    PlanBench 34% / AutomationBench 0-6.7% (long loops) yet 5/5 on short delegate tasks,
+    where an explicit ordered brief cut it from 6.4 to 5.1 tool steps and kept the hardest
+    task off the step ceiling (8/8 bare vs 5-6 roadmapped, 2026-08-24). Clients (input's
+    spawn_agent) read this to decide whether to hand the sub-agent a step-by-step plan
+    instead of an open-ended question. Declared per seat in profiles.yaml so it travels
+    with the fleet config rather than being hard-coded per model in every client.
+    """
+    from . import profiles as _profiles
+
+    for prof in (_profiles.all_profiles() or {}).values():
+        for seat in prof.get("seats") or []:
+            g = seat.get("guidance")
+            if not g:
+                continue
+            role = seat.get("role")
+            aliased = (prof.get("role_aliases") or {}).get(target)
+            if target in (role, seat.get("model")) or (aliased and aliased == role) \
+               or (model and model == seat.get("model")):
+                return g
+    return None
+
+
 def resolve(target: str, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     seats = all_seats(cfg)
@@ -48,6 +74,7 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
             "state": "absent",
             "eta_s": collect.cold_start_estimate(model_hint or target),
             "queue_depth": None,
+            "guidance": seat_guidance(target, model_hint),
         }
     state = "ready" if seat.state == "ready" else ("loading" if seat.state in ("loading", "running") else "failed")
     queue_depth = None
@@ -64,6 +91,7 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
         "state": state,
         "eta_s": eta,
         "queue_depth": queue_depth,
+        "guidance": seat_guidance(target, seat.model),
     }
 
 

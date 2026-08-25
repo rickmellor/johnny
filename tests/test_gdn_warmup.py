@@ -46,3 +46,18 @@ def test_launch_up_signature_has_warmup():
     assert inspect.signature(launch.up).parameters["warmup"].default is True
     assert "warmup" in inspect.signature(profiles.up_profile).parameters
     assert inspect.signature(profiles.up_profile).parameters["warmup"].default is True
+
+
+def test_seat_guidance_reads_profile_and_follows_role_aliases(monkeypatch):
+    from johnny.engine import profiles, service
+
+    fake = {"profiles": {"p": {
+        "seats": [{"model": "gemma-x", "role": "chat", "guidance": "roadmap"},
+                  {"model": "embed-x", "role": "embed"}],
+        "role_aliases": {"coder": "chat"}}}}
+    monkeypatch.setattr(profiles, "all_profiles", lambda: fake["profiles"])
+    assert service.seat_guidance("chat") == "roadmap"
+    assert service.seat_guidance("coder") == "roadmap"      # via role_alias
+    assert service.seat_guidance("gemma-x") == "roadmap"    # by model name
+    assert service.seat_guidance("embed") is None           # seat declares none
+    assert service.seat_guidance("nope") is None
