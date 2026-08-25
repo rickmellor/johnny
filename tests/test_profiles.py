@@ -104,7 +104,24 @@ def test_validate_cross_profile_role_warns():
     other = {"other": {"seats": [_seat("m", "p", 9000, "coder")]}}
     with mock.patch.object(profiles, "all_profiles", return_value=other):
         _, warnings = profiles.validate(GOOD, REG, None)
-    assert any("also defined in profile 'other'" in w for w in warnings)
+    w = [x for x in warnings if "role 'coder'" in x]
+    assert len(w) == 1 and "also defined in other" in w[0]
+    # the message must not claim plain first-match: resolve prefers the LIVE seat
+    assert "live seat" in w[0]
+
+
+def test_validate_cross_profile_role_warns_once_per_role():
+    """A profile with several seats on the same role (scale-out, e.g. 12b-quad's four
+    chat seats) must produce ONE warning naming the profiles, not one per seat."""
+    other = {"other": {"seats": [_seat("m", "p", 9000, "coder"),
+                                 _seat("m", "p", 9001, "coder"),
+                                 _seat("m", "p", 9002, "coder")]},
+             "third": {"seats": [_seat("m", "p", 9003, "coder")]}}
+    with mock.patch.object(profiles, "all_profiles", return_value=other):
+        _, warnings = profiles.validate(GOOD, REG, None)
+    w = [x for x in warnings if "role 'coder'" in x]
+    assert len(w) == 1, w
+    assert "other" in w[0] and "third" in w[0]
 
 
 def _live(name, model, placement, port, managed=True):

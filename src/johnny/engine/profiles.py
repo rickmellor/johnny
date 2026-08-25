@@ -186,16 +186,25 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
     if hardware is not None and gpu_need > len(getattr(hardware, "gpus", []) or []):
         warnings.append(f"placements want {gpu_need} GPUs but this box has "
                         f"{len(hardware.gpus)} — bring-up will be partial")
-    # A role defined by another profile too makes `resolve <role>` first-match
-    # ambiguous (role_to_model scans all profiles).
+    # Roles shared with other profiles are NORMAL (every profile defines chat/embed/
+    # classifier) and NOT ambiguous at runtime: role_to_models() collects candidates
+    # across all profiles, and resolve prefers whichever has a LIVE seat — the running
+    # fleet decides the winner, not file order. Only worth mentioning when *no* seat is
+    # up, where the first candidate is what a caller would get. Report it once per role
+    # with the profile list, rather than one line per duplicate seat (12b-quad's four
+    # chat seats used to emit four identical warnings).
     my_roles = {s.get("role") for s in seats if s.get("role")}
+    shared: dict[str, set] = {}
     for other_name, other in all_profiles().items():
         if other is profile or other_name == name:
             continue
         for s in other.get("seats") or []:
             if s.get("role") in my_roles:
-                warnings.append(f"role '{s['role']}' is also defined in profile "
-                                f"'{other_name}' (resolve uses first match)")
+                shared.setdefault(s["role"], set()).add(other_name)
+    for role, names in sorted(shared.items()):
+        warnings.append(f"role '{role}' is also defined in {', '.join(sorted(names))} — "
+                        f"fine at runtime (resolve prefers the live seat); only the "
+                        f"first candidate wins when nothing is up")
     return errors, warnings
 
 
