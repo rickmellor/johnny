@@ -16,30 +16,67 @@ See [PLAN.md](PLAN.md) for the full design and phased implementation roadmap.
 
 ## Status
 
-**Plan approved — build begins at Phase 0** (package skeleton + config + doctor/init).
-The SAINT integration's v0 contract (`resolve` / `up --wait` / the ingest spool) comes
-alive at Phase 3; SAINT's side is specified in its repo's OpenSpec change
-`add-johnny-integration`.
+Built and in daily use. Seats, profiles, the registry, induction/tuning, benchmarking,
+the reaper, telemetry and the SAINT resolve contract are all live; the Textual dashboard
+(`johnny tui`) and the multi-node controller (`johnny nodes`, `johnny daemon`) are the
+newest and least exercised surfaces. [PLAN.md](PLAN.md) is the original design record —
+useful for *why*, no longer accurate as a schedule.
 
-## Highlights (from the plan)
+## What it does
 
-- **Portable / shareable** — no hardwired paths or hardware; detects GPU vendor,
-  count, VRAM, arch, and natively-accelerated dtypes at runtime. Versioned schemas
-  with migrations from day 0.
-- **Declarative registry** — the source of truth for models, validated placement
-  configs (per GPU-count/TP, quant, context, MTP, KV-dtype), profiles, and fleets.
-- **Multi-seat control** — runs co-existing models across the GPUs (e.g. orchestrator
-  + coder + embeddings), replacing the single-LLM-on-8000 assumption.
-- **Early idle reaper** — evicts idle seats so the cards reach deep idle (~16–18 W vs
-  ~95 W); cron-able and stateless, landing long before the full JIT router.
-- **Model induction** — `johnny induct <model>` runs a seeded search (not a brute grid)
-  across viable placements and writes the optimal parameters into the registry.
-- **Control plane, not data plane** — request routing (SAINT, the classifier
-  router) integrates as a peer over a JSON contract; johnny manages seat lifecycle and
-  liveness, SAINT classifies and picks per request — johnny supplies the on-demand
-  loading SAINT's static policy grid structurally lacks.
-- Reuses the proven mlops scripts (bench, wait-ready, audit, probes, eval harnesses)
-  as orchestrated subprocesses rather than reimplementing them.
+A box with several GPUs can host several models at once. johnny decides what runs where,
+keeps the placements that actually work written down, and answers "where do I send this
+request right now" for whatever sits in front of it.
+
+- **Declarative registry** — the source of truth for models and their *validated
+  placements*: per GPU-count/TP, quant, context length, KV dtype, image pin, environment.
+  A placement is a configuration that has been proven to load and serve on this hardware,
+  not a guess.
+- **Seats** — `up` / `down` / `swap` a named model instance on chosen cards and a port,
+  without disturbing its siblings. Seats coexist (e.g. chat + coder + embeddings).
+- **Profiles** — a named fleet of seats brought up together (`johnny profile up <name>`),
+  optionally at boot via a systemd user unit. Roles (`chat`, `coder`, `embed`,
+  `classifier`) name what a seat is *for*; `role_aliases` lets one seat answer to several.
+- **Induction & tuning** — `johnny induct <model>` runs a seeded search (not a brute grid)
+  over viable placements and writes the winner into the registry. `johnny bench` scores a
+  placement for both throughput and quality, and records the result.
+- **Idle reaper** — evicts idle, unpinned seats so the cards drop to deep idle. Stateless
+  and cron-able; `pin` exempts a seat.
+- **Resolve contract** — `johnny resolve <role> --json` returns the live endpoint, model,
+  readiness and ETA. This is the hot path a router calls per request; it is deliberately a
+  CLI/HTTP contract, never a library import, so the router stays independent of johnny.
+- **Control plane, not data plane** — johnny manages seat lifecycle and liveness; a router
+  (SAINT) classifies and picks per request. johnny supplies the on-demand loading a static
+  policy grid structurally lacks.
+
+## Command surface
+
+```
+Seats      up · down · swap · reap · pin · unpin · resolve
+Observe    status · logs · metrics · alive · tui
+Models     induct · tune · bench · search · download · login · registry
+Fleet      profile · nodes · daemon · provider
+Setup      init · doctor · migrate · hinfo · cleanup · rm · version
+```
+
+`johnny init` detects the box and writes a starter config; `johnny doctor` preflights
+docker, the GPU runtime, arch support, disk and backends before you spend an hour on a
+load that was never going to work.
+
+## Benchmarking
+
+`johnny bench <placement> --suite <name>` records into the registry alongside the placement,
+so a config carries its own evidence:
+
+| suite | measures |
+|---|---|
+| `perf` | throughput: single-stream and peak concurrent tok/s |
+| `arc` · `icl` · `humaneval` | reasoning, in-context learning, code generation |
+| `needle` · `depth` · `ctxsafe` | long-context retrieval and where a seat stops being safe |
+| `automationbench` · `planbench` | agentic tool loops, and planning in isolation |
+
+`ctxsafe` matters more than it sounds: `max_model_len` is a *request*, not a guarantee, and a
+seat that launches at a given context can still fail at depth.
 
 ## Per-seat agent guidance
 
