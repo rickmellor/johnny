@@ -40,3 +40,31 @@ alive at Phase 3; SAINT's side is specified in its repo's OpenSpec change
   loading SAINT's static policy grid structurally lacks.
 - Reuses the proven mlops scripts (bench, wait-ready, audit, probes, eval harnesses)
   as orchestrated subprocesses rather than reimplementing them.
+
+## Per-seat agent guidance
+
+A profile seat may carry a `guidance` hint describing how *clients* should brief work sent to
+it. It changes nothing about how johnny launches or manages the seat — johnny only declares it
+and surfaces it through the resolve contract, so a client can adapt without hardcoding model
+names.
+
+```yaml
+seats:
+  - model: <model-id>
+    placement: <placement-id>
+    port: 8002
+    role: chat
+    guidance: roadmap      # this model executes delegated work well but plans it poorly
+role_aliases:
+  coder: chat              # 'coder' resolves to the chat seat — and inherits its guidance
+```
+
+```console
+$ johnny resolve chat --json
+{ "seat": "...", "endpoint": "...", "model": "...", "state": "ready", "guidance": "roadmap" }
+```
+
+`roadmap` means *give this seat an explicit ordered brief rather than an open-ended question*.
+Resolution follows `role_aliases`, so a role pointed at another seat inherits that seat's hint.
+Seats that declare nothing return `"guidance": null`, and clients are expected to treat the
+field as optional — it is advisory metadata, not a contract a client must honour.
