@@ -60,6 +60,13 @@ job. Keep that split when adding features.
   `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'` (or `low`) — AutomationBench pass rate
   goes 14.3 % (xhigh) → 30–40 % (low/medium), vs qwen-27b-coder's 16.7 %. Per-request
   `chat_template_kwargs` overrides. Placements `effort-{low,medium}-{tp2,tp4}` carry it. Report §G.
+- **Per-seat `guidance` (2026-08-24).** A profile seat may declare `guidance: roadmap` when its
+  model executes delegated work well but plans it poorly. `johnny resolve <role> --json` surfaces
+  it (`guidance` field, follows `role_aliases`), and input's `spawn_agent` reads it to hand that
+  sub-agent an explicit ordered brief instead of an open question. Set on `gemma-tp4` from
+  measurement: gemma-4-26B scores PlanBench 34% / AutomationBench 0–6.7% on long loops, yet 5/5
+  on short delegate tasks — where a roadmapped brief cut it 6.4 → 5.1 tool steps and kept the
+  ambiguous task off the 8-step ceiling. Efficiency + margin, not a correctness crutch.
 - **RDNA4 kernel tuning + 4-bit KV (2026-08-23)** — measured and parked; see
   `scratch/rdna4-kernel-tuning-and-4bit-kv-report-20260823.md`. Tuned block-FP8 / MoE
   Triton configs live in `johnny-vllm-rocm:<tag>-gfx1201` images (+2–4 % on the Qwen
