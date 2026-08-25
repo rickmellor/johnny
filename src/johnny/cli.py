@@ -2093,6 +2093,10 @@ def bench(
             console.print(f"[green]✓ humaneval[/] pass@1 {r.get('pass_at_1_pct')}% "
                           f"({r.get('passed')}/{r.get('total')}"
                           + (f", first {r['limit']}" if r.get("limit") else "") + ")")
+        elif s == "planbench":
+            console.print(f"[green]✓ planbench[/] exact-plan {r.get('exact_pct')}% "
+                          f"({r.get('exact')}/{r.get('total')}) · plan-prefix {r.get('plan_prefix_pct')}%"
+                          + (f" · errors={r['errors']}" if r.get("errors") else ""))
         elif s == "automationbench":
             console.print(f"[green]✓ automationbench[/] pass rate {r.get('pass_rate_pct')}% "
                           f"({r.get('passed')}/{r.get('total')}, avg partial credit {r.get('avg_score_pct')}%)"

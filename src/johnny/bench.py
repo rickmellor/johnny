@@ -944,7 +944,11 @@ def write_report(run_dir: Path, model_id: str, placement_id: str, results: dict)
             lines.append(f"HumanEval pass@1 {r.get('pass_at_1_pct')}% ({r.get('passed')}/{r.get('total')}"
                          + (f", limit={r['limit']}" if r.get("limit") else "") + ")")
         elif suite == "planbench":
-            console.print(f"[green]✓[/] planbench exact-plan {r.get('exact_pct')}% ({r.get('exact')}/{r.get('total')}) · prefix {r.get('plan_prefix_pct')}%")
+            lines.append(f"PlanBench ({r.get('task')}) exact-plan {r.get('exact_pct')}% "
+                         f"({r.get('exact')}/{r.get('total')}) · plan-prefix {r.get('plan_prefix_pct')}% "
+                         f"· domains={r.get('domains')} · errors={r.get('errors')}")
+            lines.append("  (exact match vs the reference plan is a strict lower bound — a valid "
+                         "alternative plan scores 0; prefix is partial credit)")
         elif suite == "automationbench":
             lines.append(f"AutomationBench pass rate {r.get('pass_rate_pct')}% "
                          f"({r.get('passed')}/{r.get('total')}, avg partial credit {r.get('avg_score_pct')}%) "
