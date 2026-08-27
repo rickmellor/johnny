@@ -33,7 +33,7 @@ REGISTRY_SCHEMA_VERSION = 1
 PROFILES_SCHEMA_VERSION = 1
 
 # Vendor-appropriate default vLLM images (config can override).
-DEFAULT_VLLM_IMAGE_AMD = "vllm/vllm-openai-rocm:v0.27.1"
+DEFAULT_VLLM_IMAGE_AMD = "vllm/vllm-openai-rocm:v0.28.0"
 DEFAULT_VLLM_IMAGE_NVIDIA = "vllm/vllm-openai:latest"
 DEFAULT_VLLM_CPU_IMAGE = "vllm/vllm-openai-cpu:v0.27.1"
 
