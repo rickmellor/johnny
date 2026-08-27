@@ -49,15 +49,23 @@ def seat_guidance(target: str, model: str | None = None) -> str | None:
     """
     from . import profiles as _profiles
 
+    # Guidance is a property of the MODEL a profile seat runs, not of the role name: the same
+    # role ('chat') is served by different models across profiles, and matching on the role
+    # leaked gemma-tp4's `roadmap` onto the Qwen3.5-122B seat (2026-08-27). When the caller
+    # knows which model is live, only that model's seat entries count; the role/alias match is
+    # kept solely for the absent-seat case (no live model to key on).
     for prof in (_profiles.all_profiles() or {}).values():
         for seat in prof.get("seats") or []:
             g = seat.get("guidance")
             if not g:
                 continue
+            if model:
+                if model == seat.get("model"):
+                    return g
+                continue
             role = seat.get("role")
             aliased = (prof.get("role_aliases") or {}).get(target)
-            if target in (role, seat.get("model")) or (aliased and aliased == role) \
-               or (model and model == seat.get("model")):
+            if target in (role, seat.get("model")) or (aliased and aliased == role):
                 return g
     return None
 
