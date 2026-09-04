@@ -144,6 +144,14 @@ full configured cap wasn't reached.
   each request only 8k. Agent-facing seats want `parallel: 1`.
 - GGUF `general.file_type` is an int enum, not a string — quant names are
   derived from filenames/headers (`registry/normalize.py:identity_gaps`).
+- Placement `extra.mounts` (vLLM) is a list of docker `-v` specs (`host:container[:ro]`, host
+  `~`-expanded) emitted before the image — how a seat runs an image with patched vLLM source
+  files without a rebuild. Qwen3.8-Flash-Next rides on it (seven files from `~/scratch/fnrepo`,
+  the checkout of `rickmellor/qwen3.8-flash-next-rdna4`); placements
+  `flashnext-awq-tp4-{,ep-}p2p-piecewise-mtp-mml131072`.
+- **Boot default profile is `flashnext` since 2026-09-04** (`johnny-profile@flashnext.service`):
+  Flash-Next TP4 + expert-parallel as `chat` with `coder` aliased onto it, nomic embed + 1B
+  classifier on CPU. GPUs 4,5 are free. `split`/`gemma-tp4` remain as profiles, not enabled.
 - Placement `extra.extra_flags` passes raw llama-server flags (e.g.
   `["-ctk", "q8_0"]` for quantized KV).
 - SAINT (~/repos/saint-router) resolves seats by **role** (`coder`/`chat`/
