@@ -1,0 +1,14 @@
+[A-4gpu-fa1] | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+[A-4gpu-fa1] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |           pp512 |       1021.71 ± 6.67 |
+[A-4gpu-fa1] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |            tg64 |         25.35 ± 0.09 |
+[B-4gpu-fa0] | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+[B-4gpu-fa0] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   0 |           pp512 |        686.23 ± 2.04 |
+[B-4gpu-fa0] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   0 |            tg64 |         25.50 ± 0.04 |
+[C-3gpu-fa1] | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+[C-3gpu-fa1] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |           pp512 |       1133.05 ± 2.81 |
+[C-3gpu-fa1] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |            tg64 |         25.48 ± 0.23 |
+[D-4gpu-smrow] | model                          |       size |     params | backend    | ngl |     sm |  fa |            test |                  t/s |
+[E-4gpu-nographs] | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+[E-4gpu-nographs] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |           pp512 |       1118.05 ± 3.19 |
+[E-4gpu-nographs] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |   1 |            tg64 |         25.67 ± 0.04 |
+MATRIX DONE

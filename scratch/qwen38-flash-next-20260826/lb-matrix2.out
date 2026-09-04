@@ -1,0 +1,8 @@
+[F-ple-on-gpu0] | model                          |       size |     params | backend    | ngl |  fa | ts           | ot                    |            test |                  t/s |
+[G-t4] | model                          |       size |     params | backend    | ngl | threads |  fa |            test |                  t/s |
+[G-t4] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |       4 |   1 |           pp512 |       1115.80 ± 3.81 |
+[G-t4] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |       4 |   1 |            tg64 |         25.64 ± 0.06 |
+[H-t24] | model                          |       size |     params | backend    | ngl | threads |  fa |            test |                  t/s |
+[H-t24] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |      24 |   1 |           pp512 |       1118.88 ± 6.70 |
+[H-t24] | qwen4exp A3B Q4_K - Medium     | 103.68 GiB |   176.94 B | ROCm       | 999 |      24 |   1 |            tg64 |         25.53 ± 0.12 |
+MATRIX2 DONE
