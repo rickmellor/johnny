@@ -24,7 +24,7 @@ import urllib.request
 log = logging.getLogger(__name__)
 
 # Arch substrings that use the GDN / linear-attention decode path.
-GDN_ARCH_MARKERS = ("Qwen3_5", "Qwen3Next")
+GDN_ARCH_MARKERS = ("Qwen3_5", "Qwen3Next", "Qwen4Exp")  # Qwen4Exp = Qwen3.8-Flash-Next (GDN + QSA)
 
 # One paragraph of neutral filler; ~6.4 chars/token on the Qwen tokenizer.
 _PARA = (

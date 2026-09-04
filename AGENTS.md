@@ -32,10 +32,15 @@ job. Keep that split when adding features.
 
 - 4× AMD R9700 (gfx1201, 32 GB each), ROCm.
 - vLLM-ROCm default is **v0.27.1** (bumped 2026-08-23 after a per-seat validation; see
-  the NOVA MegaPlan `20260823-vllm-rocm-0-27-1-fleet-validation…`). Images ≥0.21 still
-  need the gfx1201 RCCL workaround env (`multi_gpu_env`: NCCL_P2P_DISABLE=1 +
-  RCCL_NET=Socket + NCCL_PROTO=Simple — RCCL PR #2187 is the upstream fix to watch);
-  measured cost on TP2 is ~nil for dense models. **Gemma-4 is pinned per-placement to
+  the NOVA MegaPlan `20260823-vllm-rocm-0-27-1-fleet-validation…`). **GPU P2P is ON
+  since 2026-09-03** — the "gfx1201 RCCL bug" (`hipIpcGetMemHandle: invalid argument` on
+  every image ≥0.21) was `HSA_ENABLE_IPC_MODE_LEGACY=1` baked into those images' env,
+  not RCCL; `multi_gpu_env` now sets `HSA_ENABLE_IPC_MODE_LEGACY=0` + NCCL_PROTO=Simple
+  for TP≥2 (RCCL logs `via P2P/IPC`; 19.7 vs 11.6 GB/s all-reduce busbw). BIOS ACS was
+  disabled the same day (full KFD p2p_links mesh, 25 GB/s D2D). The old
+  NCCL_P2P_DISABLE=1 + RCCL_NET=Socket pair is gone from code and registry
+  (`registry.yaml.bak-20260903-224027-pre-p2p`). NCCL_PROTO=Simple stays until an image
+  carries RCCL PR #2187 (LL-protocol deadlock, a separate bug). **Gemma-4 is pinned per-placement to
   v0.20.2**: 0.27.0/0.27.1 can't load it (transformers 5.15 per-layer `head_dim`,
   vllm#52768) and the nightly that can is 13–15 % slower here — re-test at 0.28.
   Smoke-test TP=2 + `johnny bench perf` before any further image bump.
@@ -45,7 +50,7 @@ job. Keep that split when adding features.
   the display GPU; a long Triton kernel there (int4-KV prefill) tripped the gfx-ring
   watchdog 232× (`ring gfx_0.0.0 timeout → reset → "device wedged, but recovered"`) and
   afterwards every multi-GPU seat decoded at ~½ speed until reboot. Single-GPU, PCIe, VRAM
-  and CPU all measured normal — the cross-GPU (host-bounce RCCL) path was what degraded.
+  and CPU all measured normal — the cross-GPU RCCL path (host-bounce at the time) was what degraded.
   If you ever see amdgpu ring resets in `journalctl -k`, treat that GPU as suspect.
 - **Qwen3.5-family (GDN) warm-up — deep-prefill trigger:** a freshly launched Qwen3.6/3.8
   seat decodes at ~½ speed **until it serves its first deep prefill**; one ~32K-token

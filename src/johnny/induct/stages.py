@@ -144,35 +144,41 @@ def hardware_fit(audit_info: dict, hardware, free_count: int) -> tuple[list, lis
 def multi_gpu_env(gpu_count: int, image: str | None) -> dict:
     """Correctness env for multi-GPU vLLM launches on this box (single-GPU gets none).
 
-    RCCL multi-GPU is broken on gfx1201 in vLLM-ROCm images newer than v0.20.x —
-    `ncclCommInitRank` dies with HIP 'invalid argument' before the model loads,
-    and with init patched the first collective can still deadlock (0.21 / 0.23 /
-    0.25.1 all reproduce; vllm#40980 / ROCm rocm-systems#5480, no upstream fix as
-    of 2026-08-17). NCCL_P2P_DISABLE=1 + RCCL_NET=Socket is the field-proven pair
-    (host-bounce transport, no GPU P2P DMA), gated off the older images, which
-    init P2P fine and keep its bandwidth. An unparseable/custom tag (e.g. the
-    `:qwen38` release tag) gets the workaround: a broken launch costs more than
-    slower all-reduce.
+    RCCL multi-GPU on gfx1201 used to need a P2P-off workaround on every vLLM-ROCm
+    image newer than v0.20.x: `ncclCommInitRank` died with `hipIpcGetMemHandle:
+    invalid argument`, and the field-proven fix was NCCL_P2P_DISABLE=1 + RCCL_NET=Socket
+    (host-bounce transport, no GPU P2P DMA; vllm#40980 / rocm-systems#5480).
+
+    Root cause found 2026-09-03: it was never RCCL. Upstream vLLM-ROCm images from
+    ~0.21 on bake `HSA_ENABLE_IPC_MODE_LEGACY=1` into the image env, forcing the
+    pre-dma-buf KFD IPC path, which gfx12 rejects; the 0.20.x images don't set it,
+    which is why they "initialised P2P fine". Bisected by swapping the 7.2.1 HIP/HSA/RCCL
+    libs into the 0.28.0 image (still failed — same RCCL commit in both) and then
+    diffing image env. With `HSA_ENABLE_IPC_MODE_LEGACY=0` the 0.28.0 image and the
+    Sep-2 nightly init `via P2P/IPC` and all-reduce at 19.7 GB/s busbw (2-rank
+    same/cross root complex and 4-rank), vs 11.6 GB/s on the SHM fallback. BIOS ACS
+    was disabled the same day (KFD topology now shows a full p2p_links mesh, 25 GB/s
+    D2D copies) — both are in place; the IPC flag is the one that unblocks RCCL.
+
+    So: TP>=2 gets `HSA_ENABLE_IPC_MODE_LEGACY=0` on every image (harmless where the
+    image never set it) and NO P2P-disable env. NCCL_PROTO=Simple stays: the
+    first-collective LL-protocol deadlock is a separate gfx12 RCCL bug (ROCm/rccl
+    PR #2187) — drop it only once an image carries that fix.
 
     Placements won from a sweep must carry this same env (report.to_placement) —
-    a seat has to serve under the conditions it was tuned under.
-
-    2026-08-23 validation on v0.27.1 (TP2, this box): the workaround's measured cost is
-    ~nil for dense models (qwen-27b-coder 900/30.4 vs 924/30.3 tok/s on 0.20.2) and
-    RCCL_NET=Socket vs SHM made no difference on gemma-4-26B (MoE) either. Gemma-4 can't
-    load on 0.27.0/0.27.1 at all (transformers 5.15 per-layer head_dim, vllm#52768) —
-    it stays pinned per-placement to v0.20.2 until 0.28. Upstream fix for the RCCL
-    bugs: ROCm/rccl PR #2187 (gfx12 LL-protocol selection) — when an image carries it,
-    gate this env off again.
+    a seat has to serve under the conditions it was tuned under. Registry placements
+    recorded before 2026-09-03 still carry the old workaround verbatim; `johnny up`
+    takes placement env as-is, so they were rewritten in place (backup
+    registry.yaml.bak-20260903-*-pre-p2p).
     """
     if gpu_count <= 1:
         return {}
-    env = {"NCCL_PROTO": "Simple", "HIP_FORCE_DEV_KERNARG": "1", "SAFETENSORS_FAST_GPU": "1"}
-    m = re.search(r":v?(\d+)\.(\d+)", image or "")
-    if not m or (int(m.group(1)), int(m.group(2))) >= (0, 21):
-        env["NCCL_P2P_DISABLE"] = "1"
-        env["RCCL_NET"] = "Socket"
-    return env
+    return {
+        "NCCL_PROTO": "Simple",
+        "HIP_FORCE_DEV_KERNARG": "1",
+        "SAFETENSORS_FAST_GPU": "1",
+        "HSA_ENABLE_IPC_MODE_LEGACY": "0",
+    }
 
 
 def _tuning_spec(model_id: str, local_path: str, point: dict, gpus: list[int], cfg: dict, hardware,
