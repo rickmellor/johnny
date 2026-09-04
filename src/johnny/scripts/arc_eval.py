@@ -42,8 +42,12 @@ SYSTEM = (
 
 def fmt_question(doc):
     choices = doc['choices']
-    labels = choices['label']
     texts  = choices['text']
+    # Some ARC items label their choices 1-4 rather than A-D. The target is mapped
+    # 1-4 -> A-D (eval_one), and the system prompt asks for a letter, so show letters:
+    # with the raw labels the model rightly answers "The best answer is 2" and the
+    # letter-only extractor scores it as no-extraction.
+    labels = [chr(ord('A') + i) for i in range(len(texts))]
     opts = "\n".join(f"{l}. {t}" for l, t in zip(labels, texts))
     return f"Question: {doc['question']}\n{opts}"
 

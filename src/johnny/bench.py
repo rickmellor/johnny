@@ -242,13 +242,15 @@ def _run_arc(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
         cmd += ["--limit", str(limit)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
-    else:
-        # Thinking needs generation budget AND per-request time, not just the longer
-        # wall timeout: at the 512-token default a reasoning model clips mid-think and
-        # the answer never emits (Qwen3.8: 18% ARC, below the 25% MCQ floor), and at
-        # arc_eval's old 60s client timeout most contended thinking requests died as
-        # "Request timed out" (31% — timeouts, not wrong answers). 2026-08-17/18.
-        cmd += ["--max-tokens", "2048", "--timeout", "600"]
+    # Generation budget AND per-request time, in both modes. Thinking: at the 512-token
+    # default a reasoning model clips mid-think and the answer never emits (Qwen3.8: 18%
+    # ARC, below the 25% MCQ floor), and at arc_eval's old 60s client timeout most
+    # contended thinking requests died as "Request timed out" (31% — timeouts, not wrong
+    # answers). 2026-08-17/18. Thinking OFF is not exempt: the prompt asks for reasoning
+    # first, and a verbose CoT model clips the same way — Flash-Next 2026-09-04 lost 39 of
+    # 400 to exactly-512-token truncation (10% "no extraction", all mid-sentence).
+    cmd += ["--max-tokens", os.environ.get("JOHNNY_BENCH_ARC_MAX_TOKENS", "2048"),
+            "--timeout", "600"]
     rc, out = _stream_run(cmd, _ARC_TIMEOUT, progress)
     scores = parse_arc_output(out)
     if not scores:

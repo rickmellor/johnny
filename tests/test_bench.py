@@ -100,3 +100,16 @@ def test_perf_sweep_env_sized_to_max_num_seqs():
     assert B._perf_sweep_env({"max_num_seqs": 32})["BENCH_CONCURRENCY"] == "16 32"
     assert B._perf_sweep_env({"max_num_seqs": 48})["BENCH_CONCURRENCY"] == "16 32 48"
     assert B._perf_sweep_env({"max_num_seqs": 48})["WARMUP_CONCURRENCY"] == "24"
+
+
+def test_arc_fmt_question_relabels_numeric_choices():
+    import importlib.util
+    from johnny.bundled import resolve_script
+    spec = importlib.util.spec_from_file_location("arc_eval", resolve_script("arc_eval", {}))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    doc = {"question": "Q?", "choices": {"label": ["1", "2", "3", "4"],
+                                         "text": ["w", "x", "y", "z"]}}
+    assert mod.fmt_question(doc) == "Question: Q?\nA. w\nB. x\nC. y\nD. z"
+    doc["choices"]["label"] = ["A", "B", "C", "D"]
+    assert mod.fmt_question(doc).endswith("A. w\nB. x\nC. y\nD. z")
