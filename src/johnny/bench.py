@@ -815,6 +815,36 @@ def _run_ctxsafe(model_id: str, placement: dict, cfg: dict, limit: int | None, t
     }
 
 
+# bench.sh's default ramp (16..1024, twice) assumes a wide-batch seat. Against a seat
+# capped at a handful of sequences (personal seats run max_num_seqs=4) every level
+# above the cap just queues — the 2026-09-04 Flash-Next run put 800+ requests in
+# vLLM's wait queue, hit the 20-min perf wall, and the abandoned queue then stalled
+# the *next* suite's first request for ten minutes. Size the ramp to the seat.
+_BENCH_DEFAULT_LEVELS = (16, 32, 64, 128, 256, 512, 1024)
+
+
+def _perf_sweep_env(point: dict) -> dict:
+    """Env overrides for bench.sh sized to the placement's max_num_seqs (empty = defaults)."""
+    seqs = point.get("max_num_seqs")
+    try:
+        seqs = int(seqs) if seqs else None
+    except (TypeError, ValueError):
+        seqs = None
+    if not seqs or seqs >= _BENCH_DEFAULT_LEVELS[-1]:
+        return {}
+    levels = [n for n in _BENCH_DEFAULT_LEVELS if n <= seqs]
+    if not levels:  # seqs < 16: short doubling ladder that ends at the cap
+        n = 1
+        while n < seqs:
+            levels.append(n)
+            n *= 2
+        levels.append(seqs)
+    elif levels[-1] != seqs:
+        levels.append(seqs)
+    return {"BENCH_CONCURRENCY": " ".join(str(n) for n in levels),
+            "WARMUP_CONCURRENCY": str(min(24, seqs))}
+
+
 def _run_perf(port: int, container: str | None, model_id: str, point: dict, cfg: dict, progress,
              backend: str = "vllm") -> dict:
     """Induction's throughput bench against an already-running seat (no teardown).
@@ -855,7 +885,12 @@ def _run_perf(port: int, container: str | None, model_id: str, point: dict, cfg:
         # Default 20 min fits normal seats; CPU-MoE giants (single-digit tok/s)
         # need longer — override per-run, e.g. JOHNNY_BENCH_PERF_TIMEOUT=7200.
         perf_timeout = float(os.environ.get("JOHNNY_BENCH_PERF_TIMEOUT", 1200))
-        rc, out, errout = _run(["bash", script, str(port), model_id], timeout=perf_timeout)
+        sweep_env = _perf_sweep_env(point) if script_key == "bench" else {}
+        if sweep_env:
+            progress(f"perf: ramp sized to max_num_seqs={point.get('max_num_seqs')} "
+                     f"(BENCH_CONCURRENCY={sweep_env['BENCH_CONCURRENCY']})")
+        rc, out, errout = _run(["bash", script, str(port), model_id], timeout=perf_timeout,
+                               env={**os.environ, **sweep_env} if sweep_env else None)
         parsed = stages._parse_bench(out)
         if parsed.get("peak_tok_s") is None:
             parsed["error"] = (errout or out)[-300:]

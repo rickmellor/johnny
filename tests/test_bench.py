@@ -86,3 +86,17 @@ def test_write_report(tmp_path):
     text = path.read_text()
     assert "peak 1826.6 tok/s" in text and "KV 1.19M tok" in text
     assert "failed: missing eval deps" in text
+
+
+def test_perf_sweep_env_sized_to_max_num_seqs():
+    # wide seats keep bench.sh's defaults
+    assert B._perf_sweep_env({"max_num_seqs": 1024}) == {}
+    assert B._perf_sweep_env({"max_num_seqs": None}) == {}
+    assert B._perf_sweep_env({}) == {}
+    # a 4-seq personal seat: short ladder ending at the cap, warmup capped too
+    assert B._perf_sweep_env({"max_num_seqs": 4}) == {"BENCH_CONCURRENCY": "1 2 4",
+                                                     "WARMUP_CONCURRENCY": "4"}
+    # mid-size: default levels up to the cap, plus the cap itself when it is not a level
+    assert B._perf_sweep_env({"max_num_seqs": 32})["BENCH_CONCURRENCY"] == "16 32"
+    assert B._perf_sweep_env({"max_num_seqs": 48})["BENCH_CONCURRENCY"] == "16 32 48"
+    assert B._perf_sweep_env({"max_num_seqs": 48})["WARMUP_CONCURRENCY"] == "24"
