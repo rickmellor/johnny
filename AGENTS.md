@@ -268,3 +268,28 @@ it lands, before trusting any new induction/tune output:
   of IQ3_XXS) — worth a registry scan for "what would this model's quality look
   like with more headroom" once the hardware lands, separate from the benchmark
   queue above.
+
+## Bench harness notes — 2026-09-04 (first full suite on the Flash-Next EP seat)
+
+- **`perf` ramp is sized to the placement's `max_num_seqs`** (`bench._perf_sweep_env`).
+  bench.sh's default 16..1024 ramp against a `max_num_seqs=4` seat queued 800+ requests,
+  hit the 20-min perf wall, and the abandoned queue stalled the next suite's first request
+  for ten minutes. Below 16 seqs the ramp is a short doubling ladder ending at the cap
+  (`1 2 4`); wide seats keep the defaults.
+- **`arc` gets a 2048-token budget with thinking off too** (`JOHNNY_BENCH_ARC_MAX_TOKENS`
+  overrides). The prompt asks for reasoning first; a verbose CoT model clips at 512 the
+  same way a thinking model does (Flash-Next: 39/400 cut mid-sentence = 10 % "no
+  extraction"). Earlier thinking-off ARC scores were taken at 512 — verbose models will
+  score higher on re-run, so compare like with like.
+- **`arc_eval.fmt_question` always shows choices as A–D.** Some ARC items label choices
+  1–4; the target was already mapped 1–4 → A–D but the prompt showed digits, so a correct
+  "The best answer is 2" scored as no-extraction.
+- **A seat can be dead while `/health` returns 200.** A vLLM worker OOM leaves the engine
+  core waiting on shared memory forever (`No available shared memory broadcast block found
+  in 60 seconds`, repeating) and the API server still answers health. Symptom in the engine
+  log: `Running: N reqs` with 0 tok/s generation. `johnny down <seat>` + profile restart
+  recovers it; `johnny profile up` alone won't (it sees a healthy seat). Root cause of that
+  particular OOM (mixed-length concurrent prefills in the PLE short-conv) is fixed in the
+  fnrepo `ple_layer.patch`, see rickmellor/qwen3.8-flash-next-rdna4 README §5.
+- **`ctxsafe` needs its own 4-GPU disposable seat** — with the 4-GPU flashnext seat up only
+  two cards are free, so run it after `johnny down` of the live seat (then profile back up).
