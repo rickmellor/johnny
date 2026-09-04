@@ -221,6 +221,13 @@ class VllmDriver(Driver):
             args += ["-v", f"{spec['nas_dir']}:/nas:ro"]
         if spec.get("vllm_cache"):
             args += ["-v", f"{spec['vllm_cache']}:/root/.cache/vllm"]
+        # Placement-level bind mounts (extra.mounts: ["host:container[:ro]", ...]) —
+        # the way to run an image with patched vLLM source files without rebuilding
+        # it (Qwen3.8-Flash-Next needs four: ~/scratch/fnrepo/*.py over the nightly).
+        # Host side is ~-expanded; everything else is passed to docker verbatim.
+        for m in extra.get("mounts") or []:
+            host, _, rest = str(m).partition(":")
+            args += ["-v", f"{Path(host).expanduser()}:{rest}"]
         args += ["-p", f"{spec.get('bind_address', '127.0.0.1')}:{spec['port']}:8000"]
         if gpus:
             args += ["-e", f"{spec.get('visible_env', 'CUDA_VISIBLE_DEVICES')}={','.join(str(g) for g in gpus)}"]
