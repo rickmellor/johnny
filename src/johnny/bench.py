@@ -744,6 +744,11 @@ def _run_ctxsafe(model_id: str, placement: dict, cfg: dict, limit: int | None, t
         spec = stages._cpu_tuning_spec(model_id, path, point, cfg) if is_cpu \
             else stages._tuning_spec(model_id, path, point, gpus, cfg, hw)
         spec["extra"] = {**spec.get("extra", {}), **(placement.get("extra") or {})}
+        # The placement's own env must ride along too (e.g. Flash-Next's
+        # VLLM_QWEN4EXP_PLE_CPU_OFFLOAD=1 — without it the 51B PLE table is loaded
+        # on-GPU and the temp seat OOMs at load). _tuning_spec only sets the
+        # multi-GPU env; placement env wins on conflicts, same as engine.launch.
+        spec["env"] = {**(spec.get("env") or {}), **(placement.get("env") or {})}
         spec["container_name"] = container
         spec["port"] = port
     else:
@@ -1067,6 +1072,11 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
                 else stages._tuning_spec(model_id, path, point, gpus, cfg, hw)
             # Bench what production runs: carry the placement's parsers/template into the seat.
             spec["extra"] = {**spec.get("extra", {}), **(placement.get("extra") or {})}
+            # The placement's own env must ride along too (e.g. Flash-Next's
+            # VLLM_QWEN4EXP_PLE_CPU_OFFLOAD=1 — without it the 51B PLE table is loaded
+            # on-GPU and the temp seat OOMs at load). _tuning_spec only sets the
+            # multi-GPU env; placement env wins on conflicts, same as engine.launch.
+            spec["env"] = {**(spec.get("env") or {}), **(placement.get("env") or {})}
             port, container = stages.TUNING_PORT, stages.TUNING_CONTAINER
         _p(f"launching temp seat from {pid} on " + ("CPU" if is_cpu else f"GPU {gpus}") + "…")
         drv.launch(spec)
