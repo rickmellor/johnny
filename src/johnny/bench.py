@@ -53,8 +53,27 @@ placement's knobs (same machinery as induction). Suites:
   incident. No extra deps (uses ``openai`` like the other probes; ``tiktoken`` if
   present for precise depth construction, else a char-count estimate).
 
+- ``hardcode``: 20 medium/hard coding tasks with hidden tests validated against
+  reference solutions (bundled hardcode_eval.py). The discriminating code suite:
+  HumanEval and ARC are saturated for 25B+ models (95–97 % across very different
+  models, 2026-09), this set separated them 13 → 18 of 20. ±2 tasks is noise. Stdlib only.
+- ``load``: realistic serving load (bundled load_bench.py) — closed-loop concurrency
+  sweep with real input/output lengths (default 2800 in / 250 out), unique prompts so
+  the prefix cache cannot help, reporting req/s, prefill/output/total tok/s and
+  TTFT/TPOT/E2E percentiles. ``perf``'s tiny prompts measure decode only and miss
+  prefill-bound workloads entirely. Stdlib only.
+- ``depthprobe``: prefill + decode tok/s at chosen prompt depths (bundled
+  depth_probe.py) against any endpoint — decode at depth decides whether a seat's
+  context is usable (seen: 49 → 8 tok/s by 30K on one seat, flat on another). Stdlib only.
+
 Scores land in the placement's ``quality`` block in the registry plus a
 BENCH_REPORT.md under runs/.
+
+**Endpoint mode** (``run_endpoint`` / ``johnny bench --endpoint URL``): run the
+client-side suites against any OpenAI-compatible server that johnny does not manage
+(a llama.cpp SYCL seat on an Intel card, a fork build, a remote box). Nothing is
+launched, pinned or written to the registry — results go to a run dir + report only.
+``perf`` and ``ctxsafe`` need a johnny-managed container and are refused there.
 """
 
 from __future__ import annotations
@@ -76,7 +95,11 @@ from .induct import stages
 from .registry import store
 from .telemetry import collect
 
-SUITES = ("perf", "arc", "icl", "needle", "depth", "humaneval", "ctxsafe", "automationbench", "planbench")
+SUITES = ("perf", "arc", "icl", "needle", "depth", "humaneval", "ctxsafe", "automationbench", "planbench",
+          "hardcode", "load", "depthprobe")
+# Suites that are pure HTTP clients — the only ones endpoint mode can run.
+ENDPOINT_SUITES = ("arc", "icl", "needle", "depth", "humaneval", "automationbench", "planbench",
+                   "hardcode", "load", "depthprobe")
 PLANNED: dict[str, str] = {}
 _ARC_TIMEOUT = 4 * 3600  # full ARC-Challenge with CoT can run for a while
 _ICL_TIMEOUT = 20 * 60  # 16 short single-turn cases — should be minutes, not hours
@@ -85,6 +108,9 @@ _DEPTH_TIMEOUT = 20 * 60  # a handful of depths, a few runs each — minutes, no
 _DEPTH_SWEEP = (0, 4096, 8192)  # modest on purpose — a quick suite, not an hours-long one
 _HUMANEVAL_TIMEOUT = 90 * 60  # 164 problems up to 2048 gen toks each — generous for a slow (e.g. llamacpp) seat
 _HUMANEVAL_SCORE_TIMEOUT = 30 * 60  # re-scorer: up to 164 subprocess test runs, 10s cap each
+_HARDCODE_TIMEOUT = 3 * 3600  # 20 tasks; a thinking model can spend minutes per task
+_LOAD_TIMEOUT = 3 * 3600  # 10x-concurrency requests per level at real lengths
+_DEPTHPROBE_TIMEOUT = 2 * 3600  # a 100K prefill on a slow card is minutes on its own
 _CTXSAFE_LAUNCH_TIMEOUT = 900  # a big long-context seat can be slow to load (large KV reservation)
 
 # Dedicated bench-tuning container/port for llamacpp temp seats — distinct from both
@@ -93,6 +119,16 @@ _CTXSAFE_LAUNCH_TIMEOUT = 900  # a big long-context seat can be slow to load (la
 # ever collide if run back to back.
 _LLAMACPP_TUNING_CONTAINER = "llamacpp-johnny-bench-tuning"
 _LLAMACPP_TUNING_PORT = 9002
+
+
+
+def _v1(target) -> str:
+    """OpenAI base URL (…/v1) for a suite target: an int port on this host (placement
+    mode) or an explicit endpoint URL (endpoint mode; ``/v1`` appended when missing)."""
+    if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
+        return f"http://127.0.0.1:{int(target)}/v1"
+    url = str(target).rstrip("/")
+    return url if url.endswith("/v1") else url + "/v1"
 
 
 def resolve_target(reg: dict, target: str) -> list[tuple[str, dict]]:
@@ -236,7 +272,7 @@ def _run_arc(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
     if not script:
         return {"ok": False, "error": "arc_eval.py unavailable (not bundled, no scripts.arc_eval override)"}
     out_path = run_dir / "arc_samples.jsonl"
-    cmd = [sys.executable, script, "--base-url", f"http://127.0.0.1:{port}/v1",
+    cmd = [sys.executable, script, "--base-url", _v1(port),
            "--model", model_id, "--concurrency", str(concurrency), "--out", str(out_path)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -282,7 +318,7 @@ def _run_planbench(port: int, model_id: str, run_dir: Path, cfg: dict, limit: in
         return {"ok": False, "error": "planbench_eval.py unavailable (not bundled, no scripts.planbench_eval override)"}
     out_path = run_dir / "planbench_results.json"
     out_path.unlink(missing_ok=True)      # never score a prior run's file (see _run_icl)
-    cmd = [sys.executable, script, "--base-url", f"http://127.0.0.1:{port}/v1",
+    cmd = [sys.executable, script, "--base-url", _v1(port),
            "--model", model_id, "--concurrency", str(concurrency), "--out", str(out_path),
            "--limit", str(limit or 100)]
     if not thinking:
@@ -314,7 +350,7 @@ def _run_icl(port: int, model_id: str, run_dir: Path, cfg: dict, limit: int | No
     if not script:
         return {"ok": False, "error": "icl_eval.py unavailable (not bundled, no scripts.icl_eval override)"}
     out_path = run_dir / "icl_results.json"
-    cmd = [sys.executable, script, "--base-url", f"http://127.0.0.1:{port}/v1",
+    cmd = [sys.executable, script, "--base-url", _v1(port),
            "--model", model_id, "--out", str(out_path)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -380,7 +416,7 @@ def _run_needle(port: int, model_id: str, run_dir: Path, cfg: dict, thinking: bo
         return {"ok": False, "error": "code_needle.py unavailable (not bundled, no scripts.code_needle override)"}
     out_path = run_dir / "needle_results.json"
     # code_needle.py has no --limit — it's a fixed 16-target probe, not a subsettable suite.
-    cmd = [sys.executable, script, "--corpus", str(corpus_path), "--base-url", f"http://127.0.0.1:{port}/v1",
+    cmd = [sys.executable, script, "--corpus", str(corpus_path), "--base-url", _v1(port),
            "--model", model_id, "--out", str(out_path)]
     if not thinking:  # PLAN §3.6: thinking-off plumbed, else reasoning models score 0
         cmd += ["--disable-thinking"]
@@ -437,7 +473,7 @@ def _run_depth(port: int, model_id: str, run_dir: Path, cfg: dict, progress) -> 
         return {"ok": False, "error": f"missing eval deps: {', '.join(missing)} — "
                 "`pipx inject johnny-fleet llama-benchy` (or pip install 'johnny-fleet[bench]')"}
     out_path = run_dir / "depth_results.json"
-    cmd = [sys.executable, "-m", "llama_benchy", "--base-url", f"http://127.0.0.1:{port}/v1",
+    cmd = [sys.executable, "-m", "llama_benchy", "--base-url", _v1(port),
            "--model", model_id, "--depth", *[str(d) for d in _DEPTH_SWEEP],
            "--format", "json", "--save-result", str(out_path)]
     rc, out = _stream_run(cmd, _DEPTH_TIMEOUT, progress)
@@ -469,6 +505,12 @@ def parse_humaneval_score(out: str) -> dict | None:
     fp = re.search(r"Failed entry points:\s*(.+)", out)
     if fp:
         res["failed_entry_points_sample"] = fp.group(1).strip()
+    # Scorer restores the prompt's own `from typing import …` lines by default; how many
+    # otherwise-correct answers that rescued says whether a model habitually omits them
+    # (one went 84.15 % → 91.46 %, 2026-09-21).
+    rs = re.search(r"rescued by restored imports:\s*(\d+)", out)
+    if rs:
+        res["imports_rescued"] = int(rs.group(1))
     return res
 
 
@@ -516,7 +558,7 @@ def _run_humaneval(port: int, model_id: str, run_dir: Path, cfg: dict, limit: in
         gen_kwargs.append("chat_template_kwargs={'enable_thinking': False}")
     cmd = [sys.executable, "-m", "lm_eval", "run",
            "--model", "local-chat-completions",
-           "--model_args", f"base_url=http://127.0.0.1:{port}/v1/chat/completions,model={model_id},"
+           "--model_args", f"base_url={_v1(port)}/chat/completions,model={model_id},"
                             f"num_concurrent={concurrency},max_retries=3,tokenized_requests=False,"
                             # single-digit-tok/s CPU-MoE seats + thinking need far more than
                             # lm-eval's 300s default per request; env-tunable like perf's timeout.
@@ -652,7 +694,7 @@ def _run_automationbench(port: int, model_id: str, run_dir: Path, cfg: dict, dom
     # left over from an earlier smoke test — same file, different --num-examples.)
     export_path.unlink(missing_ok=True)
     cmd = ["uv", "run", "auto-bench",
-           "--model", model_id, "--base-url", f"http://127.0.0.1:{port}/v1",
+           "--model", model_id, "--base-url", _v1(port),
            "--api", "chat_completions", "--api-key-var", "OPENAI_API_KEY",
            "--domains", domains, "--max-concurrent", str(concurrency),
            "--export-json", str(export_path)]
@@ -674,6 +716,87 @@ def _run_automationbench(port: int, model_id: str, run_dir: Path, cfg: dict, dom
         return {"ok": False, "error": f"export JSON at {export_path} was unparseable"}
     scores.update({"ok": True, "domains_arg": domains, "num_examples": num_examples})
     return scores
+
+
+def _result_line(out: str, tag: str) -> dict | None:
+    """Parse a bundled script's final ``TAG {json}`` stdout line (the stable contract
+    between bench.py and hardcode_eval / load_bench / depth_probe)."""
+    for line in reversed(out.splitlines()):
+        if line.startswith(tag + " "):
+            try:
+                return json.loads(line[len(tag) + 1:])
+            except ValueError:
+                return None
+    return None
+
+
+def _run_hardcode(port, model_id: str, run_dir: Path, cfg: dict, limit: int | None,
+                  concurrency: int, thinking: bool, progress) -> dict:
+    from .bundled import resolve_script
+
+    script = resolve_script("hardcode_eval", cfg)
+    if not script:
+        return {"ok": False, "error": "hardcode_eval.py unavailable (not bundled, no scripts.hardcode_eval override)"}
+    out_path = run_dir / "hardcode_results.json"
+    out_path.unlink(missing_ok=True)  # stale-export hazard, same as icl/automationbench
+    cmd = [sys.executable, script, "--base-url", _v1(port), "--model", model_id,
+           "--concurrency", str(min(concurrency, 8)), "--out", str(out_path)]
+    if limit:
+        cmd += ["--limit", str(limit)]
+    if thinking:
+        cmd += ["--thinking"]
+    rc, out = _stream_run(cmd, _HARDCODE_TIMEOUT, progress)
+    res = _result_line(out, "HARDCODE_RESULT")
+    if rc != 0 or res is None:
+        return {"ok": False, "error": f"hardcode_eval rc={rc}, no result line — {out[-300:]}"}
+    return {"ok": True, **{k: res.get(k) for k in
+                           ("passed", "total", "pass_rate_pct", "failed", "api_errors",
+                            "mean_completion_tokens", "thinking")},
+            "limit": limit, "samples": str(out_path)}
+
+
+def _run_load(port, model_id: str, run_dir: Path, cfg: dict, load_opts: dict | None, progress) -> dict:
+    from .bundled import resolve_script
+
+    script = resolve_script("load_bench", cfg)
+    if not script:
+        return {"ok": False, "error": "load_bench.py unavailable (not bundled, no scripts.load_bench override)"}
+    o = load_opts or {}
+    out_path = run_dir / "load_results.json"
+    out_path.unlink(missing_ok=True)
+    cmd = [sys.executable, script, "--base-url", _v1(port), "--model", model_id,
+           "--input-tokens", str(o.get("input_tokens") or 2800),
+           "--output-tokens", str(o.get("output_tokens") or 250),
+           "--concurrency", str(o.get("concurrency") or "8,16,32"), "--out", str(out_path)]
+    if o.get("requests_per_level"):
+        cmd += ["--requests-per-level", str(o["requests_per_level"])]
+    rc, out = _stream_run(cmd, _LOAD_TIMEOUT, progress)
+    res = _result_line(out, "LOAD_RESULT")
+    if res is None or not res.get("best"):  # load_bench emits best=null when no request completed
+        return {"ok": False, "error": f"load_bench rc={rc}, no request completed — {out[-300:]}"}
+    return {"ok": True, **res, "samples": str(out_path)}
+
+
+def _run_depthprobe(port, model_id: str, run_dir: Path, cfg: dict, depths: str | None,
+                    thinking: bool, progress) -> dict:
+    from .bundled import resolve_script
+
+    script = resolve_script("depth_probe", cfg)
+    if not script:
+        return {"ok": False, "error": "depth_probe.py unavailable (not bundled, no scripts.depth_probe override)"}
+    out_path = run_dir / "depthprobe_results.json"
+    out_path.unlink(missing_ok=True)
+    cmd = [sys.executable, script, "--base-url", _v1(port), "--model", model_id, "--out", str(out_path)]
+    if depths:
+        cmd += ["--depths", depths]
+    if thinking:
+        cmd += ["--thinking"]
+    rc, out = _stream_run(cmd, _DEPTHPROBE_TIMEOUT, progress)
+    res = _result_line(out, "DEPTHPROBE_RESULT")
+    good = [p for p in (res or {}).get("points") or [] if not p.get("error")]
+    if not good:
+        return {"ok": False, "error": f"depth_probe rc={rc}, no successful depth — {out[-300:]}"}
+    return {"ok": True, "points": res["points"], "samples": str(out_path)}
 
 
 def _run_ctxsafe(model_id: str, placement: dict, cfg: dict, limit: int | None, thinking: bool,
@@ -984,7 +1107,35 @@ def write_report(run_dir: Path, model_id: str, placement_id: str, results: dict)
                              f"ttfr {p['ttfr_ms']}ms")
         elif suite == "humaneval":
             lines.append(f"HumanEval pass@1 {r.get('pass_at_1_pct')}% ({r.get('passed')}/{r.get('total')}"
-                         + (f", limit={r['limit']}" if r.get("limit") else "") + ")")
+                         + (f", limit={r['limit']}" if r.get("limit") else "") + ")"
+                         + (f" · {r['imports_rescued']} rescued by restoring the prompt's imports" if r.get("imports_rescued") else ""))
+        elif suite == "hardcode":
+            lines.append(f"Hard coding set {r.get('passed')}/{r.get('total')} ({r.get('pass_rate_pct')}%)"
+                         + (f" · failed: {', '.join(r.get('failed') or [])}" if r.get("failed") else "")
+                         + f" · api errors {r.get('api_errors', 0)} · mean answer {r.get('mean_completion_tokens')} tok"
+                         + (" · thinking ON" if r.get("thinking") else ""))
+            lines.append("  (n=20 — a difference of ±2 tasks is noise)")
+        elif suite == "load":
+            lines.append(f"Serving load, {r.get('input_tokens')} in / {r.get('output_tokens')} out, unique prompts "
+                         f"(~{r.get('tokens_per_word')} tok/word calibration):")
+            lines.append("")
+            lines.append("| conc | done | fail | req/s | prefill tok/s | output tok/s | total tok/s | TTFT p50/p99 ms | TPOT p50 ms | E2E p50/p99 s |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|")
+            for lv in (r.get("levels") or []):
+                lines.append(f"| {lv.get('concurrency')} | {lv.get('completed')} | {lv.get('failed')} | {lv.get('req_per_s')} | "
+                             f"{lv.get('prefill_tok_s')} | {lv.get('output_tok_s')} | {lv.get('total_tok_s')} | "
+                             f"{lv.get('ttft_ms_p50')}/{lv.get('ttft_ms_p99')} | {lv.get('tpot_ms_p50')} | "
+                             f"{lv.get('e2e_s_p50')}/{lv.get('e2e_s_p99')} |")
+            b = r.get("best") or {}
+            lines.append("")
+            lines.append(f"best: {b.get('req_per_s')} req/s ({b.get('total_tok_s')} total tok/s) at concurrency {b.get('concurrency')}")
+        elif suite == "depthprobe":
+            for pt in (r.get("points") or []):
+                if pt.get("error"):
+                    lines.append(f"- ~{pt.get('target_tokens')} tok: {pt['error']}")
+                else:
+                    lines.append(f"- {pt.get('prompt_tokens')} tok prompt: prefill {pt.get('prefill_tok_s')} tok/s "
+                                 f"(TTFT {pt.get('ttft_s')} s) · decode {pt.get('decode_tok_s')} tok/s")
         elif suite == "planbench":
             lines.append(f"PlanBench ({r.get('task')}) exact-plan {r.get('exact_pct')}% "
                          f"({r.get('exact')}/{r.get('total')}) · plan-prefix {r.get('plan_prefix_pct')}% "
@@ -1005,9 +1156,113 @@ def write_report(run_dir: Path, model_id: str, placement_id: str, results: dict)
     return path
 
 
+def _run_client_suite(s: str, target, model_id: str, run_dir: Path, cfg: dict, limit: int | None,
+                      concurrency: int, thinking: bool, load_opts: dict | None, depths: str | None,
+                      progress) -> dict:
+    """The three stdlib-only client suites — shared by placement mode and endpoint mode."""
+    if s == "hardcode":
+        return _run_hardcode(target, model_id, run_dir, cfg, limit, concurrency, thinking, progress)
+    if s == "load":
+        return _run_load(target, model_id, run_dir, cfg, load_opts, progress)
+    return _run_depthprobe(target, model_id, run_dir, cfg, depths, thinking, progress)
+
+
+def _client_suite_quality(results: dict, date: str) -> dict:
+    """Registry ``quality`` entries for hardcode / load / depthprobe (compact — the full
+    per-request detail stays in the run dir)."""
+    q: dict = {}
+    hc = results.get("hardcode")
+    if hc and hc.get("ok"):
+        q["hardcode"] = {k: hc.get(k) for k in ("passed", "total", "pass_rate_pct", "failed", "thinking", "limit")} \
+                        | {"date": date}
+    ld = results.get("load")
+    if ld and ld.get("ok"):
+        q["load"] = {"input_tokens": ld.get("input_tokens"), "output_tokens": ld.get("output_tokens"),
+                     "best": ld.get("best"),
+                     "levels": [{k: lv.get(k) for k in ("concurrency", "req_per_s", "total_tok_s", "ttft_ms_p50",
+                                                         "tpot_ms_p50", "e2e_s_p50", "e2e_s_p99", "failed")}
+                                for lv in (ld.get("levels") or [])],
+                     "date": date}
+    dp = results.get("depthprobe")
+    if dp and dp.get("ok"):
+        q["depthprobe"] = {"points": dp.get("points"), "date": date}
+    return q
+
+
+def endpoint_models(base_url: str, timeout: float = 5.0) -> list[str]:
+    """Model ids an OpenAI-compatible endpoint serves (``GET /v1/models``); [] if unreachable."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(_v1(base_url) + "/models", timeout=timeout) as r:
+            return [m.get("id") for m in (json.load(r).get("data") or []) if m.get("id")]
+    except (OSError, ValueError):
+        return []
+
+
+def run_endpoint(base_url: str, model: str | None, suites: list[str], cfg: dict | None = None,
+                 limit: int | None = None, concurrency: int = 8, thinking: bool = False,
+                 automationbench_domains: str = "all", progress=None,
+                 load_opts: dict | None = None, depths: str | None = None) -> dict:
+    """Bench a bare OpenAI-compatible endpoint johnny does not manage.
+
+    Nothing is launched, reaper-pinned or written to the registry: the target may be a
+    seat johnny cannot model at all (SYCL llama.cpp on an Intel card, a fork build, a
+    remote box). Only the client-side suites (ENDPOINT_SUITES) can run; ``perf`` wants a
+    local container for the KV readback and ``ctxsafe`` launches its own probe seat.
+    Results: a run dir + BENCH_REPORT.md under runs/bench-endpoint-<host>-<model>/."""
+    from urllib.parse import urlparse
+
+    _p = progress or (lambda *_: None)
+    cfg = cfg if cfg is not None else load_config()
+    bad = [s for s in suites if s not in ENDPOINT_SUITES]
+    if bad:
+        return {"error": f"suite(s) {', '.join(bad)} need a johnny-managed seat — endpoint mode runs: "
+                         + ", ".join(ENDPOINT_SUITES) + ("  (use `load` instead of `perf`)" if "perf" in bad else "")}
+    base = _v1(base_url)
+    served = endpoint_models(base)
+    if not served:
+        return {"error": f"{base}/models is unreachable or lists no models"}
+    if model is None:
+        model = served[0]
+        _p(f"endpoint serves {', '.join(served)} — using {model}")
+    elif model not in served:
+        _p(f"note: {model!r} is not in the endpoint's model list ({', '.join(served)}) — sending it anyway")
+    u = urlparse(base)
+    tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{u.hostname}-{u.port or 80}-{model}")
+    run_dir = C.get_paths().runs_dir / f"bench-endpoint-{tag}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    results: dict = {}
+    for s in suites:
+        if s == "arc":
+            results[s] = _run_arc(base, model, run_dir, cfg, limit, concurrency, thinking, _p)
+        elif s == "planbench":
+            results[s] = _run_planbench(base, model, run_dir, cfg, limit, concurrency, thinking, _p)
+        elif s == "icl":
+            results[s] = _run_icl(base, model, run_dir, cfg, limit, thinking, _p)
+        elif s == "needle":
+            results[s] = _run_needle(base, model, run_dir, cfg, thinking, _p)
+        elif s == "depth":
+            results[s] = _run_depth(base, model, run_dir, cfg, _p)
+        elif s == "humaneval":
+            results[s] = _run_humaneval(base, model, run_dir, cfg, limit, concurrency, thinking, _p)
+        elif s == "automationbench":
+            results[s] = _run_automationbench(base, model, run_dir, cfg, automationbench_domains,
+                                              limit, concurrency, thinking, _p)
+        else:
+            results[s] = _run_client_suite(s, base, model, run_dir, cfg, limit, concurrency, thinking,
+                                           load_opts, depths, _p)
+        ok = results[s].get("ok")
+        _p(f"{s}: " + ("done" if ok else f"FAILED — {results[s].get('error')}"))
+    report = write_report(run_dir, model, f"endpoint {base}", results)
+    return {"model_id": model, "placement_id": None, "endpoint": base, "results": results,
+            "registry_updated": False, "report": str(report), "seat": "external endpoint"}
+
+
 def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = None,
         limit: int | None = None, concurrency: int = 8, thinking: bool = False,
-        automationbench_domains: str = "all", progress=None) -> dict:
+        automationbench_domains: str = "all", progress=None,
+        load_opts: dict | None = None, depths: str | None = None) -> dict:
     """Bench one placement: reuse its running seat or launch a temp tuning seat, run the
     suites, write scores to the registry + a BENCH_REPORT. Returns per-suite results.
 
@@ -1134,6 +1389,11 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
                 else:
                     results["automationbench"] = _run_automationbench(port, model_id, run_dir, cfg, automationbench_domains,
                                                                        limit, concurrency, thinking, _p)
+            elif s in ("hardcode", "load", "depthprobe"):
+                results[s] = ({"ok": False, "error": f"embeddings model — {s} needs a generative seat"}
+                              if point.get("embeddings") else
+                              _run_client_suite(s, port, model_id, run_dir, cfg, limit, concurrency, thinking,
+                                                load_opts, depths, _p))
             ok = results[s].get("ok")
             _p(f"{s}: " + ("done" if ok else f"FAILED — {results[s].get('error')}"))
     finally:
@@ -1164,12 +1424,13 @@ def run(model_id: str, placement: dict, suites: list[str], cfg: dict | None = No
     humaneval = results.get("humaneval")
     if humaneval and humaneval.get("ok"):
         quality["humaneval"] = {k: humaneval.get(k) for k in
-                                ("pass_at_1_pct", "passed", "total", "limit")} | {"date": date}
+                                ("pass_at_1_pct", "passed", "total", "limit", "imports_rescued")} | {"date": date}
     automationbench = results.get("automationbench")
     if automationbench and automationbench.get("ok"):
         quality["automationbench"] = {k: automationbench.get(k) for k in
                                       ("pass_rate_pct", "avg_score_pct", "passed", "total", "aborted",
                                        "domains", "domains_run", "max_steps", "num_examples")} | {"date": date}
+    quality.update(_client_suite_quality(results, date))
     ctxsafe = results.get("ctxsafe")
     if ctxsafe is not None and ctxsafe.get("tested_depths") is not None:
         # Recorded even on a failed/crashed sweep (ok=False, verified_safe_tokens possibly

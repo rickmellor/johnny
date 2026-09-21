@@ -74,6 +74,23 @@ so a config carries its own evidence:
 | `arc` · `icl` · `humaneval` | reasoning, in-context learning, code generation |
 | `needle` · `depth` · `ctxsafe` | long-context retrieval and where a seat stops being safe |
 | `automationbench` · `planbench` | agentic tool loops, and planning in isolation |
+| `hardcode` | 20 medium/hard coding tasks with hidden tests — the code suite that still separates strong models (HumanEval and ARC saturate at 95–97 %) |
+| `load` | realistic serving load: closed-loop concurrency sweep at real input/output lengths, unique prompts, req/s + TTFT/TPOT/E2E percentiles |
+| `depthprobe` | prefill and decode tok/s at chosen prompt depths — whether a seat's context is actually usable |
+
+`perf` fires tiny prompts, so it measures decode only. A prefill-heavy workload (say 2800 tokens in,
+250 out) has different bottlenecks entirely — that is what `load` is for.
+
+**Seats johnny does not manage** — a SYCL llama.cpp server on an Intel card, a fork build, a remote
+box — can be benched by URL. Nothing is launched and nothing is written to the registry; the report
+lands under `runs/bench-endpoint-<host>-<port>-<model>/`:
+
+```
+johnny bench --endpoint http://127.0.0.1:8124 --suite hardcode,depthprobe --depths 2000,16000,32000
+johnny bench --endpoint http://host:8002/v1 --model my-model --suite load --input-tokens 2800 --output-tokens 250
+```
+
+Endpoint mode runs the client-side suites only (`perf` and `ctxsafe` need a managed seat).
 
 `ctxsafe` matters more than it sounds: `max_model_len` is a *request*, not a guarantee, and a
 seat that launches at a given context can still fail at depth.

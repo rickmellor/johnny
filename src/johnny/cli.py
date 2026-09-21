@@ -1943,11 +1943,18 @@ def tune(
 @app.command(rich_help_panel=_P_MODELS)
 def bench(
     target: str = typer.Argument(None, help="Model id or placement id (exact or unique substring). Omit to pick from the registry."),
-    suite: str = typer.Option("perf,arc", "--suite", help="Comma-separated suites: perf (throughput/single-stream bench — refreshes the placement's perf numbers) · arc (ARC-Challenge CoT accuracy; needs the optional eval deps: `pipx inject johnny-fleet openai datasets`) · icl (in-context-learning pattern-completion probe; needs `openai`) · needle (positional-recall/long-context probe against a bundled code corpus; needs `openai`) · depth (prefill/decode throughput + latency vs. context depth via llama-benchy; needs `llama-benchy`) · humaneval (real HumanEval pass@1 via lm-eval + a chat-aware re-scorer; needs `pipx inject johnny-fleet 'lm-eval[api]'`) · automationbench (real agentic tool-use eval via Zapier's public AutomationBench — 600 tasks over simulated SaaS tools, self-bootstraps a vendored `uv`-managed checkout; needs `uv` on PATH; see `--domains`) · planbench (PlanBench task_1 plan generation — short one-shot PDDL/Blocksworld problems, no tools and ~1-2K context, so it isolates PLANNING from agentic-loop and context-pressure confounds; scored as exact action-sequence match, a strict lower bound, plus plan_prefix_pct partial credit; needs `openai`+`datasets`) · ctxsafe (empirical context-safety probe — walks real needle-in-haystack requests at progressively deeper depths up to max_model_len against a dedicated disposable seat, live rocm-smi VRAM polling, real crash detection; writes quality.ctxsafe with the verified-safe depth vs. configured max_model_len vs. trained native_context — see AGENTS.md's Context safety section; needs `openai`, ideally `tiktoken`)."),
+    suite: str = typer.Option("perf,arc", "--suite", help="Comma-separated suites: hardcode (20 hard coding tasks with hidden tests — the code suite that still discriminates; stdlib only) · load (realistic serving load: closed-loop concurrency sweep at --input-tokens/--output-tokens with latency percentiles; stdlib only) · depthprobe (prefill/decode tok/s at --depths against any endpoint; stdlib only) · perf (throughput/single-stream bench — refreshes the placement's perf numbers) · arc (ARC-Challenge CoT accuracy; needs the optional eval deps: `pipx inject johnny-fleet openai datasets`) · icl (in-context-learning pattern-completion probe; needs `openai`) · needle (positional-recall/long-context probe against a bundled code corpus; needs `openai`) · depth (prefill/decode throughput + latency vs. context depth via llama-benchy; needs `llama-benchy`) · humaneval (real HumanEval pass@1 via lm-eval + a chat-aware re-scorer; needs `pipx inject johnny-fleet 'lm-eval[api]'`) · automationbench (real agentic tool-use eval via Zapier's public AutomationBench — 600 tasks over simulated SaaS tools, self-bootstraps a vendored `uv`-managed checkout; needs `uv` on PATH; see `--domains`) · planbench (PlanBench task_1 plan generation — short one-shot PDDL/Blocksworld problems, no tools and ~1-2K context, so it isolates PLANNING from agentic-loop and context-pressure confounds; scored as exact action-sequence match, a strict lower bound, plus plan_prefix_pct partial credit; needs `openai`+`datasets`) · ctxsafe (empirical context-safety probe — walks real needle-in-haystack requests at progressively deeper depths up to max_model_len against a dedicated disposable seat, live rocm-smi VRAM polling, real crash detection; writes quality.ctxsafe with the verified-safe depth vs. configured max_model_len vs. trained native_context — see AGENTS.md's Context safety section; needs `openai`, ideally `tiktoken`)."),
     limit: int = typer.Option(None, "--limit", help="arc/humaneval: only the first N questions/problems — a quick smoke. Full sets are 1172 CoT questions (arc, an hour-ish on a mid-size seat) / 164 problems (humaneval). automationbench: only the first N tasks (across --domains, dataset order) — full public set is 600 (100/domain). ctxsafe: cap the deepest depth tested (tokens) — for placements whose max_model_len is too large to sweep to in one run."),
     concurrency: int = typer.Option(8, "--concurrency", help="arc/humaneval: parallel requests against the seat. automationbench: max concurrent tasks (--max-concurrent)."),
     domains: str = typer.Option("all", "--domains", help="automationbench: comma-separated domains (sales/marketing/operations/support/finance/hr) or 'all'."),
     thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="arc/icl/needle/humaneval: leave model thinking on. Default off — reasoning models score ~0 (or truncate mid-answer) when the answer drowns in an unclosed think block."),
+    endpoint: str = typer.Option(None, "--endpoint", help="Bench a bare OpenAI-compatible endpoint johnny does not manage (e.g. http://host:8124 or …/v1) instead of a registry placement. Nothing is launched or written to the registry; client-side suites only (no perf/ctxsafe — use `load`)."),
+    model: str = typer.Option(None, "--model", help="--endpoint: model name to send. Default: the first id from the endpoint's /v1/models."),
+    input_tokens: int = typer.Option(2800, "--input-tokens", help="load: prompt length per request."),
+    output_tokens: int = typer.Option(250, "--output-tokens", help="load: forced output length per request."),
+    load_concurrency: str = typer.Option("8,16,32", "--load-concurrency", help="load: comma-separated closed-loop concurrency levels."),
+    requests_per_level: int = typer.Option(None, "--requests-per-level", help="load: requests per level (default 10x concurrency, min 20 — short runs under-read)."),
+    depths: str = typer.Option(None, "--depths", help="depthprobe: comma-separated prompt depths in tokens (default 2000,16000,32000)."),
     yes: bool = typer.Option(False, "--yes", help="Skip the temp-seat launch confirmation."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
@@ -1968,6 +1975,13 @@ def bench(
     Perf refreshes the placement's `perf`; quality lands under its `quality` block;
     both plus a BENCH_REPORT.md under the runs dir. To re-tune knobs instead, see
     `johnny tune`.
+
+    Seats johnny does not manage (a SYCL llama.cpp server, a fork build, a remote box)
+    can be benched by URL — no TARGET, nothing launched, nothing written to the registry:
+
+      johnny bench --endpoint http://127.0.0.1:8124 --suite hardcode,depthprobe
+
+      johnny bench --endpoint http://host:8002/v1 --model my-model --suite load --input-tokens 2800 --output-tokens 250
     """
     from . import bench as B
     from .engine import load_config as _load_cfg
@@ -1984,6 +1998,26 @@ def bench(
         if s not in B.SUITES:
             err.print(f"[red]unknown suite '{s}'[/] — available: {', '.join(B.SUITES)}; planned: {', '.join(B.PLANNED)}.")
             raise typer.Exit(code=1)
+
+    load_opts = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                 "concurrency": load_concurrency, "requests_per_level": requests_per_level}
+    prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
+    pid = None
+    if endpoint:
+        if target:
+            err.print("[red]--endpoint and a TARGET are mutually exclusive[/] — an endpoint has no registry placement.")
+            raise typer.Exit(code=1)
+        if suite == "perf,arc":  # the placement-mode default makes no sense here (perf needs a managed seat)
+            err.print("[red]--endpoint needs an explicit --suite[/] — client-side suites: " + ", ".join(B.ENDPOINT_SUITES))
+            raise typer.Exit(code=1)
+        try:
+            res = B.run_endpoint(endpoint, model, suites, cfg=_load_cfg(), limit=limit, concurrency=concurrency,
+                                 thinking=thinking, automationbench_domains=domains, progress=prog,
+                                 load_opts=load_opts, depths=depths)
+        except Exception as e:
+            _emit_err(e, json_output)
+        _bench_render(res, suites, pid, json_output)
+        return
 
     reg = store.load()
     if target:
@@ -2028,12 +2062,18 @@ def bench(
         if not typer.confirm(f"Bench {model_id} · {pid} ({', '.join(suites)})?"):
             raise typer.Exit(code=1)
 
-    prog = None if json_output else (lambda m: console.print(f"[dim]· {m}[/]"))
     try:
         res = B.run(model_id, placement, suites, cfg=cfg, limit=limit, concurrency=concurrency,
-                    thinking=thinking, automationbench_domains=domains, progress=prog)
+                    thinking=thinking, automationbench_domains=domains, progress=prog,
+                    load_opts=load_opts, depths=depths)
     except Exception as e:
         _emit_err(e, json_output)
+    _bench_render(res, suites, pid, json_output)
+
+
+def _bench_render(res: dict, suites: list[str], pid: str | None, json_output: bool) -> None:
+    """Print a bench result (placement mode or endpoint mode) and exit 1 if any suite failed."""
+
     if json_output:
         console.print(_json.dumps(res, indent=2, default=str))
         return
@@ -2093,6 +2133,25 @@ def bench(
             console.print(f"[green]✓ humaneval[/] pass@1 {r.get('pass_at_1_pct')}% "
                           f"({r.get('passed')}/{r.get('total')}"
                           + (f", first {r['limit']}" if r.get("limit") else "") + ")")
+        elif s == "hardcode":
+            console.print(f"[green]✓ hardcode[/] {r.get('passed')}/{r.get('total')} ({r.get('pass_rate_pct')}%)"
+                          + (f" · failed: {', '.join(r.get('failed') or [])}" if r.get("failed") else "")
+                          + (f" · [yellow]{r['api_errors']} api errors[/]" if r.get("api_errors") else "")
+                          + "  [dim](±2 tasks is noise)[/]")
+        elif s == "load":
+            console.print(f"[green]✓ load[/] {r.get('input_tokens')} in / {r.get('output_tokens')} out, unique prompts")
+            for lv in (r.get("levels") or []):
+                console.print(f"    c={lv.get('concurrency'):>3}: {lv.get('req_per_s')} req/s · {lv.get('total_tok_s')} total tok/s "
+                              f"(prefill {lv.get('prefill_tok_s')}, out {lv.get('output_tok_s')}) · TTFT p50 {lv.get('ttft_ms_p50')} ms · "
+                              f"TPOT p50 {lv.get('tpot_ms_p50')} ms · E2E p50/p99 {lv.get('e2e_s_p50')}/{lv.get('e2e_s_p99')} s"
+                              + (f" · [yellow]{lv['failed']} failed[/]" if lv.get("failed") else ""))
+            b = r.get("best") or {}
+            console.print(f"    best: {b.get('req_per_s')} req/s at concurrency {b.get('concurrency')}")
+        elif s == "depthprobe":
+            console.print("[green]✓ depthprobe[/]")
+            for pt in (r.get("points") or []):
+                console.print(f"    ~{pt.get('target_tokens')} tok: [yellow]{pt['error']}[/]" if pt.get("error") else
+                              f"    {pt.get('prompt_tokens')} tok: prefill {pt.get('prefill_tok_s')} tok/s · decode {pt.get('decode_tok_s')} tok/s")
         elif s == "planbench":
             console.print(f"[green]✓ planbench[/] exact-plan {r.get('exact_pct')}% "
                           f"({r.get('exact')}/{r.get('total')}) · plan-prefix {r.get('plan_prefix_pct')}%"

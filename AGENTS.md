@@ -293,3 +293,32 @@ it lands, before trusting any new induction/tune output:
   fnrepo `ple_layer.patch`, see rickmellor/qwen3.8-flash-next-rdna4 README §5.
 - **`ctxsafe` needs its own 4-GPU disposable seat** — with the 4-GPU flashnext seat up only
   two cards are free, so run it after `johnny down` of the live seat (then profile back up).
+
+## Bench harness notes — 2026-09-21 (endpoint mode, hardcode / load / depthprobe)
+
+- **`johnny bench --endpoint URL [--model NAME] --suite …`** benches any OpenAI-compatible server by URL:
+  no TARGET, nothing launched, reaper-pinned or written to the registry (`bench.run_endpoint`). Every suite
+  now builds its base URL through `bench._v1(target)` — an int port (placement mode) or a URL (endpoint
+  mode) — so new suites must use it, never a literal `127.0.0.1:{port}`. Only `ENDPOINT_SUITES` run there;
+  `perf` (KV readback from a local container) and `ctxsafe` (launches its own probe seat) are refused.
+  Born from the Intel Arc Pro B50 / PrismML-fork seats, which johnny has no backend for.
+- **Three stdlib-only client suites** (no `openai`, no `lm-eval`), each a bundled script whose *last stdout
+  line* is the contract `TAG {json}` parsed by `bench._result_line`: `hardcode_eval.py` → `HARDCODE_RESULT`,
+  `load_bench.py` → `LOAD_RESULT` (`best` is null when nothing completed — treated as failure),
+  `depth_probe.py` → `DEPTHPROBE_RESULT`. `hardcode_tasks.py` must sit beside `hardcode_eval.py`
+  (it is imported from the script's own directory, so a `scripts.hardcode_eval` override needs both files).
+- **`hardcode`**: 20 tasks, hidden tests validated against reference solutions (`--self-test`). n=20 → ±2 tasks
+  is noise. Measured 2026-09-21: Flash-Next AWQ 18, Qwen3.8-27B-FP8 17, Qwen3.6-35B-A3B Q2_K 13–15,
+  Bonsai 2 27B ternary 13 — while HumanEval/ARC put all four within 5 points. Thinking mode can burn
+  9–17K tokens per task without answering; the default is thinking off.
+- **`load`** has no tokenizer: it calibrates tokens/word from one `max_tokens=1` request, then sizes prompts.
+  Closed loop, 10× concurrency requests per level by default — shorter runs under-read by 10–40 % and hid a
+  bimodal seat (gemma-swarm, 2026-09-17). Prompts are unique from the first word, so a prefix-cache-friendly
+  real workload will do better. Options: `--input-tokens --output-tokens --load-concurrency --requests-per-level`.
+- **`depthprobe`**: TTFT includes queueing → run against an idle seat. Sends `cache_prompt: false` and a random
+  first line so a prefix cache cannot fake the prefill number (an early ad-hoc probe reported 108K tok/s that way).
+- **HumanEval scorer restores the prompt's own import lines by default** (`--strict-imports` for the old
+  behaviour) and reports `rescued by restored imports: N`, surfaced as `quality.humaneval.imports_rescued`.
+  A model that omits `from typing import List` went 84.15 % → 91.46 %; models that write their own imports
+  are unchanged. It also now tries three indent layouts for body-only (continuation) answers.
+

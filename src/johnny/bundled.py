@@ -27,6 +27,9 @@ _BUNDLED = {
     "icl_eval": "icl_eval.py",
     "bench_llamacpp": "bench_llamacpp.sh",     # llama.cpp client throughput (concurrency 1..32)
     "llama_bench": "bench_llama_speed.sh",     # llama.cpp single-stream prefill/decode (llama-bench)
+    "hardcode_eval": "hardcode_eval.py",       # 20 hard coding tasks, hidden tests (imports hardcode_tasks.py beside it)
+    "load_bench": "load_bench.py",             # realistic closed-loop serving load, latency percentiles
+    "depth_probe": "depth_probe.py",           # prefill/decode tok/s at prompt depth, any OpenAI endpoint
 }
 
 
