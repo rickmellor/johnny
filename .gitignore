@@ -21,3 +21,18 @@ state/
 .idea/
 .vscode/
 scratch/backups/
+
+# Raw experiment output under scratch/ — reports, scripts and summaries are tracked, bulk data is not
+scratch/*/logs/
+scratch/*/results/
+scratch/*/dataset/
+scratch/*/tcache*/
+scratch/*/tuned-moe*/
+scratch/*/*.out
+scratch/*/answers*.json
+scratch/*/hard-*.json
+scratch/*/*/arc.jsonl
+scratch/*/*/arc.log
+scratch/*/*/run60.log
+scratch/*/*/humaneval*/
+scratch/*/*/humaneval*.log
