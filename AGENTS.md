@@ -65,6 +65,11 @@ job. Keep that split when adding features.
   `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'` (or `low`) — AutomationBench pass rate
   goes 14.3 % (xhigh) → 30–40 % (low/medium), vs qwen-27b-coder's 16.7 %. Per-request
   `chat_template_kwargs` overrides. Placements `effort-{low,medium}-{tp2,tp4}` carry it. Report §G.
+- **Per-seat `gpus:` pin (2026-09-21).** Optional list on a profile seat, or `johnny up --gpus`;
+  `engine/placement.pin_gpus` validates (count = placement gpu_count, indices exist, free unless
+  `--force`) instead of choosing. HIP index order is NOT PCI/rocm-smi/btop order on Rick's box
+  (HIP 0..5 = PCI 63,43,46,23,26,03) — the daily profile's pins are chosen so btop reads
+  chat = gpu1-2, coder = gpu3-6 (gpu0 is the RTX 4080).
 - **Per-seat `guidance` (2026-08-24).** A profile seat may declare `guidance: roadmap` when its
   model executes delegated work well but plans it poorly. `johnny resolve <role> --json` surfaces
   it (`guidance` field, follows `role_aliases`), and input's `spawn_agent` reads it to hand that

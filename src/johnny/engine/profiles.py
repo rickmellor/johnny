@@ -165,6 +165,15 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
                 errors.append(f"{who}: placement '{seat['placement']}' not found on model")
         if placement:
             gpu_need += int((placement.get("knobs") or {}).get("gpu_count") or 0)
+        pin = seat.get("gpus")
+        if pin is not None:
+            if not isinstance(pin, list) or not all(isinstance(g, int) for g in pin):
+                errors.append(f"{who}: 'gpus' must be a list of GPU indices")
+            elif placement and len(pin) != int((placement.get("knobs") or {}).get("gpu_count") or 0):
+                errors.append(f"{who}: 'gpus' pins {len(pin)} GPU(s) but the placement needs "
+                              f"{(placement.get('knobs') or {}).get('gpu_count')}")
+            elif hardware is not None and (bad := [g for g in pin if g not in {x.index for x in hardware.gpus}]):
+                errors.append(f"{who}: 'gpus' names GPU(s) this box does not have: {bad}")
         # A seat's identity is its port — duplicate ports are the only hard
         # collision. Repeating a model (scale-out fleets like N× one model,
         # one per GPU) is legitimate; launch.up's idempotency is port-aware.
@@ -246,7 +255,7 @@ def up_profile(name: str, wait: bool = False, cfg: dict | None = None, warmup: b
         try:
             r = launch.up(model, placement_id=seat.get("placement"),
                           port=seat.get("port"), wait=wait or _needs_warm,
-                          warmup=warmup)
+                          warmup=warmup, gpus=seat.get("gpus"))
         except launch.PlacementError as e:
             entry.update({"action": "error", "error": str(e)})
             results.append(entry)

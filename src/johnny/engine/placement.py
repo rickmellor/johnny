@@ -51,6 +51,27 @@ def assign_gpus(gpu_count: int, hardware, free: list[int]) -> list[int]:
     return []
 
 
+def pin_gpus(gpu_count: int, hardware, free: list[int], requested: list[int], force: bool = False) -> list[int]:
+    """An explicit GPU pin (profile seat `gpus:` / `up --gpus`). Validates instead of
+    choosing: the count must match the placement, every index must exist, and —
+    unless --force — every index must be free. Returns the pin in the given order
+    (it becomes *_VISIBLE_DEVICES, so order = the seat's local rank order)."""
+    if not gpu_count:
+        return []
+    if len(requested) != gpu_count:
+        raise ValueError(f"pin lists {len(requested)} GPU(s) but the placement needs {gpu_count}")
+    if len(set(requested)) != len(requested):
+        raise ValueError(f"pin repeats a GPU: {requested}")
+    known = {g.index for g in hardware.gpus}
+    bad = [g for g in requested if g not in known]
+    if bad:
+        raise ValueError(f"pin names GPU(s) this box does not have: {bad} (have {sorted(known)})")
+    busy = [g for g in requested if g not in set(free)]
+    if busy and not force:
+        raise ValueError(f"pinned GPU(s) {busy} are busy (free: {free}). Pass --swap <seat> or --force.")
+    return list(requested)
+
+
 def fill_gpus_forced(gpu_count: int, hardware, seats, assigned: list[int]) -> list[int]:
     """Top a short --force assignment up to gpu_count from the least-subscribed
     busy GPUs. A short assignment must never ship: the driver only sets

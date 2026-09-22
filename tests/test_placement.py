@@ -60,3 +60,20 @@ def test_fill_gpus_forced_tops_up_partial_tp_assignment():
     seats = [_seat("a", 8000, [0]), _seat("b", 8001, [1]), _seat("c", 8002, [2])]
     # TP=2 with one free GPU: keep the free one, add the least-loaded busy one
     assert fill_gpus_forced(2, hw, seats, [3]) == [0, 3]
+
+
+def test_pin_gpus_validates_instead_of_choosing():
+    from johnny.engine.placement import pin_gpus
+    import pytest
+    hw = _box(6); free = [0, 1, 2, 5]
+    assert pin_gpus(2, hw, free, [5, 1]) == [5, 1]          # order kept: it becomes the visibility mask
+    assert pin_gpus(0, hw, free, []) == []                  # cpu/pooling placements ignore pins
+    with pytest.raises(ValueError, match="needs 2"):
+        pin_gpus(2, hw, free, [0])
+    with pytest.raises(ValueError, match="repeats"):
+        pin_gpus(2, hw, free, [0, 0])
+    with pytest.raises(ValueError, match="does not have"):
+        pin_gpus(2, hw, free, [0, 9])
+    with pytest.raises(ValueError, match="busy"):
+        pin_gpus(2, hw, free, [3, 4])
+    assert pin_gpus(2, hw, free, [3, 4], force=True) == [3, 4]

@@ -15,7 +15,7 @@ from ..runtime import probe
 from ..runtime.lock import mutation_lock
 from ..telemetry import collect
 from . import all_seats, driver_for, load_config
-from .placement import allocate_port, assign_gpus, fill_gpus_forced, free_gpus, pick_placement, role_for, viable
+from .placement import allocate_port, assign_gpus, fill_gpus_forced, free_gpus, pick_placement, pin_gpus, role_for, viable
 from . import warmup as warmup_mod
 from ..hardware import detect as hwdetect
 from ..registry import store
@@ -145,6 +145,7 @@ def up(
     # at 600s looks exactly like success to a script (2026-08-19 incident).
     wait_timeout: float = 1200.0,
     warmup: bool = True,
+    gpus: list[int] | None = None,   # explicit pin (HIP/CUDA indices); None = auto-place on free GPUs
 ) -> dict:
     cfg = load_config()
     hardware = hwdetect.detect()
@@ -190,12 +191,20 @@ def up(
         knobs = placement.get("knobs") or {}
         gc = knobs.get("gpu_count") or 0
         free = free_gpus(hardware, seats)
-        ok, reason = viable(knobs, hardware, free)
-        if not ok and not force:
-            raise PlacementError(
-                f"cannot place '{model_id}': {reason}. Pass --swap <seat> to free GPUs, or --force."
-            )
-        gpus = assign_gpus(gc, hardware, free)
+        if gpus is not None:
+            # Pinned: validate the request instead of picking (viable() still
+            # gates the dtype fit, but the free-count check is the pin's own).
+            try:
+                gpus = pin_gpus(gc, hardware, free, list(gpus), force=force)
+            except ValueError as e:
+                raise PlacementError(f"cannot place '{model_id}' on GPUs {list(gpus)}: {e}") from None
+        else:
+            ok, reason = viable(knobs, hardware, free)
+            if not ok and not force:
+                raise PlacementError(
+                    f"cannot place '{model_id}': {reason}. Pass --swap <seat> to free GPUs, or --force."
+                )
+            gpus = assign_gpus(gc, hardware, free)
         if gc and len(gpus) < gc:
             # Only reachable under --force (viable() blocks the placement
             # otherwise) — pin busy GPUs rather than launch with no mask.
