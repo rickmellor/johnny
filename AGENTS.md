@@ -65,6 +65,11 @@ job. Keep that split when adding features.
   `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'` (or `low`) — AutomationBench pass rate
   goes 14.3 % (xhigh) → 30–40 % (low/medium), vs qwen-27b-coder's 16.7 %. Per-request
   `chat_template_kwargs` overrides. Placements `effort-{low,medium}-{tp2,tp4}` carry it. Report §G.
+- **`systemd` backend (2026-09-22).** `backends/systemd.py`: seats = registry placements with
+  `backend: systemd` whose `extra.unit` is active (`systemctl --user show`); `ready` when `extra.port`
+  answers `extra.health`. `launch.up` short-circuits to `_up_systemd` (no GPU/port allocation — the unit
+  owns its device). Rick's `saint-features` sidecar (RTX 4080) is the first; it sits in profile `daily`
+  as role `embed` so `johnny status` shows the whole fleet.
 - **Per-seat `gpus:` pin (2026-09-21).** Optional list on a profile seat, or `johnny up --gpus`;
   `engine/placement.pin_gpus` validates (count = placement gpu_count, indices exist, free unless
   `--force`) instead of choosing. HIP index order is NOT PCI/rocm-smi/btop order on Rick's box

@@ -26,13 +26,17 @@ def get_driver(name: str, **kw) -> Driver:
         from .llamacpp import LlamaCppDriver
 
         return LlamaCppDriver(**kw)
+    if name == "systemd":
+        from .systemd import SystemdDriver
+
+        return SystemdDriver()
     raise ValueError(f"unknown backend: {name}")
 
 
 def available_drivers() -> list[str]:
     """Backends whose CLI/runtime is present on this box."""
     out = []
-    for name in ("vllm", "lmstudio", "llamacpp"):
+    for name in ("vllm", "lmstudio", "llamacpp", "systemd"):
         try:
             if get_driver(name).available():
                 out.append(name)
