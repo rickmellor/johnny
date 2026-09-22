@@ -69,7 +69,9 @@ job. Keep that split when adding features.
   `backend: systemd` whose `extra.unit` is active (`systemctl --user show`); `ready` when `extra.port`
   answers `extra.health`. `launch.up` short-circuits to `_up_systemd` (no GPU/port allocation — the unit
   owns its device). Rick's `saint-features` sidecar (RTX 4080) is the first; it sits in profile `daily`
-  as role `embed` so `johnny status` shows the whole fleet.
+  as role `embed` so `johnny status` shows the whole fleet. Several seats per unit via `extra.seat_name`
+  (`saint-features.service#embed` + `#classifier`); `comfyui.service` is a seat too (role `image`).
+  Shared-unit seats may share a port (profiles.validate + up_profile exempt them).
 - **Per-seat `gpus:` pin (2026-09-21).** Optional list on a profile seat, or `johnny up --gpus`;
   `engine/placement.pin_gpus` validates (count = placement gpu_count, indices exist, free unless
   `--force`) instead of choosing. HIP index order is NOT PCI/rocm-smi/btop order on Rick's box

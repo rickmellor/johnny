@@ -9,6 +9,10 @@ fleet view is complete. Placement shape:
     knobs:   {gpu_count: 0}                     # not one of johnny's placed GPUs
     extra:   {unit: saint-features.service, port: 8005, served_model: nomic-embed,
               health: "/health", image: "host · ~/.venvs/llmc · RTX 4080"}
+
+One unit may back several seats (one process serving embeddings AND a classifier):
+give each placement its own `extra.seat_name` (default = the unit name). Stopping any
+of them stops the unit — they are the same process, and status says so.
 """
 from __future__ import annotations
 
@@ -62,11 +66,20 @@ class SystemdDriver(Driver):
                     out.append((model_id, p))
         return out
 
+    @classmethod
+    def _unit_for(cls, seat: str) -> str:
+        """Seat name → unit (seat names may be `unit#suffix` or a custom extra.seat_name)."""
+        for _, p in cls._placements():
+            extra = p.get("extra") or {}
+            if (extra.get("seat_name") or extra["unit"]) == seat:
+                return extra["unit"]
+        return seat.split("#", 1)[0]
+
     def runtime_state(self) -> list[SeatInfo]:
         seats = []
         for model_id, p in self._placements():
             extra = p.get("extra") or {}
-            unit = extra["unit"]
+            unit = extra["unit"]; seat_name = extra.get("seat_name") or unit
             try:
                 r = _systemctl("show", unit, "-p", "ActiveState,SubState,MainPID", timeout=5)
             except Exception:
@@ -78,7 +91,7 @@ class SystemdDriver(Driver):
             port = extra.get("port")
             state = "ready" if active == "active" and _healthy(port, extra.get("health")) else "loading"
             seats.append(SeatInfo(
-                "systemd", unit, extra.get("served_model") or model_id, int(port) if port else None, [], state,
+                "systemd", seat_name, extra.get("served_model") or model_id, int(port) if port else None, [], state,
                 {"image": extra.get("image") or "host process",
                  "labels": {"johnny.model": model_id, "johnny.placement": p.get("id", ""), "johnny.unit": unit},
                  "pid": props.get("MainPID"), "substate": props.get("SubState")},
@@ -90,21 +103,22 @@ class SystemdDriver(Driver):
         r = _systemctl("start", unit)
         if r.returncode != 0:
             raise RuntimeError(f"systemctl --user start {unit}: {r.stderr.strip() or r.stdout.strip()}")
-        return SeatInfo("systemd", unit, spec.get("model"), spec.get("port"), [], "loading",
+        return SeatInfo("systemd", spec.get("seat_name") or unit, spec.get("model"), spec.get("port"), [], "loading",
                         {"image": spec.get("image") or "host process",
                          "labels": {"johnny.model": spec.get("model_id", ""), "johnny.placement": spec.get("placement", ""),
                                     "johnny.unit": unit}})
 
     def stop(self, seat: str) -> None:
-        r = _systemctl("stop", seat)
+        unit = self._unit_for(seat)
+        r = _systemctl("stop", unit)
         if r.returncode != 0:
-            raise RuntimeError(f"systemctl --user stop {seat}: {r.stderr.strip() or r.stdout.strip()}")
+            raise RuntimeError(f"systemctl --user stop {unit}: {r.stderr.strip() or r.stdout.strip()}")
 
     def metrics(self, seat: str) -> dict:
         return {}
 
     def logs(self, seat: str, follow: bool = False, tail: int = 200):
-        cmd = ["journalctl", "--user", "-u", seat, "-n", str(tail), "--no-pager"] + (["-f"] if follow else [])
+        cmd = ["journalctl", "--user", "-u", self._unit_for(seat), "-n", str(tail), "--no-pager"] + (["-f"] if follow else [])
         if follow:
             return subprocess.Popen(cmd)
         return subprocess.run(cmd, capture_output=True, text=True).stdout
