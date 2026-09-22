@@ -118,6 +118,20 @@ $ johnny resolve chat --json
 { "seat": "...", "endpoint": "...", "model": "...", "state": "ready", "guidance": "roadmap" }
 ```
 
+A seat may also pin its cards with `gpus:` (HIP/CUDA indices as `johnny hinfo` lists them;
+the count must match the placement, and the order becomes the container's visibility
+mask). Without it johnny takes the first free run, so which model lands on which card
+depends on bring-up order. `johnny up --gpus 4,5 <model>` does the same for one seat.
+
+```yaml
+seats:
+  - model: <chat-model>
+    placement: <tp2-placement>
+    port: 8003
+    role: chat
+    gpus: [5, 3]            # always these two cards — a monitor's GPU panel reads the same every day
+```
+
 `roadmap` means *give this seat an explicit ordered brief rather than an open-ended question*.
 Resolution follows `role_aliases`, so a role pointed at another seat inherits that seat's hint.
 Seats that declare nothing return `"guidance": null`, and clients are expected to treat the
