@@ -9,7 +9,7 @@ from johnny.backends.systemd import SystemdDriver
 
 REG = {"models": {"saint-features": {"identity": {}, "placements": [
     {"id": "rtx4080-systemd", "backend": "systemd", "knobs": {"gpu_count": 0},
-     "extra": {"unit": "saint-features.service", "port": 8005, "served_model": "nomic-embed", "health": "/health"}}]}}}
+     "extra": {"unit": "saint-features.service", "port": 8005, "served_model": "nomic-embed", "health": "/health", "device": "RTX 4080"}}]}}}
 
 
 def _cp(stdout: str, rc: int = 0):
@@ -28,7 +28,7 @@ def test_runtime_state_reports_active_units_only():
         seats = drv.runtime_state()
     assert len(seats) == 1 and seats[0].name == "saint-features.service"
     assert seats[0].port == 8005 and seats[0].model == "nomic-embed" and seats[0].state == "ready" and seats[0].gpus == []
-    assert seats[0].extra["labels"]["johnny.model"] == "saint-features"
+    assert seats[0].extra["labels"]["johnny.model"] == "saint-features" and seats[0].extra["device"] == "RTX 4080"
     with mock.patch("johnny.registry.store.load", return_value=REG), \
          mock.patch("johnny.backends.systemd._systemctl", return_value=_cp("ActiveState=inactive\nSubState=dead\nMainPID=0\n")):
         assert drv.runtime_state() == []

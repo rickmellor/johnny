@@ -8,7 +8,10 @@ fleet view is complete. Placement shape:
     backend: systemd
     knobs:   {gpu_count: 0}                     # not one of johnny's placed GPUs
     extra:   {unit: saint-features.service, port: 8005, served_model: nomic-embed,
-              health: "/health", image: "host · ~/.venvs/llmc · RTX 4080"}
+              health: "/health", device: "RTX 4080", image: "host · ~/.venvs/llmc"}
+
+`device` names the card for `status` when it is not one johnny places (its hardware model is
+the AMD fleet; the NVIDIA card has no index) — a label, not a placement.
 
 One unit may back several seats (one process serving embeddings AND a classifier):
 give each placement its own `extra.seat_name` (default = the unit name). Stopping any
@@ -92,7 +95,7 @@ class SystemdDriver(Driver):
             state = "ready" if active == "active" and _healthy(port, extra.get("health")) else "loading"
             seats.append(SeatInfo(
                 "systemd", seat_name, extra.get("served_model") or model_id, int(port) if port else None, [], state,
-                {"image": extra.get("image") or "host process",
+                {"image": extra.get("image") or "host process", "device": extra.get("device"),
                  "labels": {"johnny.model": model_id, "johnny.placement": p.get("id", ""), "johnny.unit": unit},
                  "pid": props.get("MainPID"), "substate": props.get("SubState")},
             ))
@@ -104,7 +107,7 @@ class SystemdDriver(Driver):
         if r.returncode != 0:
             raise RuntimeError(f"systemctl --user start {unit}: {r.stderr.strip() or r.stdout.strip()}")
         return SeatInfo("systemd", spec.get("seat_name") or unit, spec.get("model"), spec.get("port"), [], "loading",
-                        {"image": spec.get("image") or "host process",
+                        {"image": spec.get("image") or "host process", "device": spec.get("device"),
                          "labels": {"johnny.model": spec.get("model_id", ""), "johnny.placement": spec.get("placement", ""),
                                     "johnny.unit": unit}})
 
