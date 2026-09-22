@@ -224,3 +224,16 @@ def test_validate_seat_gpu_pin():
     assert any("pins 1 GPU" in e for e in errors)
     errors, _ = _validate({"seats": [dict(base, gpus="4,5")]})
     assert any("list of GPU indices" in e for e in errors)
+
+
+def test_shared_unit_systemd_seats_may_share_a_port():
+    """Two systemd seats backed by ONE unit are the same process: not a port collision."""
+    reg = {"models": {
+        "emb": {"identity": {"repo_id": "x"}, "placements": [{"id": "sd", "backend": "systemd", "knobs": {"gpu_count": 0}, "extra": {"unit": "f.service", "port": 8005}}]},
+        "clf": {"identity": {"repo_id": "x"}, "placements": [{"id": "sd", "backend": "systemd", "knobs": {"gpu_count": 0}, "extra": {"unit": "f.service", "port": 8005}}]},
+        "oth": {"identity": {"repo_id": "x"}, "placements": [{"id": "sd", "backend": "systemd", "knobs": {"gpu_count": 0}, "extra": {"unit": "g.service", "port": 8005}}]}}}
+    with mock.patch.object(profiles, "all_profiles", return_value={}):
+        ok, _ = profiles.validate({"seats": [_seat("emb", "sd", 8005, "embed"), _seat("clf", "sd", 8005, "classifier")]}, reg, None)
+        bad, _ = profiles.validate({"seats": [_seat("emb", "sd", 8005, "embed"), _seat("oth", "sd", 8005, "x")]}, reg, None)
+    assert not [e for e in ok if "duplicate port" in e]
+    assert any("duplicate port" in e for e in bad)

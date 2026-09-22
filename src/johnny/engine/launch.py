@@ -103,7 +103,7 @@ def _up_systemd(model_id: str, placement: dict) -> dict:
     extra = placement.get("extra") or {}
     if not extra.get("unit"):
         raise PlacementError(f"placement '{placement.get('id')}' has no extra.unit")
-    spec = {"unit": extra["unit"], "port": extra.get("port"), "model": extra.get("served_model") or model_id,
+    spec = {"unit": extra["unit"], "seat_name": extra.get("seat_name"), "port": extra.get("port"), "model": extra.get("served_model") or model_id,
             "model_id": model_id, "placement": placement.get("id", ""), "image": extra.get("image")}
     seat = drv.launch(spec)
     started = collect.now()

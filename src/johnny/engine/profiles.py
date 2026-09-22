@@ -147,6 +147,7 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
         return errors, warnings
 
     seen_ports: set = set()
+    seen_units: dict = {}          # port -> systemd unit, for shared-unit seats
     role_models: dict[str, set] = {}
     gpu_need = 0
     for i, seat in enumerate(seats):
@@ -177,10 +178,15 @@ def validate(profile: dict, reg: dict, hardware=None, name: str | None = None) -
         # A seat's identity is its port — duplicate ports are the only hard
         # collision. Repeating a model (scale-out fleets like N× one model,
         # one per GPU) is legitimate; launch.up's idempotency is port-aware.
+        # Exception: several systemd seats may be ONE process (same unit) serving several
+        # things on one port — that is the same seat identity, not a collision.
         port = seat.get("port")
+        unit = ((placement or {}).get("extra") or {}).get("unit") if (placement or {}).get("backend") == "systemd" else None
         if port is not None:
-            if port in seen_ports:
+            if port in seen_ports and not (unit and seen_units.get(port) == unit):
                 errors.append(f"{who}: duplicate port '{port}' in profile")
+            if unit:
+                seen_units.setdefault(port, unit)
             seen_ports.add(port)
         role = seat.get("role")
         if role:
@@ -231,6 +237,8 @@ def up_profile(name: str, wait: bool = False, cfg: dict | None = None, warmup: b
     if prof is None:
         raise launch.PlacementError(f"no profile '{name}' (see `johnny profile list`)")
 
+    from ..registry import store as _store
+    _reg = _store.load()
     results = []
     for seat in prof.get("seats") or []:
         model = seat.get("model")
@@ -241,6 +249,12 @@ def up_profile(name: str, wait: bool = False, cfg: dict | None = None, warmup: b
         holder = next((s for s in all_seats(cfg)
                        if s.port == seat.get("port")
                        and (_seat_labels(s).get("johnny.model") or s.model) != model), None)
+        if holder and getattr(holder, "backend", None) == "systemd":
+            # same unit = same process: a shared-unit systemd seat is not a port holder
+            _m = _store.get(_reg, model) or {}
+            _pl = next((pp for pp in (_m.get("placements") or []) if pp.get("id") == seat.get("placement")), {})
+            if _seat_labels(holder).get("johnny.unit") == ((_pl.get("extra") or {}).get("unit")):
+                holder = None
         if holder:
             entry.update({"action": "error", "error": f"port {seat.get('port')} held by {holder.name}"})
             results.append(entry)

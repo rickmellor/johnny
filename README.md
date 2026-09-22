@@ -41,6 +41,8 @@ request right now" for whatever sits in front of it.
   (+ port, served model, health path) and johnny starts/stops it, shows it in `status`, resolves
   it by role and pins it in a profile like any container seat. For sidecars that are not
   containers (e.g. an embedding + classifier service in a torch venv on a card johnny does not place).
+  One unit may back several named seats (`extra.seat_name`, e.g. `unit#embed` and `unit#classifier`);
+  they share a port, and stopping either stops the process.
 - **Induction & tuning** — `johnny induct <model>` runs a seeded search (not a brute grid)
   over viable placements and writes the winner into the registry. `johnny bench` scores a
   placement for both throughput and quality, and records the result.
