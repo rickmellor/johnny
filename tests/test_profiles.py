@@ -211,3 +211,16 @@ def test_role_aliases_resolve_within_own_profile(monkeypatch):
     assert profiles.role_to_models("coder") == ["qwen", "ornith"]
     # alias resolves against its OWN profile's seats, not standard's chat
     assert "gemma" not in profiles.role_to_models("coder")
+
+
+
+def test_validate_seat_gpu_pin():
+    """A seat's optional `gpus:` must be a list of indices whose length matches the placement."""
+    model = next(iter(REG["models"]))  # the qwen-tp2 model (gpu_count 2)
+    base = _seat(model, "qwen-tp2", 8000, "chat")
+    errors, _ = _validate({"seats": [dict(base, gpus=[4, 5])]})
+    assert not [e for e in errors if "gpus" in e]
+    errors, _ = _validate({"seats": [dict(base, gpus=[4])]})
+    assert any("pins 1 GPU" in e for e in errors)
+    errors, _ = _validate({"seats": [dict(base, gpus="4,5")]})
+    assert any("list of GPU indices" in e for e in errors)

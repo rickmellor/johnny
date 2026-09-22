@@ -1419,6 +1419,8 @@ def up(
     port: int = typer.Option(None, "--port", help="Serve on this port (else auto-assigned from the configured range)."),
     swap: str = typer.Option(None, "--swap", help="Seat to evict to free its GPUs/port."),
     force: bool = typer.Option(False, "--force", help="Place even if GPUs are busy."),
+    gpus: str = typer.Option(None, "--gpus", help="Pin to these GPU indices, e.g. '4,5' (HIP/CUDA order, "
+                             "as `johnny hinfo` lists them); count must match the placement."),
     wait: bool = typer.Option(False, "--wait", help="Block until the seat is serving."),
     warmup: bool = typer.Option(True, "--warmup/--no-warmup",
                                 help="GDN models (Qwen3.5-family) decode at ~half speed until their first deep "
@@ -1445,7 +1447,8 @@ def up(
         model, placement = _pick_placement_interactive(json_output)
 
     try:
-        res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait, warmup=warmup)
+        pin = [int(x) for x in gpus.split(",") if x.strip()] if gpus else None
+        res = launch.up(model, placement_id=placement, port=port, swap=swap, force=force, wait=wait, warmup=warmup, gpus=pin)
     except Exception as e:
         _emit_err(e, json_output)
     if json_output:
@@ -2402,11 +2405,12 @@ def _parse_role_flags(role_flags: list[str]) -> dict:
 
 def _render_profile_seats(seats: list[dict]) -> None:
     t = Table(pad_edge=False)
-    for col in ("ROLE", "MODEL", "PLACEMENT", "PORT", "PINNED"):
+    for col in ("ROLE", "MODEL", "PLACEMENT", "PORT", "GPUS", "PINNED"):
         t.add_column(col, no_wrap=(col != "PLACEMENT"))
     for s in seats:
         t.add_row(str(s.get("role") or "—"), str(s.get("model")), str(s.get("placement") or "—"),
-                  str(s.get("port") or "—"), "✓" if s.get("pinned") else "")
+                  str(s.get("port") or "—"), ",".join(map(str, s.get("gpus"))) if s.get("gpus") else "auto",
+                  "✓" if s.get("pinned") else "")
     console.print(t)
 
 
