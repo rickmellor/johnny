@@ -91,7 +91,7 @@ def _seats_as_dicts(seats) -> list[dict]:
         ident = m.get("identity") or {}
         out.append(
             {"seat": s.name, "backend": s.backend, "port": s.port, "model": s.model,
-             "state": s.state, "gpus": s.gpus, "image": _seat_image(s),
+             "state": s.state, "gpus": s.gpus, "device": (s.extra or {}).get("device"), "image": _seat_image(s),
              # raw registry fields, null when unknown — formatting is the table's job
              "params": ident.get("params"), "quant": ident.get("quant"),
              "native_context": (m.get("capabilities") or {}).get("native_context")})
@@ -117,7 +117,7 @@ def _render_status(json_output: bool = False) -> None:
                        ("MODEL", "cyan"), ("SPEC", "dim"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
         table.add_column(col, style=style, no_wrap=(col == "SPEC"))
     for s in seats:
-        gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
+        gpus = ",".join(map(str, s.gpus)) if s.gpus else ((s.extra or {}).get("device") or "—")
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
                       spec_map.get(s.model, "—"),
                       f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
@@ -162,7 +162,7 @@ def _build_status_renderable(spec_map=None):
                        ("MODEL", "cyan"), ("SPEC", "dim"), ("STATE", None), ("GPUS", None), ("IMAGE", "dim")):
         table.add_column(col, style=style, no_wrap=(col == "SPEC"))
     for s in seats:
-        gpus = ",".join(map(str, s.gpus)) if s.gpus else "—"
+        gpus = ",".join(map(str, s.gpus)) if s.gpus else ((s.extra or {}).get("device") or "—")
         table.add_row(s.name, s.backend, str(s.port or "—"), s.model or "—",
                       spec_map.get(s.model, "—"),
                       f"[{_STATE_STYLE.get(s.state, 'white')}]{s.state}[/]", gpus, _seat_image(s))
