@@ -37,6 +37,10 @@ request right now" for whatever sits in front of it.
 - **Profiles** — a named fleet of seats brought up together (`johnny profile up <name>`),
   optionally at boot via a systemd user unit. Roles (`chat`, `coder`, `embed`,
   `classifier`) name what a seat is *for*; `role_aliases` lets one seat answer to several.
+- **Host-process seats** — backend `systemd`: a placement names a `systemctl --user` unit
+  (+ port, served model, health path) and johnny starts/stops it, shows it in `status`, resolves
+  it by role and pins it in a profile like any container seat. For sidecars that are not
+  containers (e.g. an embedding + classifier service in a torch venv on a card johnny does not place).
 - **Induction & tuning** — `johnny induct <model>` runs a seeded search (not a brute grid)
   over viable placements and writes the winner into the registry. `johnny bench` scores a
   placement for both throughput and quality, and records the result.

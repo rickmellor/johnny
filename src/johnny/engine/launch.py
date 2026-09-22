@@ -94,6 +94,25 @@ def build_spec(model_id: str, model: dict, placement: dict, gpus: list[int], por
     }
 
 
+def _up_systemd(model_id: str, placement: dict) -> dict:
+    """A `systemctl --user` unit owns its own device + port; johnny only starts it and
+    records the seat. Idempotent: `systemctl start` on a running unit is a no-op."""
+    drv = get_driver("systemd")
+    if not drv.available():
+        raise PlacementError("systemd --user is not available on this box")
+    extra = placement.get("extra") or {}
+    if not extra.get("unit"):
+        raise PlacementError(f"placement '{placement.get('id')}' has no extra.unit")
+    spec = {"unit": extra["unit"], "port": extra.get("port"), "model": extra.get("served_model") or model_id,
+            "model_id": model_id, "placement": placement.get("id", ""), "image": extra.get("image")}
+    seat = drv.launch(spec)
+    started = collect.now()
+    collect.record_activity(seat.name, ts=started)
+    collect.record_load_event(seat.name, model_id, placement.get("id", ""), started, None)
+    return {"action": "launched", "seat": seat.name, "port": seat.port, "gpus": [],
+            "model": model_id, "placement": placement.get("id"), "state": "loading"}
+
+
 def _up_lmstudio(model_id: str, model: dict, placement: dict, cfg: dict) -> dict:
     """LM Studio launch: it owns GPU placement + a shared server port, so we skip
     GPU assignment/port allocation and delegate to `lms load` via the driver."""
@@ -176,6 +195,8 @@ def up(
 
         if (placement.get("backend") or "vllm") == "lmstudio":
             return _up_lmstudio(model_id, model, placement, cfg)
+        if placement.get("backend") == "systemd":
+            return _up_systemd(model_id, placement)
 
         if swap:
             target = _find_seat(seats, swap)
