@@ -261,7 +261,41 @@ def up(
     return result
 
 
-def down(seat_name: str, drain: bool = False) -> dict:
+def _saint(args: list[str]) -> bool:
+    """Best-effort call of the SAINT CLI (drain/undrain). False when SAINT is not installed or the call fails."""
+    import shutil
+    import subprocess as _sp
+
+    if not shutil.which("saint"):
+        return False
+    try:
+        return _sp.run(["saint", *args], capture_output=True, text=True, timeout=15).returncode == 0
+    except Exception:
+        return False
+
+
+def _drain_and_wait(target, timeout: float) -> None:
+    import sys
+    import time
+
+    from ..telemetry import sources
+
+    if not _saint(["drain", target.name]):
+        print(f"[johnny] no SAINT CLI (or drain failed) — downing {target.name} without draining", file=sys.stderr)
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        m = sources.metrics_for_port(target.port, timeout=2.0) if target.port else {}
+        inflight = (m.get("running") or 0) + (m.get("waiting") or 0)
+        if not inflight:
+            print(f"[johnny] {target.name} idle — stopping", file=sys.stderr)
+            return
+        print(f"[johnny] draining {target.name}: {int(inflight)} in flight", file=sys.stderr)
+        time.sleep(5)
+    print(f"[johnny] drain timeout ({int(timeout)}s) on {target.name} — stopping anyway", file=sys.stderr)
+
+
+def down(seat_name: str, drain: bool = False, drain_timeout: float = 1800.0) -> dict:
     cfg = load_config()
     with mutation_lock():
         seats = all_seats(cfg)
@@ -269,13 +303,17 @@ def down(seat_name: str, drain: bool = False) -> dict:
         if not target:
             raise PlacementError(f"no running seat '{seat_name}'")
         if drain:
-            # vLLM has no drain mode; without a router to stop admission this no-ops.
-            pass
+            # Graceful: tell SAINT to stop routing NEW requests to this seat (`saint drain <seat>` writes the router's
+            # drain file — no restart), then wait until the seat's own /metrics show nothing running or waiting,
+            # then stop it and undrain the name so a future seat with the same name is not blocked.
+            _drain_and_wait(target, drain_timeout)
         drv = driver_for(target, cfg)
         if not drv:
             raise PlacementError(f"no driver for backend '{target.backend}'")
         drv.stop(target.name)
         collect.remove_pin(target.name)
+    if drain:
+        _saint(["undrain", target.name])
     return {"action": "down", "seat": target.name, "drain": drain}
 
 

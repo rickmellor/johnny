@@ -1479,7 +1479,8 @@ def up(
 @app.command(rich_help_panel=_P_SEATS)
 def down(
     seat: str = typer.Argument(None, help="Seat/container name (or model id). Omit to pick interactively."),
-    drain: bool = typer.Option(False, "--drain", help="Graceful drain (no-op without a router)."),
+    drain: bool = typer.Option(False, "--drain", help="Graceful: `saint drain <seat>` (router stops routing new requests to it), wait until idle, then stop."),
+    drain_timeout: float = typer.Option(1800.0, "--drain-timeout", help="Seconds to wait for in-flight work before stopping anyway."),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Tear down a single named seat (never siblings).
@@ -1493,7 +1494,7 @@ def down(
         seat = _pick_seat_interactive(json_output)
 
     try:
-        res = launch.down(seat, drain=drain)
+        res = launch.down(seat, drain=drain, drain_timeout=drain_timeout)
     except Exception as e:
         _emit_err(e, json_output)
     console.print(_json.dumps(res, indent=2) if json_output else f"[green]✓[/] down {res['seat']}")

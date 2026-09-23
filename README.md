@@ -142,3 +142,7 @@ seats:
 Resolution follows `role_aliases`, so a role pointed at another seat inherits that seat's hint.
 Seats that declare nothing return `"guidance": null`, and clients are expected to treat the
 field as optional — it is advisory metadata, not a contract a client must honour.
+
+### Graceful seat removal (2026-09-23)
+
+`johnny down --drain <seat>` asks SAINT to stop routing new requests to the seat (`saint drain`), waits until the seat's own `/metrics` report nothing running or waiting (`--drain-timeout`, default 30 min), stops it, then `saint undrain`s the name. Without the SAINT CLI it falls back to an immediate stop.
