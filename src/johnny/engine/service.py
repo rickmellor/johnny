@@ -28,6 +28,13 @@ def _find(seats, target):
     # decides which one wins. Profile file order only breaks the no-seat tie (the
     # absent estimate names the first-profile model, as before).
     hints = profiles.role_to_models(target) or [target]
+    # Same model on several seats (2026-09-23, daily-q3: three INT4 TP2 seats as chat/coder/worker):
+    # the profile's role → port pairing is the only thing that tells them apart, so it wins first.
+    for model, port in profiles.role_to_seats(target):
+        for s in seats:
+            labels = (s.extra or {}).get("labels", {})
+            if s.port == port and (s.model == model or labels.get("johnny.model") == model):
+                return s, model
     for hint in hints:
         for s in seats:
             labels = (s.extra or {}).get("labels", {})

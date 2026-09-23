@@ -59,6 +59,22 @@ def role_to_models(role: str) -> list[str]:
     return out
 
 
+def role_to_seats(role: str) -> list[tuple[str, int]]:
+    """(model, port) pairs declared for a role across profiles (aliases included), file order,
+    deduped. When several live seats run the SAME model (daily-q3: three INT4 TP2 seats as
+    chat/coder/worker), the model alone cannot tell them apart — the port can."""
+    out: list[tuple[str, int]] = []
+    for prof in (load().get("profiles") or {}).values():
+        seats = prof.get("seats") or []
+        aliased = (prof.get("role_aliases") or {}).get(role)
+        for seat in seats:
+            if seat.get("role") == role or (aliased and seat.get("role") == aliased):
+                m, p = seat.get("model"), seat.get("port")
+                if m and p and (m, int(p)) not in out:
+                    out.append((m, int(p)))
+    return out
+
+
 def all_profiles() -> dict:
     return load().get("profiles") or {}
 
