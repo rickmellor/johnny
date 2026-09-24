@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-hardcode — 20 medium/hard one-shot coding tasks scored by hidden tests.
+hardcode — 24 medium/hard one-shot coding tasks scored by hidden tests.
 
 What it measures: can the model write a complete, correct function/class from a
 prose spec in ONE completion (temperature 0)? Tasks (hardcode_tasks.py) cover parsing,
-graphs, DP, data structures and stateful classes; each answer is executed against
+graphs, DP, data structures, stateful classes and, since 2026-09-24, applied maths
+(polar angles, sun position, the rocket equation, beam deflection); each answer is executed against
 hidden asserts in a subprocess, and a task passes iff that process exits 0. It sits
 above HumanEval in difficulty, where current local seats all saturate (~95 %).
 
-Reading the score: n=20, so one task is 5 points. Treat +/-2 tasks as noise —
-18/20 vs 16/20 is not a ranking, 18/20 vs 11/20 is. Compare the failed-id lists.
+Reading the score: n=24, so one task is ~4 points. Treat +/-2 tasks as noise —
+22/24 vs 20/24 is not a ranking, 22/24 vs 13/24 is. Compare the failed-id lists.
+Scores recorded before 2026-09-24 were out of 20 (h01-h20); compare pass_rate_pct or
+the failed-id lists, not raw counts, across that boundary.
 
 Thinking mode: --thinking sends enable_thinking=true and raises the default budget to
 20000 tokens per task. Reasoning models can burn most of that on every task (hundreds
@@ -131,7 +134,7 @@ def self_test(test_timeout: float = 60) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="20 hard one-shot coding tasks, scored by hidden tests.")
+    ap = argparse.ArgumentParser(description="24 hard one-shot coding tasks, scored by hidden tests.")
     ap.add_argument("--base-url", help="OpenAI-compatible base, e.g. http://127.0.0.1:8124/v1")
     ap.add_argument("--model")
     ap.add_argument("--concurrency", type=int, default=4)

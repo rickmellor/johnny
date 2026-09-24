@@ -80,7 +80,7 @@ so a config carries its own evidence:
 | `arc` · `icl` · `humaneval` | reasoning, in-context learning, code generation |
 | `needle` · `depth` · `ctxsafe` | long-context retrieval and where a seat stops being safe |
 | `automationbench` · `planbench` | agentic tool loops, and planning in isolation |
-| `hardcode` | 20 medium/hard coding tasks with hidden tests — the code suite that still separates strong models (HumanEval and ARC saturate at 95–97 %) |
+| `hardcode` | 24 medium/hard coding tasks with hidden tests (h21–h24 are applied maths: polar angles, sun position, rocket equation, beam deflection) — the code suite that still separates strong models (HumanEval and ARC saturate at 95–97 %) |
 | `load` | realistic serving load: closed-loop concurrency sweep at real input/output lengths, unique prompts, req/s + TTFT/TPOT/E2E percentiles |
 | `depthprobe` | prefill and decode tok/s at chosen prompt depths — whether a seat's context is actually usable |
 

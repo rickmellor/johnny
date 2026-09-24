@@ -1,4 +1,4 @@
-"""The 20 tasks of the hardcode suite (see hardcode_eval.py).
+"""The 24 tasks of the hardcode suite (see hardcode_eval.py).
 
 Each task is a dict: id, prompt, reference (a validated solution) and tests (hidden
 asserts run after the candidate; `__SRC__` holds the candidate source, so a test can
@@ -514,4 +514,183 @@ assert (L.balance('a'),L.balance('b'))==(70,30)
 assert L.history('a')==[('deposit',100),('out',30)] and L.history('b')==[('in',30)]
 L.transfer('b','c',10); L.rollback(2)
 assert (L.balance('a'),L.balance('b'),L.balance('c'))==(100,0,0) and L.history('b')==[] and L.history('a')==[('deposit',100)]""",
+)
+
+# --- h21..h24: applied maths / physics (added 2026-09-24). Numeric tests use math.isclose;
+# angles are compared modulo 2*pi so a candidate is not penalised for -pi vs pi at the seam.
+
+_add(
+    'h21',
+    "Write four polar-coordinate helpers (all angles in radians, no cmath or numpy). `wrap_angle(theta: float) -> float` returns the equivalent angle in the half-open interval (-pi, pi] (so pi and -pi both map to pi). `polar_sum(vectors: list[tuple[float, float]]) -> tuple[float, float]` adds vectors given as (r, theta) and returns the resultant as (r, theta) with r >= 0 and theta wrapped as above; a negative input r means the vector points the opposite way; when the resultant r < 1e-9 return (0.0, 0.0). `polar_distance(r1: float, t1: float, r2: float, t2: float) -> float` is the straight-line distance between two points given in polar form. `circular_mean(angles: list[float]) -> float | None` is the mean direction (wrapped as above) of the unit vectors at those angles, or None if the list is empty or the resultant length is < 1e-9.",
+    """import math
+def wrap_angle(t):
+    t=t%(2*math.pi)
+    if t>math.pi: t-=2*math.pi
+    return t
+def polar_sum(vs):
+    x=sum(r*math.cos(t) for r,t in vs); y=sum(r*math.sin(t) for r,t in vs)
+    r=math.hypot(x,y)
+    return (0.0,0.0) if r<1e-9 else (r,wrap_angle(math.atan2(y,x)))
+def polar_distance(r1,t1,r2,t2):
+    return math.sqrt(max(0.0,r1*r1+r2*r2-2*r1*r2*math.cos(t1-t2)))
+def circular_mean(a):
+    if not a: return None
+    x=sum(map(math.cos,a)); y=sum(map(math.sin,a))
+    return None if math.hypot(x,y)<1e-9 else wrap_angle(math.atan2(y,x))""",
+    """import math
+pi=math.pi
+def aeq(a,b):
+    d=(a-b)%(2*pi); return min(d,2*pi-d)<1e-9
+for t in (0,1,-1,pi,-pi,3*pi,-3*pi,7.5*pi,-2.5*pi,1e6):
+    w=wrap_angle(t); assert -pi<w<=pi and aeq(w,t),t
+assert wrap_angle(pi)==pi and wrap_angle(-pi)==pi and abs(wrap_angle(3*pi)-pi)<1e-9
+r,t=polar_sum([(1,0),(1,pi/2)]); assert math.isclose(r,math.sqrt(2)) and aeq(t,pi/4)
+assert polar_sum([(1,0),(1,pi)])==(0.0,0.0) and polar_sum([])==(0.0,0.0)
+r,t=polar_sum([(2,0),(-2,pi)]); assert math.isclose(r,4) and aeq(t,0)
+r,t=polar_sum([(1,3*pi/4),(1,-3*pi/4)]); assert math.isclose(r,math.sqrt(2)) and aeq(t,pi) and -pi<t<=pi
+r,t=polar_sum([(3,0.2),(4,0.2+pi/2)]); assert math.isclose(r,5) and aeq(t,0.2+math.atan2(4,3))
+assert math.isclose(polar_distance(1,0,1,pi),2) and math.isclose(polar_distance(3,0,4,pi/2),5) and abs(polar_distance(2,1,2,1))<1e-9
+assert math.isclose(polar_distance(1,0,1,2*pi/3),math.sqrt(3))
+assert circular_mean([])is None and circular_mean([0,pi])is None and circular_mean([0,2*pi/3,4*pi/3])is None
+assert aeq(circular_mean([0,pi/2]),pi/4) and aeq(circular_mean([pi-0.1,-pi+0.1]),pi) and aeq(circular_mean([0.3]*5),0.3)
+assert aeq(circular_mean([math.radians(350),math.radians(10)]),0) and abs(circular_mean([math.radians(350),math.radians(10)]))<1e-9
+m=circular_mean([pi-0.1,-pi+0.1]); assert -pi<m<=pi
+assert 'cmath' not in __SRC__ and 'numpy' not in __SRC__""",
+)
+
+_add(
+    'h22',
+    "Write `sun_position(lat_deg: float, day_of_year: int, solar_hour: float) -> tuple[float, float]` returning the sun's (elevation_deg, azimuth_deg) from this model: declination delta = 23.44 deg * sin(360 deg * (284 + day_of_year) / 365); hour angle H = 15 deg * (solar_hour - 12), where solar_hour is local solar time in hours and 12 is solar noon; with phi = latitude, the unit vector toward the sun in local east/north/up axes is east = -cos(delta)*sin(H), north = cos(phi)*sin(delta) - sin(phi)*cos(delta)*cos(H), up = sin(phi)*sin(delta) + cos(phi)*cos(delta)*cos(H). Elevation is asin(up) in degrees (negative below the horizon); azimuth is the compass bearing of (east, north), clockwise from north, in degrees in [0, 360). Also write `day_length_hours(lat_deg: float, day_of_year: int) -> float`: the hours per day the sun is at or above the horizon under the same model, 2*H0/15 with cos(H0) = -tan(phi)*tan(delta), returning 24.0 for polar day and 0.0 for polar night. Both raise ValueError if |lat_deg| > 90 or day_of_year is not in 1..366. Do not use astral, ephem or numpy.",
+    """import math
+def _decl(n): return math.radians(23.44*math.sin(math.radians(360*(284+n)/365)))
+def _chk(lat,n):
+    if abs(lat)>90 or not (1<=n<=366) or int(n)!=n: raise ValueError
+def sun_position(lat,n,h):
+    _chk(lat,n); d=_decl(n); H=math.radians(15*(h-12)); p=math.radians(lat)
+    e=-math.cos(d)*math.sin(H); no=math.cos(p)*math.sin(d)-math.sin(p)*math.cos(d)*math.cos(H)
+    up=math.sin(p)*math.sin(d)+math.cos(p)*math.cos(d)*math.cos(H)
+    return math.degrees(math.asin(max(-1.0,min(1.0,up)))), math.degrees(math.atan2(e,no))%360.0
+def day_length_hours(lat,n):
+    _chk(lat,n); c=-math.tan(math.radians(lat))*math.tan(_decl(n))
+    if c<=-1: return 24.0
+    if c>=1: return 0.0
+    return 2*math.degrees(math.acos(c))/15""",
+    """import math
+def close(a,b,tol=1e-3): return abs(a-b)<tol
+def azeq(a,b,tol=1e-3):
+    d=(a-b)%360; return min(d,360-d)<tol
+e,a=sun_position(0,81,6); assert close(e,0) and azeq(a,90) and 0<=a<360
+e,a=sun_position(0,81,18); assert close(e,0) and azeq(a,270)
+e,a=sun_position(40,172,12); assert close(e,73.4398) and azeq(a,180)
+e,a=sun_position(-33.9,172,12); assert close(e,32.6602) and azeq(a,0) and 0<=a<360
+e,a=sun_position(40,355,0); assert close(e,-73.4398) and azeq(a,0)
+e,a=sun_position(40,172,9); assert close(e,48.8219) and azeq(a,99.8198)
+e,a=sun_position(40,172,15); assert close(e,48.8219) and azeq(a,260.1802)
+e,a=sun_position(51.5,100,8.25); assert close(e,26.4510) and azeq(a,112.9744)
+e,a=sun_position(-45,300,16.5); assert close(e,25.5446) and azeq(a,276.0064)
+assert close(day_length_hours(0,81),12.0) and close(day_length_hours(40,172),14.8445) and close(day_length_hours(40,355),9.1555)
+assert day_length_hours(80,172)==24.0 and day_length_hours(-80,172)==0.0 and close(day_length_hours(51.5,100),13.2755)
+dl=day_length_hours(40,172); e,a=sun_position(40,172,12-dl/2); assert close(e,0,1e-6) and azeq(a,58.7166)
+for h in (7,10.5,13.25,20):
+    e1,a1=sun_position(40,172,h); e2,a2=sun_position(40,172,24-h); assert close(e1,e2,1e-9) and azeq(a1,360-a2,1e-9)
+for bad in (lambda:sun_position(91,100,12),lambda:sun_position(0,0,12),lambda:sun_position(0,367,12),lambda:day_length_hours(-90.5,10),lambda:day_length_hours(10,0)):
+    try:
+        bad(); raise AssertionError('no error')
+    except ValueError: pass
+assert 'astral' not in __SRC__ and 'ephem' not in __SRC__ and 'numpy' not in __SRC__""",
+)
+
+_add(
+    'h23',
+    "Write rocket-equation helpers using g0 = 9.80665 m/s^2 and specific impulse Isp in seconds (no numpy). `exhaust_velocity(isp_s: float) -> float` = Isp * g0. `delta_v(isp_s: float, m0: float, mf: float) -> float` = Isp * g0 * ln(m0 / mf) for initial mass m0 and final mass mf. `propellant_for_dv(dv: float, isp_s: float, final_mass: float) -> float` returns the propellant mass that, burned down to final_mass, delivers dv. `stage_delta_v(stages: list[tuple[float, float, float]], payload: float) -> list[float]` takes stages in firing order as (isp_s, propellant_mass, dry_mass) and returns each stage's delta-v under serial staging: a stage burns with every later stage and the payload still attached, and its dry mass is discarded before the next stage fires. Raise ValueError for isp_s <= 0, any negative mass, mf <= 0 or final_mass <= 0, m0 < mf, dv < 0, or an empty stage list.",
+    """import math
+G0=9.80665
+def exhaust_velocity(isp):
+    if isp<=0: raise ValueError
+    return isp*G0
+def delta_v(isp,m0,mf):
+    if isp<=0 or mf<=0 or m0<mf: raise ValueError
+    return isp*G0*math.log(m0/mf)
+def propellant_for_dv(dv,isp,mf):
+    if dv<0 or isp<=0 or mf<=0: raise ValueError
+    return mf*(math.exp(dv/(isp*G0))-1)
+def stage_delta_v(stages,payload):
+    if not stages or payload<0: raise ValueError
+    for isp,p,d in stages:
+        if isp<=0 or p<0 or d<0: raise ValueError
+    out=[]
+    for i,(isp,p,d) in enumerate(stages):
+        above=payload+sum(pp+dd for _,pp,dd in stages[i+1:])
+        out.append(delta_v(isp,above+d+p,above+d))
+    return out""",
+    """import math
+assert math.isclose(exhaust_velocity(300),2941.995) and math.isclose(exhaust_velocity(450),4412.9925)
+assert math.isclose(delta_v(300,100,50),2039.2355394714561) and delta_v(300,100,100)==0.0
+assert math.isclose(delta_v(450,2.0,1.0),exhaust_velocity(450)*math.log(2))
+assert math.isclose(propellant_for_dv(2039.2355394714561,300,50),50) and propellant_for_dv(0,300,10)==0.0
+for isp,m0,mf in ((300,100,50),(320,1000,275),(452,10.5,1.25)):
+    assert math.isclose(propellant_for_dv(delta_v(isp,m0,mf),isp,mf),m0-mf,rel_tol=1e-9)
+dv=stage_delta_v([(300,100,10),(350,20,2)],1)
+assert len(dv)==2 and math.isclose(dv[0],4100.67492018618) and math.isclose(dv[1],6991.245853191067)
+assert math.isclose(stage_delta_v([(300,100,10)],5)[0],delta_v(300,115,15))
+assert math.isclose(stage_delta_v([(300,100,10)],0)[0],delta_v(300,110,10))
+one=stage_delta_v([(300,120,12)],1)[0]; two=sum(stage_delta_v([(300,60,6),(300,60,6)],1)); assert two>one
+assert stage_delta_v([(300,0,10)],1)==[0.0]
+for bad in (lambda:delta_v(300,50,100),lambda:delta_v(0,100,50),lambda:delta_v(300,100,0),lambda:delta_v(-1,100,50),lambda:exhaust_velocity(0),lambda:propellant_for_dv(-1,300,10),lambda:propellant_for_dv(100,300,0),lambda:stage_delta_v([],1),lambda:stage_delta_v([(300,-1,10)],1),lambda:stage_delta_v([(0,10,10)],1)):
+    try:
+        bad(); raise AssertionError('no error')
+    except ValueError: pass
+assert 'numpy' not in __SRC__""",
+)
+
+_add(
+    'h24',
+    "Write `beam_deflection(support: str, L: float, E: float, I: float, P: float, a: float, x: float) -> float`: the downward deflection (positive down, consistent units) at position x along a prismatic Euler-Bernoulli beam of length L, Young's modulus E and second moment of area I, carrying one downward point load P at distance a from the left end (x = 0). support is 'cantilever' (fixed at x = 0, free at x = L) or 'simple' (pinned at both ends). Cantilever: for x <= a, y = P*x^2*(3a - x)/(6EI); for x > a, y = P*a^2*(3x - a)/(6EI). Simple, with b = L - a: for x <= a, y = P*b*x*(L^2 - b^2 - x^2)/(6*L*E*I); for x > a, y = P*a*(L - x)*(2*L*x - x^2 - a^2)/(6*L*E*I). Also write `max_deflection(support, L, E, I, P, a) -> tuple[float, float]` returning (x_max, y_max): for a cantilever the free end; for a simple beam, if a >= b the maximum is at x = sqrt((L^2 - b^2)/3), otherwise mirror the beam so x_max = L - sqrt((L^2 - a^2)/3). Also write `deflection_multi(support, L, E, I, loads: list[tuple[float, float]], x) -> float` summing the deflections of several (P, a) loads by superposition (0.0 for no loads). All three raise ValueError for an unknown support, L, E or I <= 0, or any a or x outside [0, L]. Do not use numpy or scipy.",
+    """import math
+def _chk(s,L,E,I,*pos):
+    if s not in('cantilever','simple') or L<=0 or E<=0 or I<=0 or any(v<0 or v>L for v in pos): raise ValueError
+def beam_deflection(s,L,E,I,P,a,x):
+    _chk(s,L,E,I,a,x)
+    if s=='cantilever':
+        return P*x*x*(3*a-x)/(6*E*I) if x<=a else P*a*a*(3*x-a)/(6*E*I)
+    b=L-a
+    if x<=a: return P*b*x*(L*L-b*b-x*x)/(6*L*E*I)
+    return P*a*(L-x)*(2*L*x-x*x-a*a)/(6*L*E*I)
+def max_deflection(s,L,E,I,P,a):
+    _chk(s,L,E,I,a)
+    if s=='cantilever': xm=L
+    else:
+        b=L-a
+        xm=math.sqrt((L*L-b*b)/3) if a>=b else L-math.sqrt((L*L-a*a)/3)
+    return xm,beam_deflection(s,L,E,I,P,a,xm)
+def deflection_multi(s,L,E,I,loads,x):
+    _chk(s,L,E,I,x)
+    return sum((beam_deflection(s,L,E,I,P,a,x) for P,a in loads),0.0)""",
+    """import math
+L,E,I,P=10.0,200e9,8e-6,5000.0
+c=math.isclose
+assert c(beam_deflection('cantilever',L,E,I,P,L,L),P*L**3/(3*E*I))
+assert c(beam_deflection('cantilever',L,E,I,P,L,L/2),5*P*L**3/(48*E*I))
+assert c(beam_deflection('cantilever',L,E,I,P,4,L),0.21666666666666667) and beam_deflection('cantilever',L,E,I,P,4,0)==0.0
+assert c(beam_deflection('simple',L,E,I,P,L/2,L/2),P*L**3/(48*E*I)) and c(beam_deflection('simple',L,E,I,P,L/2,L/2),0.06510416666666667)
+assert beam_deflection('simple',L,E,I,P,3,0)==0.0 and abs(beam_deflection('simple',L,E,I,P,3,L))<1e-12
+for a in (2.5,7):
+    assert c(beam_deflection('simple',L,E,I,P,a,a-1e-7),beam_deflection('simple',L,E,I,P,a,a+1e-7),rel_tol=1e-4)
+    assert c(beam_deflection('cantilever',L,E,I,P,a,a-1e-7),beam_deflection('cantilever',L,E,I,P,a,a+1e-7),rel_tol=1e-4)
+for x in (1,4,6.5,9):
+    assert c(beam_deflection('simple',L,E,I,P,3,x),beam_deflection('simple',L,E,I,P,7,L-x))
+    assert c(beam_deflection('simple',L,E,I,2*P,3,x),2*beam_deflection('simple',L,E,I,P,3,x))
+xm,ym=max_deflection('simple',L,E,I,P,L/2); assert c(xm,5) and c(ym,P*L**3/(48*E*I))
+xm,ym=max_deflection('simple',L,E,I,P,7); assert c(xm,5.507570547286102) and c(ym,0.052207179146149515)
+xm2,ym2=max_deflection('simple',L,E,I,P,3); assert c(xm2,L-5.507570547286102) and c(ym2,ym)
+assert all(ym>=beam_deflection('simple',L,E,I,P,7,k*L/200)-1e-15 for k in range(201))
+xm,ym=max_deflection('cantilever',L,E,I,P,4); assert xm==L and c(ym,0.21666666666666667)
+xm,ym=max_deflection('cantilever',L,E,I,P,L); assert xm==L and c(ym,P*L**3/(3*E*I))
+assert c(deflection_multi('simple',L,E,I,[(P,3),(2*P,6)],4.5),beam_deflection('simple',L,E,I,P,3,4.5)+beam_deflection('simple',L,E,I,2*P,6,4.5))
+assert deflection_multi('cantilever',L,E,I,[],5)==0.0
+for bad in (lambda:beam_deflection('fixed',L,E,I,P,3,4),lambda:beam_deflection('simple',0,E,I,P,0,0),lambda:beam_deflection('simple',L,E,-I,P,3,4),lambda:beam_deflection('simple',L,E,I,P,11,4),lambda:beam_deflection('simple',L,E,I,P,3,-0.1),lambda:max_deflection('simple',L,E,I,P,10.5),lambda:max_deflection('beam',L,E,I,P,5),lambda:deflection_multi('simple',L,E,I,[(P,3)],L+1)):
+    try:
+        bad(); raise AssertionError('no error')
+    except ValueError: pass
+assert 'numpy' not in __SRC__ and 'scipy' not in __SRC__""",
 )

@@ -319,8 +319,8 @@ it lands, before trusting any new induction/tune output:
   `load_bench.py` → `LOAD_RESULT` (`best` is null when nothing completed — treated as failure),
   `depth_probe.py` → `DEPTHPROBE_RESULT`. `hardcode_tasks.py` must sit beside `hardcode_eval.py`
   (it is imported from the script's own directory, so a `scripts.hardcode_eval` override needs both files).
-- **`hardcode`**: 20 tasks, hidden tests validated against reference solutions (`--self-test`). n=20 → ±2 tasks
-  is noise. Measured 2026-09-21: Flash-Next AWQ 18, Qwen3.8-27B-FP8 17, Qwen3.6-35B-A3B Q2_K 13–15,
+- **`hardcode`**: 24 tasks (h01–h20 algorithms/data structures; h21–h24 added 2026-09-24: polar/radian helpers, sun position + day length, rocket equation/Isp/serial staging, point-load beam deflection), hidden tests validated against reference solutions (`--self-test`). n=24 → ±2 tasks
+  is noise. Counts below were measured against the original 20 (compare `pass_rate_pct` across the boundary). Measured 2026-09-21: Flash-Next AWQ 18, Qwen3.8-27B-FP8 17, Qwen3.6-35B-A3B Q2_K 13–15,
   Bonsai 2 27B ternary 13 — while HumanEval/ARC put all four within 5 points. Thinking mode can burn
   9–17K tokens per task without answering; the default is thinking off.
 - **`load`** has no tokenizer: it calibrates tokens/word from one `max_tokens=1` request, then sizes prompts.

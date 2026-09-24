@@ -53,7 +53,7 @@ placement's knobs (same machinery as induction). Suites:
   incident. No extra deps (uses ``openai`` like the other probes; ``tiktoken`` if
   present for precise depth construction, else a char-count estimate).
 
-- ``hardcode``: 20 medium/hard coding tasks with hidden tests validated against
+- ``hardcode``: 24 medium/hard coding tasks with hidden tests validated against
   reference solutions (bundled hardcode_eval.py). The discriminating code suite:
   HumanEval and ARC are saturated for 25B+ models (95–97 % across very different
   models, 2026-09), this set separated them 13 → 18 of 20. ±2 tasks is noise. Stdlib only.
@@ -108,7 +108,7 @@ _DEPTH_TIMEOUT = 20 * 60  # a handful of depths, a few runs each — minutes, no
 _DEPTH_SWEEP = (0, 4096, 8192)  # modest on purpose — a quick suite, not an hours-long one
 _HUMANEVAL_TIMEOUT = 90 * 60  # 164 problems up to 2048 gen toks each — generous for a slow (e.g. llamacpp) seat
 _HUMANEVAL_SCORE_TIMEOUT = 30 * 60  # re-scorer: up to 164 subprocess test runs, 10s cap each
-_HARDCODE_TIMEOUT = 3 * 3600  # 20 tasks; a thinking model can spend minutes per task
+_HARDCODE_TIMEOUT = 3 * 3600  # 24 tasks; a thinking model can spend minutes per task
 _LOAD_TIMEOUT = 3 * 3600  # 10x-concurrency requests per level at real lengths
 _DEPTHPROBE_TIMEOUT = 2 * 3600  # a 100K prefill on a slow card is minutes on its own
 _CTXSAFE_LAUNCH_TIMEOUT = 900  # a big long-context seat can be slow to load (large KV reservation)
@@ -1114,7 +1114,7 @@ def write_report(run_dir: Path, model_id: str, placement_id: str, results: dict)
                          + (f" · failed: {', '.join(r.get('failed') or [])}" if r.get("failed") else "")
                          + f" · api errors {r.get('api_errors', 0)} · mean answer {r.get('mean_completion_tokens')} tok"
                          + (" · thinking ON" if r.get("thinking") else ""))
-            lines.append("  (n=20 — a difference of ±2 tasks is noise)")
+            lines.append("  (n=24 — a difference of ±2 tasks is noise; runs before 2026-09-24 were n=20)")
         elif suite == "load":
             lines.append(f"Serving load, {r.get('input_tokens')} in / {r.get('output_tokens')} out, unique prompts "
                          f"(~{r.get('tokens_per_word')} tok/word calibration):")

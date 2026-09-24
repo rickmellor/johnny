@@ -9,7 +9,7 @@ hc = importlib.util.module_from_spec(spec); sys.modules["hardcode_eval"] = hc; s
 
 
 def test_tasks_shape():
-    assert [t["id"] for t in hc.TASKS] == [f"h{i:02d}" for i in range(1, 21)]
+    assert [t["id"] for t in hc.TASKS] == [f"h{i:02d}" for i in range(1, 25)]
     for t in hc.TASKS:
         assert set(t) == {"id", "prompt", "reference", "tests"}
         assert t["prompt"].endswith("Return only one ```python code block, no explanation.")
