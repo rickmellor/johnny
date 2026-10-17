@@ -208,9 +208,19 @@ class VllmDriver(Driver):
                 args += ["--cpuset-cpus", str(extra["cpuset"])]
         else:
             args += ["--device=/dev/kfd", "--device=/dev/dri", *gpu_group_args()]
-        args += ["--ipc=host", "--shm-size", spec.get("shm_size", "16g")]
+        # extra.shm_size overrides the fleet default (docker.shm_size) for one placement —
+        # the tcclaviger Flash-Next recipe wants 32g where the fleet runs 16g.
+        args += ["--ipc=host", "--shm-size", extra.get("shm_size") or spec.get("shm_size", "16g")]
+        # extra.ulimits: ["memlock=-1:-1", ...] → docker --ulimit, verbatim. Docker's default
+        # memlock is 8 MiB; engines that pin large host buffers (expert offload to RAM) need it lifted.
+        for u in extra.get("ulimits") or []:
+            args += ["--ulimit", str(u)]
         if spec.get("models_dir"):
             args += ["-v", f"{spec['models_dir']}:/models"]
+        if spec.get("weights_dir"):
+            # Absolute identity.local_path: build_spec points model_path at /weights/<name> and
+            # hands us the parent dir — mount it read-only, same contract as the llamacpp driver.
+            args += ["-v", f"{spec['weights_dir']}:/weights:ro"]
         if spec.get("nas_dir"):
             # Second, read-only mount for weights that resolved onto roots.nas_dir
             # (engine.launch.build_spec / config.resolve_weights_path). Nothing in

@@ -164,6 +164,7 @@ full configured cap wasn't reached.
 - **Boot default profile is `flashnext` since 2026-09-04** (`johnny-profile@flashnext.service`):
   Flash-Next TP4 + expert-parallel as `chat` with `coder` aliased onto it, nomic embed + 1B
   classifier on CPU. GPUs 4,5 are free. `split`/`gemma-tp4` remain as profiles, not enabled.
+- **vLLM placement docker knobs (2026-10-17):** `extra.ulimits: ["memlock=-1:-1"]` → `--ulimit` (docker's default memlock is 8 MiB; engines that pin host buffers for expert offload need it), `extra.shm_size: 32g` overrides `docker.shm_size` for one placement, and an ABSOLUTE `identity.local_path` is now mounted read-only at `/weights` by the vLLM driver too (build_spec already computed it; only llamacpp emitted the mount). First user: the tcclaviger Flash-Next MXFP4 seats of profile `daily` (checkpoint under ~/models, not roots.models_dir). Known gap: `johnny up --wait` keeps reporting `loading` for a container that has already exited — poll `docker ps` alongside.
 - Placement `extra.extra_flags` passes raw llama-server flags (e.g.
   `["-ctk", "q8_0"]` for quantized KV).
 - SAINT (~/repos/saint-router) resolves seats by **role** (`coder`/`chat`/
