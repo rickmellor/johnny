@@ -231,6 +231,11 @@ class LlamaCppDriver(Driver):
     def stop(self, seat: str) -> None:
         run(["docker", "rm", "-f", seat], timeout=30)
 
+    def alive(self, seat: str) -> bool:
+        """False once the container has exited or was never created; never raises."""
+        rc, out, _ = run(["docker", "inspect", "-f", "{{.State.Running}}", seat], timeout=15)
+        return rc == 0 and out.strip() == "true"
+
     def metrics(self, seat: str) -> dict:
         from ..telemetry import sources
 

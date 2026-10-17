@@ -244,7 +244,8 @@ def up(
     result = {"action": "launched", "seat": seat.name, "port": port, "gpus": gpus,
               "model": model_id, "placement": placement.get("id"), "state": "loading"}
     if wait:
-        if _wait_ready(port, wait_timeout):
+        outcome = _wait_ready(port, wait_timeout, drv=drv, seat=seat.name)
+        if outcome == "ready":
             collect.record_load_event(seat.name, model_id, placement.get("id", ""), started, collect.now())
             result["state"] = "ready"
             result["endpoint"] = f"http://{spec['bind_address']}:{port}/v1"
@@ -254,6 +255,15 @@ def up(
                 result["warmup"] = warmup_mod.gdn_warmup(
                     port, spec["served_model_name"],
                     (placement.get("knobs") or {}).get("max_model_len"))
+        elif outcome == "exited":
+            # The container died during startup — say so now instead of reporting
+            # `loading` until the timeout expires.
+            result["state"] = "failed"
+            result["wait_failed"] = True
+            try:
+                result["log_tail"] = "\n".join((drv.logs(seat.name, tail=30) or "").splitlines()[-30:])
+            except Exception:
+                result["log_tail"] = ""
         else:
             result["state"] = "loading"
             result["wait_timed_out"] = wait_timeout
@@ -321,12 +331,20 @@ def swap(seat_name: str, model_id: str, wait: bool = False) -> dict:
     return up(model_id, swap=seat_name, wait=wait)
 
 
-def _wait_ready(port: int, timeout: float) -> bool:
+def _wait_ready(port: int, timeout: float, drv=None, seat: str | None = None) -> str:
+    """Poll the seat until it serves: "ready" | "exited" | "timeout".
+
+    A container that crashes during startup never answers /v1/models, so without the
+    driver liveness check `--wait` reported `loading` for the full timeout (1200s
+    observed) before failing. `drv`/`seat` are optional — callers that cannot ask stay
+    optimistic and only ever see "ready"/"timeout"."""
     import time
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         if probe.probe_models(port):
-            return True
+            return "ready"
+        if drv and seat and not drv.alive(seat):
+            return "exited"
         time.sleep(3)
-    return False
+    return "timeout"

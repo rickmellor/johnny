@@ -1469,6 +1469,12 @@ def up(
             console.print(f"  [yellow]⚠ GDN warm-up failed ({w.get('error', '')[:80]}) — seat decodes at ~half speed until its first deep prompt[/]")
     if st == "loading":
         console.print(f"  [dim]loading — poll `johnny resolve {res['model']}` or tail `johnny logs {res['seat']}`[/]")
+    if res.get("wait_failed"):
+        # The container exited during startup; the log tail is the whole diagnosis.
+        # style= rather than [dim]…[/] — log text is full of square brackets.
+        console.print("[red]✗[/] seat exited during startup — last log lines:")
+        console.print(res.get("log_tail") or "", style="dim")
+        raise typer.Exit(1)
     if res.get("wait_timed_out"):
         # --wait that expires must FAIL, not shrug: scripts treat rc 0 as "serving" and
         # immediately probe a seat that resets connections until startup completes.

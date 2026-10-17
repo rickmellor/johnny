@@ -83,6 +83,13 @@ class Driver:
     def logs(self, seat: str, follow: bool = False):  # pragma: no cover
         raise NotImplementedError("logs land at P3")
 
+    def alive(self, seat: str) -> bool:
+        """True while the seat's process/container is still running. Lets `--wait` fail
+        fast on a seat that dies during startup instead of polling a dead port for the
+        whole timeout. Drivers that cannot tell stay optimistic (True) — a false negative
+        would abort a healthy launch."""
+        return True
+
 
 def gpu_group_args() -> list[str]:
     """--group-add flags for GPU device access, as numeric GIDs resolved from the host.
