@@ -77,13 +77,26 @@ def seat_guidance(target: str, model: str | None = None) -> str | None:
     return None
 
 
+_REG_CACHE: tuple[float, dict] | None = None   # (registry mtime, parsed registry)
+
+
 def _registry_safe() -> dict:
     """The registry for resolve's capabilities lookup — an empty dict on any failure.
-    Modalities are advisory; a broken/unreadable registry must not fail the hot path."""
+    Modalities are advisory; a broken/unreadable registry must not fail the hot path.
+    Cached by file mtime: a YAML parse is ~250 ms and resolve is SAINT's per-request path."""
+    global _REG_CACHE
     from ..registry import store
 
     try:
-        return store.load()
+        from .. import config as C
+
+        mtime = C.get_paths().registry_file.stat().st_mtime
+        if mtime is not None and _REG_CACHE is not None and _REG_CACHE[0] == mtime:
+            return _REG_CACHE[1]
+        reg = store.load()
+        if mtime is not None:
+            _REG_CACHE = (mtime, reg)
+        return reg
     except Exception:
         return {}
 
@@ -123,6 +136,7 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
         queue_depth = sources.metrics_for_port(seat.port, timeout=0.3).get("waiting")
     elif state == "loading":
         eta = collect.cold_start_estimate(seat.model or model_hint or target)
+    labels = (seat.extra or {}).get("labels") or {}
     return {
         "seat": seat.name,
         "endpoint": _endpoint(cfg, seat),
@@ -131,8 +145,10 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
         "eta_s": eta,
         "queue_depth": queue_depth,
         "guidance": seat_guidance(target, seat.model),
+        # systemd/lmstudio seats serve under an alias (gemma31 for gemma-4-31B-it): the launch
+        # label carries the registry id, the served-model name is only the fallback.
         "capabilities": _safe_caps(
-            reg, seat.model, ((seat.extra or {}).get("labels") or {}).get("johnny.placement")
+            reg, labels.get("johnny.model") or seat.model, labels.get("johnny.placement")
         ),
     }
 

@@ -211,6 +211,7 @@ def test_resolve_survives_a_broken_registry():
     """SAINT's hot path: an unreadable registry costs the capabilities key, nothing else."""
     with mock.patch.object(service, "all_seats", return_value=[_live_seat()]), \
          mock.patch.object(service, "_find", return_value=(_live_seat(), None)), \
+         mock.patch.object(service, "_REG_CACHE", None), \
          mock.patch("johnny.registry.store.load", side_effect=RuntimeError("yaml boom")), \
          mock.patch.object(service, "seat_guidance", return_value=None), \
          mock.patch("johnny.telemetry.sources.metrics_for_port", return_value={}):
@@ -282,3 +283,24 @@ def test_write_placement_records_modalities_without_overwriting(monkeypatch):
                            {"id": "p1", "backend": "vllm"}, SimpleNamespace(fingerprint="fp"))
     assert reg2["models"]["n"]["capabilities"]["modalities"] == ["text", "vision"]
 
+
+
+def test_resolve_prefers_registry_id_label_over_served_name(monkeypatch):
+    """A systemd seat serves under an alias (gemma31) while the launch label carries the
+    registry id — capabilities must come from the registry entry, not the alias."""
+    from johnny.engine import service
+
+    class _Seat:
+        backend, name, model, port, gpus, state = "systemd", "gemma31.service", "gemma31", 8121, [], "ready"
+        extra = {"labels": {"johnny.model": "gemma-4-31B-it", "johnny.placement": "rtx-pair-systemd"}}
+
+    reg = {"models": {"gemma-4-31B-it": {"capabilities": {"multimodal": False},
+                                         "placements": [{"id": "rtx-pair-systemd", "backend": "systemd"}]}}}
+    monkeypatch.setattr(service, "all_seats", lambda cfg: [_Seat()])
+    monkeypatch.setattr(service, "_find", lambda seats, target: (seats[0], None))
+    monkeypatch.setattr(service, "_endpoint", lambda cfg, seat: "http://127.0.0.1:8121/v1")
+    monkeypatch.setattr(service, "_registry_safe", lambda: reg)
+    monkeypatch.setattr(service, "seat_guidance", lambda *a, **k: None)
+    monkeypatch.setattr(service.sources, "metrics_for_port", lambda *a, **k: {})
+    res = service.resolve("chat", cfg={})
+    assert res["capabilities"] == {"modalities": ["text"]}
