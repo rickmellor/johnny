@@ -76,6 +76,16 @@ def audit(path: str) -> dict:
         config.get("vision_config") or config.get("audio_config")
         or str(info.get("arch") or "").endswith("ForConditionalGeneration")
     )
+    # The same towers as an explicit modality list (capabilities.modalities) — what a
+    # seat can actually accept, and what SAINT routes image/audio requests on. A
+    # *_config block is the positive signal; the ConditionalGeneration arch suffix is a
+    # vision encoder bolted to the LM. Launch flags can only narrow this (johnny.capabilities).
+    modalities = ["text"]
+    if config.get("vision_config") or str(info.get("arch") or "").endswith("ForConditionalGeneration"):
+        modalities.append("vision")
+    if config.get("audio_config"):
+        modalities.append("audio")
+    info["modalities"] = modalities
     if not info.get("quant"):
         low = path.lower()
         for tok in ("fp8", "awq", "int4", "bf16"):

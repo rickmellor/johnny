@@ -138,6 +138,7 @@ def write_placement(model_id: str, audit: dict, placement: dict, hardware, local
     ident.update(normalize.identity_gaps(model_id, m))
     cap = m["capabilities"]
     cap.setdefault("multimodal", audit.get("multimodal"))
+    cap.setdefault("modalities", audit.get("modalities"))
     cap.setdefault("mtp_head", audit.get("mtp_head"))
     cap.setdefault("native_context", audit.get("native_context") or (audit.get("dims") or {}).get("ctx"))
     # replace any prior induction placement with the same id; else append

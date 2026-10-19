@@ -1592,6 +1592,9 @@ def resolve(
         f"model={res.get('model')} · endpoint={res.get('endpoint') or '—'} · "
         f"eta_s={res.get('eta_s')} · queue={res.get('queue_depth')}"
     )
+    mods = (res.get("capabilities") or {}).get("modalities")
+    if mods:
+        console.print(f"modalities: {', '.join(mods)}")
 
 
 @app.command(rich_help_panel=_P_OBSERVE)

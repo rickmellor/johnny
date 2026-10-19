@@ -77,10 +77,33 @@ def seat_guidance(target: str, model: str | None = None) -> str | None:
     return None
 
 
+def _registry_safe() -> dict:
+    """The registry for resolve's capabilities lookup — an empty dict on any failure.
+    Modalities are advisory; a broken/unreadable registry must not fail the hot path."""
+    from ..registry import store
+
+    try:
+        return store.load()
+    except Exception:
+        return {}
+
+
+def _safe_caps(reg: dict, model: str | None, placement: str | None) -> dict | None:
+    """seat_capabilities, but never the reason a dispatch fails (SAINT's hot path)."""
+    from ..capabilities import seat_capabilities
+
+    try:
+        return seat_capabilities(reg, model, placement)
+    except Exception:
+        return None
+
+
 def resolve(target: str, cfg: dict | None = None) -> dict:
     cfg = cfg if cfg is not None else load_config()
     seats = all_seats(cfg)
     seat, model_hint = _find(seats, target)
+    # Loaded once per call (as ready_chat_seats does); capabilities never raise.
+    reg = _registry_safe()
     if not seat:
         return {
             "seat": None,
@@ -90,6 +113,7 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
             "eta_s": collect.cold_start_estimate(model_hint or target),
             "queue_depth": None,
             "guidance": seat_guidance(target, model_hint),
+            "capabilities": _safe_caps(reg, model_hint or target, None),
         }
     state = "ready" if seat.state == "ready" else ("loading" if seat.state in ("loading", "running") else "failed")
     queue_depth = None
@@ -107,6 +131,9 @@ def resolve(target: str, cfg: dict | None = None) -> dict:
         "eta_s": eta,
         "queue_depth": queue_depth,
         "guidance": seat_guidance(target, seat.model),
+        "capabilities": _safe_caps(
+            reg, seat.model, ((seat.extra or {}).get("labels") or {}).get("johnny.placement")
+        ),
     }
 
 
